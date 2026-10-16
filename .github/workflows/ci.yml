@@ -1,0 +1,26 @@
+name: Verify pi-agent-tg Telegram agent
+on:
+  push:
+  pull_request:
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run build
+      - name: Offline mocked tests (no bot, API key, email or paid tools)
+        run: npm test
+      - name: Validate Compose (no runtime credentials required)
+        run: docker compose config --quiet
+      - name: Build container and inspect offline runtime
+        run: |
+          docker build -t pi-agent-tg:test .
+          scripts/smoke-container.sh pi-agent-tg:test

@@ -1,0 +1,7 @@
+[
+  {
+    "name": "executor",
+    "url": "https://executor.example/mcp",
+    "tokenEnv": "EXECUTOR_TOKEN"
+  }
+]

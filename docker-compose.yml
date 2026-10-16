@@ -1,0 +1,54 @@
+services:
+  pi-agent-tg:
+    build:
+      context: .
+    restart: unless-stopped
+    init: true
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # NODE_ENV and DATA_DIR are already fixed in the image (Dockerfile ENV).
+      # Required: bot token + TELEGRAM_ALLOWED_USERS. Chats default to the same IDs (DM).
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ALLOWED_USERS: ${TELEGRAM_ALLOWED_USERS:-}
+      # One generic OpenAI-compatible provider. No model is pinned here: choose it in
+      # Telegram (/model, /thinking) or set the global default with npm run setup-model.
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      # Catalog declaration. Required for /thinking: without it the provider is
+      # discovered from GET {LLM_BASE_URL}/models, which reports no capabilities,
+      # so every model ends up with reasoning=false and only "off" is offered.
+      # Format: id | id|contextWindow|maxTokens|reasoning | id|...|level+level
+      # DeepSeek: LLM_MODELS=deepseek-flash|1000000|384000|off+low+high+max
+      LLM_MODELS: ${LLM_MODELS:-}
+      # Executor: the preferred single endpoint for every MCP server. https://executor.sh
+      # Raw API key. The process sends Authorization: Bearer <EXECUTOR_TOKEN>.
+      EXECUTOR_TOKEN: ${EXECUTOR_TOKEN:-}
+      EXECUTOR_MCP_URL: ${EXECUTOR_MCP_URL:-}
+      # A panel variable the compose does not declare here never reaches the
+      # container: Coolify only forwards what this block maps. Add a line above
+      # before setting TELEGRAM_ALLOWED_CHATS, MCP_SERVERS_JSON, MCP_CONFIG_FILE
+      # or a *_FILE variant in the panel.
+    volumes:
+      - pi_agent_tg_data:/app/data
+      # Optional operator-provisioned MCP config / secrets, read-only:
+      # - ./config:/app/config:ro
+      # - ./secrets:/run/secrets:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "node", "dist/src/healthcheck.js"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+    stop_grace_period: 45s
+
+volumes:
+  pi_agent_tg_data:

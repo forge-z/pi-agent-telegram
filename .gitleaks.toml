@@ -1,0 +1,4 @@
+title = "Pi Agent secret scanning"
+
+[extend]
+useDefault = true
