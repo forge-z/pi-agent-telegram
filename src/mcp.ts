@@ -649,7 +649,7 @@ export class McpGateway implements ToolGateway {
         if (token) headers.Authorization = `Bearer ${token}`;
         const makeClient = () => {
           const client = new Client(
-            { name: "pi-personal-agent", version: "0.1.0" },
+            { name: "pi-agent", version: "0.1.0" },
             {
               capabilities: { elicitation: { form: {}, url: {} } },
               jsonSchemaValidator: this.schemas,

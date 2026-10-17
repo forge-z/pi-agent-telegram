@@ -1,4 +1,4 @@
-# pi-agent-tg verification
+# Pi-Agent verification
 
 Validation on 2026-10-15, in an isolated worktree and temporary test volumes. No deployment, real Telegram request, email, paid model/tool call, webhook change or production data was involved.
 

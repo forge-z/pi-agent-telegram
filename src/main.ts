@@ -60,7 +60,7 @@ try {
   // Safe deploy hint: endpoint and catalog only, never credentials.
   const catalog = models.getModels(LLM_PROVIDER_ID);
   console.info(
-    `Pi Agent TG: provedor ${LLM_PROVIDER_ID} (${models.getProvider(LLM_PROVIDER_ID)?.baseUrl ?? "sem endpoint"}) — ${catalog.length} modelo(s), reasoning habilitado em ${catalog.filter((model) => model.reasoning).length}.`,
+    `Pi-Agent: provedor ${LLM_PROVIDER_ID} (${models.getProvider(LLM_PROVIDER_ID)?.baseUrl ?? "sem endpoint"}) — ${catalog.length} modelo(s), reasoning habilitado em ${catalog.filter((model) => model.reasoning).length}.`,
   );
   const api = new TelegramBotApi(config.token);
   const bot = (await api.call("getMe")) as { id: number; username?: string };
@@ -110,7 +110,7 @@ try {
     });
   });
   void polling.engine.flush();
-  console.info("Pi Agent TG: Telegram polling iniciado.");
+  console.info("Pi-Agent: Telegram polling iniciado.");
 } catch (error) {
   console.error(startupErrorMessage(error));
   process.exitCode = 1;

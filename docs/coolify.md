@@ -1,4 +1,4 @@
-# Deploy no Coolify — pi-agent-tg
+# Deploy no Coolify — Pi-Agent
 
 Checklist do lado do painel. O repositório não contém credenciais: tudo é variável de
 runtime, nunca argumento de build.

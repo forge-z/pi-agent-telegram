@@ -1,182 +1,139 @@
-# Pi Agent TG — Telegram + Docker Compose
+# Pi-Agent
 
-Versão exclusiva do Telegram, sobre `pi-durable`/`pi-ai` **1.3.0**, Node 24 e SQLite. Sem chat web, servidor HTTP, login de assinatura, browser próprio ou espelhamento. Usa long polling e não expõe porta pública. [Referência completa em inglês](README.md).
+Um assistente de IA pessoal que vive no Telegram: um container, um volume, nenhum painel web. Roda sobre o harness do [pi.dev](https://pi.dev) e alcança qualquer integração pelo [Executor](https://executor.sh), um único endpoint MCP autenticado.
 
-**O Pi Agent é um assistente de IA, não um agente de programação.** Ele não traz ferramentas de arquivo, shell, patch, repositório ou browser, e não conhece o host, o volume nem o código-fonte. Além da conversa e das ferramentas internas de agendamento, suas únicas capacidades são os servidores MCP que o operador expõe — ele não vê mais nada. Sem MCP conectado, ele conversa e agenda, e só. Trate tudo que volta do MCP como dado externo não confiável.
+O repositório e o container mantêm o nome `pi-agent-tg` para não quebrar volumes e deploys existentes.
 
-Foi feito para rodar com o [Executor](https://executor.sh): a forma preferida de expor todos os MCPs atrás de um único endpoint autenticado, de modo que um `EXECUTOR_MCP_URL` + `EXECUTOR_TOKEN` cobre toda a superfície de ferramentas. Roda sobre o [pi.dev](https://pi.dev) e o harness [`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/main/packages/durable).
+**O Pi-Agent é um assistente, não um agente de programação.** Ele não traz ferramentas de arquivo, shell, patch ou browser, e não conhece o host, o volume nem o código-fonte. Além da conversa e dos agendamentos, suas únicas capacidades são os servidores MCP que o operador expõe. Trate tudo que volta do MCP como dado externo não confiável.
 
-## Instalação na Oracle
+## Docker + Telegram + Executor
 
-Requer Docker e Compose v2.24+ em Linux amd64/arm64. A imagem oficial Node oferece ambas as arquiteturas e a persistência usa `node:sqlite`. O teste local executa amd64; não houve execução ARM64 neste ambiente.
+**Docker** embala tudo: uma imagem, um volume em `/app/data`, sistema de arquivos somente leitura, nenhum segredo em argumento de build. Roda em qualquer VPS amd64 ou arm64, e o estado são dois arquivos SQLite.
+
+**Telegram** é a única interface — não há porta HTTP para expor. Um tópico nativo é uma conversa: cada um guarda histórico, modelo e esforço próprios. Imagem e recado de voz chegam como anexo, e o bot responde onde foi perguntado.
+
+**Executor** é o único endpoint de ferramentas. Ele transforma qualquer serviço OpenAPI, MCP ou GraphQL numa ferramenta atrás de uma chave, então e-mail, calendário, repositório ou sandbox aparecem para o assistente sem que este app guarde essas credenciais. Toda chamada com efeito pausa para um cartão de aprovação, e o registro guarda o que foi decidido.
+
+## Criar o bot no Telegram
+
+1. Abra o **@BotFather**, mande `/newbot`, escolha nome e um usuário terminado em `bot`. Ele responde com o **token** — é o `TELEGRAM_BOT_TOKEN`.
+2. Pegue seu **ID numérico**: mande qualquer mensagem para o bot novo e rode
+
+   ```sh
+   curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | grep -o '"from":{"id":[0-9]*' | head -1
+   ```
+
+   Esse número é o `TELEGRAM_ALLOWED_USERS`. (O bot não pode falar com você primeiro: aperte **Start** na conversa.)
+
+3. Opcional, para grupo: adicione o bot e, no **@BotFather**, `/setprivacy` → **Disable**; sem isso o Telegram só entrega comandos e menções. O id negativo do grupo vai em `TELEGRAM_ALLOWED_CHATS`.
+4. Opcional, para uma conversa por tópico: transforme o grupo em **fórum** (configurações do grupo → Tópicos). Cada tópico fica com histórico, modelo e esforço próprios, sem configuração extra.
+
+O menu de comandos (`/model`, `/thinking`, `/crons`, `/stop`, `/status`, `/help`) é registrado pelo próprio app ao subir e de novo no `/status` — não há `/setcommands` para fazer.
+
+## Instalação
 
 ```sh
-git clone https://github.com/forge-z/pi-agent-tg.git
-cd pi-agent-tg
-cp .env.example .env
-# Edite .env NO SERVIDOR: token do bot, IDs permitidos e chaves de API.
-chmod 600 .env
-SOURCE_COMMIT=$(git rev-parse HEAD) docker compose up -d --build
-docker compose ps
-docker compose logs --tail=50
-# Primeira configuração, no terminal do container: escolha o modelo padrão global.
-docker compose exec pi-agent-tg npm run setup-model -- --list
-docker compose exec pi-agent-tg npm run setup-model -- --model llm/<id> --effort high
+git clone https://github.com/forge-z/pi-agent-telegram.git
+cd pi-agent-telegram
+cp .env.example .env      # token do bot + seu ID numérico do Telegram
+docker compose up -d --build
 ```
 
-Deploy no Coolify: veja [docs/coolify.md](docs/coolify.md) — variáveis de runtime no painel, origem do commit, volume e healthcheck.
+Obrigatórias: `TELEGRAM_BOT_TOKEN` e `TELEGRAM_ALLOWED_USERS`. Para ter ferramentas, acrescente `EXECUTOR_MCP_URL` + `EXECUTOR_TOKEN`. O resto é opcional e está em [.env.example](.env.example).
 
-Use bot dedicado e o novo volume `pi_agent_tg_data`; não conecte o volume de outro deployment. Configure `TELEGRAM_ALLOWED_USERS`. `TELEGRAM_ALLOWED_CHATS` é opcional e, se omitida, usa os mesmos IDs (DM privada). Defina chats só para grupos/supergrupos (IDs negativos). Supergrupos usam IDs negativos. Cada combinação **chat + usuário + tópico nativo** tem uma conversa isolada. Crie os tópicos no próprio Telegram; a conversa local nasce no primeiro uso. Nada é criado no startup. Em grupos, os membros veem as mensagens: use grupos confiáveis e configure a privacidade/permissões do bot no Telegram. Webhook existente ou outro consumidor de polling bloqueiam o início; o aplicativo não remove webhook automaticamente.
-
-### Diagnóstico
-
-**Dentro do container (Coolify → terminal do serviço), após redeploy:**
+## Configuração única
 
 ```sh
-node scripts/diagnose-tg-runtime.mjs
-```
-
-Ou `npm run diagnose`. O script valida variáveis (sem mostrar segredos), `readConfig`, modelos, MCP e heartbeat.
-
-**No host com Docker Compose (SSH na VM):**
-
-```sh
-bash scripts/diagnose-tg-deploy.sh .
-```
-
-## Primeira subida: rode o setup
-
-**Só duas variáveis são obrigatórias para subir:** `TELEGRAM_BOT_TOKEN` e `TELEGRAM_ALLOWED_USERS`. O resto — provedor, endpoint, chave, modelo, esforço, e os modelos de visão e áudio — é escolhido uma vez no terminal e fica gravado no volume.
-
-```sh
-# com o container de pé (ele fica esperando quando ainda não há configuração)
 docker exec -it <container> npm run setup
-# com compose puro, antes da primeira subida:
-docker compose run --rm pi-agent-tg npm run setup
 ```
 
-O bot **não** morre sem provedor: registra que falta configuração, mantém o container vivo e começa a responder sozinho poucos segundos depois do assistente terminar — sem restart.
-
-O que fica gravado: provedor, endpoint, modelo, esforço e os modelos de visão/áudio em `meta` (`setup:live`), e a chave em `credentials` — o mesmo lugar de onde o pi-ai já lê credenciais. `LLM_*` / `VISION_*` / `AUDIO_*` continuam valendo como override declarativo e, quando presentes, **vencem** o registro do volume.
-
-## Ambiente e modelos
-
-**A primeira configuração é no terminal, não no Telegram:** `npm run setup` (veja a seção de primeira subida). Depois disso, `/model` e `/thinking` mudam só aquela conversa, e rodar o setup de novo move o padrão global.
-
-Só duas variáveis são obrigatórias: `TELEGRAM_BOT_TOKEN` e `TELEGRAM_ALLOWED_USERS`. O provider (`LLM_*`, `VISION_*`, `AUDIO_*`) é gravado pelo setup e continua valendo como override quando definido — e nesse caso **vence** o registro do volume. O Compose declara apenas as duas do Telegram e as duas do Executor; o resto chega por `env_file: .env`. Sem `LLM_MODELS`, o catálogo vem de `GET {LLM_BASE_URL}/models`, que não informa capacidades, então `/thinking` fica só em `off` — declarar o catálogo (`id|contextWindow|maxTokens|reasoning`) é o que habilita esforço e limites reais.
-
-O Compose injeta `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODELS`, `EXECUTOR_MCP_URL` e `EXECUTOR_TOKEN`. **Variável do painel que o compose não declara não chega ao container** — o Coolify só repassa o que o bloco `environment:` mapeia; acrescente a linha ali antes de configurar `TELEGRAM_ALLOWED_CHATS`, `MCP_SERVERS_JSON`, `MCP_CONFIG_FILE` ou `*_FILE`. Os opcionais — `TELEGRAM_ALLOWED_CHATS` (grupos), `LLM_MODELS` (raciocínio além de `off`), `MCP_SERVERS_JSON`, `*_FILE` — **não** são declarados no compose, para não aparecerem como variáveis dele: defina no painel ou no `.env`. Build local: `npm run compose:up` exporta `SOURCE_COMMIT`. Não é preciso habilitar nada no painel do Coolify para o SHA aparecer em `/status`. Substitua os placeholders do `.env.example` por valores reais. A subida imprime mensagens seguras (por exemplo falta de `LLM_API_KEY` ou token Telegram inválido); falhas de rede continuam genéricas.
-
-`EXECUTOR_MCP_URL` define o endpoint HTTPS do Executor neste deploy (auto-hospedado ou nuvem). **Não há URL real no git** — configure na UI do Coolify ou no `.env` do servidor. O Executor só entra na configuração MCP quando `EXECUTOR_TOKEN` também estiver definido (sem token, o bot ainda pode subir, mas ferramentas MCP ficam indisponíveis). `EXECUTOR_TOKEN` é a chave crua (`Authorization: Bearer` é montado pela aplicação). Se `MCP_SERVERS_JSON` estiver preenchido e não for `[]`, ele substitui `EXECUTOR_MCP_URL` (vários servidores). Fora do Compose, vale a mesma regra, ou use `MCP_CONFIG_FILE`. [Exemplo MCP](docs/mcp.example.json). Endpoints exigem HTTPS; HTTP só em loopback para testes/desenvolvimento.
-
-Segredos são variáveis de runtime no servidor/Coolify, nunca argumentos de build. Chaves/tokens aceitam `NAME_FILE` com arquivo montado somente leitura. A aplicação guarda apenas fingerprint do token Telegram no ledger; chaves de IA ficam em memória. Históricos e resultados podem ser sensíveis: proteja volume e backups. Exceções cruas não entram nos logs; valores secretos conhecidos são redigidos na saída Telegram.
-
-## Visão e áudio (opcional)
-
-Nada disso é obrigatório. Modelo multimodal e nenhuma variável extra é o padrão: imagem vai direto para ele, e recado de voz responde com uma nota curta dizendo que áudio não está configurado.
-
-| Modelo do chat                  | `VISION_MODEL` | O que acontece com a imagem                                               |
-| ------------------------------- | -------------- | ------------------------------------------------------------------------- |
-| lê imagem (`LLM_INPUT` ausente) | ausente        | vai como parte de imagem (mais barato, fidelidade total)                  |
-| lê imagem                       | definido       | continua como parte de imagem; `VISION_MODE=text` força o modelo auxiliar |
-| só texto (`LLM_INPUT=text`)     | definido       | o modelo auxiliar descreve e entra como texto                             |
-| só texto                        | ausente        | o bot explica que o modelo não lê imagem                                  |
-
-Áudio é sempre texto: o `pi-ai` não tem parte de áudio, então o recado é transcrito e **a transcrição vira o texto do turno**. O áudio nunca entra no contexto do modelo nem no histórico.
-
-Toda mensagem convertida diz ao modelo de texto de onde ela veio, no próprio texto que ele lê:
+**Rode isto antes de o bot ser útil.** Container novo não tem provedor, então ele registra `Configuração inicial ausente` e espera — fica de pé e saudável em vez de entrar em restart loop, que é o que mantém o terminal disponível. O wizard é o que encerra essa espera:
 
 ```
-[áudio transcrito · {"origin":"audio","model":"whisper-1"}]
-reunião sexta às dez
-[imagem: descrição automática · {"origin":"image","model":"gemini-3-flash"}]
-um gráfico de vendas
+[1] DeepSeek  [2] Gemini  [3] OpenAI  [4] OpenCode Zen
+[5] OpenCode Go  [6] OpenRouter  [7] Outro (OpenAI-compatible)
+Provedor [1]: 2
+Chave de API (não aparece): █                  ← oculta; valida na hora
+  ✔ chave válida — 63 modelos listados
+Modelo (número ou id): 12
+Esforço: high
+Modelo do chat: lê imagens                     ← o modelo é sondado, não presumido
+IMAGEM — Enter mantém o do chat, "-" desativa
+Modelo de visão [usa o do chat]:               ← ou "o" para outro provedor
+ÁUDIO — Enter desativa
+  [1] OpenAI — whisper-1  [2] Groq  [3] Gemini  [4] Outro
+Transcrição [desativada]: 1
+Idioma [auto]: pt
+Gravar? [y/N] y
+Configuração gravada no volume (gemini) — as variáveis LLM_* deixam de ser necessárias.
 ```
 
-Texto digitado vai sem prefixo. A transcrição chega ao modelo verbatim. Quando um especialista falha, a mensagem é admitida mesmo assim, com a origem e o motivo (`{"origin":"audio","error":"resposta 500"}`), para o modelo responder ao usuário em vez de ficar em silêncio.
+1. **Provedor** — número da lista, id ou URL raiz. "Outro" pede a URL.
+2. **Chave** — nunca aparece na tela, e é validada em `GET /models` antes de seguir.
+3. **Modelo e esforço** — a lista é o que o provedor realmente serve.
+4. **Imagem** — o modelo do chat é sondado; se lê imagens, Enter mantém. `o` abre a lista de provedores de novo (visão no Gemini com chat na DeepSeek), `-` desativa.
+5. **Áudio** — endpoint de transcrição, porque endpoint de chat não transcreve; avisa que o modelo precisa aceitar OGG/Opus.
+6. **Confirmar** — a escolha vai para `meta`, as chaves para `credentials`, e o bot começa a responder em até dez segundos. Sem restart.
 
-**O modelo de áudio precisa aceitar OGG/Opus.** É o único formato que o Telegram usa num recado de voz. `whisper-1`, Gemini e Groq leem direto; a família `gpt-4o-transcribe` não lista `ogg` e falha, porque converter exigiria ffmpeg na imagem. A falha responde no chat, nunca em silêncio.
+Qualquer passo depois do primeiro pode ser pulado com Enter, e o `npm run setup` pode ser rodado de novo: mostra os valores atuais e mantém o que você não mudar. Variáveis de ambiente continuam valendo e **vencem** o registro.
 
-```sh
-# visão, mesmo provedor do chat (chave/endpoint vazios herdam os do chat)
-VISION_MODEL=<modelo com visão>
-# visão em outro provedor: superfície OpenAI-compatible do Gemini
-VISION_MODEL=gemini-3-flash
-VISION_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
-VISION_API_KEY=<chave do Gemini>
-# áudio via multipart compatível com OpenAI
-AUDIO_MODEL=whisper-1
-AUDIO_API_KEY=sk-...
-# áudio via Gemini (JSON com base64, não multipart)
-AUDIO_MODEL=gemini-3-flash
-AUDIO_API=gemini
-```
+## Provedores que ele já conhece
 
-`VISION_API_KEY` / `AUDIO_API_KEY` vazios herdam `LLM_API_KEY` **só quando o endpoint é do mesmo host** do chat (a Groq serve chat e áudio assim); em qualquer outro host, defina a chave, senão a função fica desligada em vez de falhar com um 401 confuso.
+| Provedor     | Endpoint                                                  | Observação                                               |
+| ------------ | --------------------------------------------------------- | -------------------------------------------------------- |
+| DeepSeek     | `https://api.deepseek.com`                                | `deepseek-flash` lê imagens; limites e níveis conhecidos |
+| Gemini       | `https://generativelanguage.googleapis.com/v1beta/openai` | superfície OpenAI-compatible; tem free tier              |
+| OpenAI       | `https://api.openai.com/v1`                               | também é o caminho de áudio (`/audio/transcriptions`)    |
+| OpenCode Zen | `https://opencode.ai/zen/v1`                              | catálogo separado do Go                                  |
+| OpenCode Go  | `https://opencode.ai/zen/go/v1`                           | a chave pode não valer nos dois                          |
+| OpenRouter   | `https://openrouter.ai/api/v1`                            | muitos modelos, inclusive variantes `:free`              |
+| Outro        | qualquer URL raiz                                         | qualquer endpoint que fale a API de completion da OpenAI |
 
-Escolha os modelos no terminal com `npm run setup-model` (o menu pergunta chat, imagem e áudio); as chaves ficam no ambiente e nunca são gravadas no banco nem mostradas na tela.
+Áudio é configurado à parte, porque endpoint de chat não transcreve: OpenAI, Groq e Gemini aparecem com o modelo padrão de cada um.
+
+## Free tiers bastam para experimentar
+
+- **Google AI Studio** ([aistudio.google.com](https://aistudio.google.com), [preços](https://ai.google.dev/pricing)) — o free tier do Gemini cobre **visão** (imagem vira descrição) e **áudio** (recado vira transcrição), sem cartão de crédito. As cotas são por minuto e por dia, e o Google pode usar conteúdo do free tier para melhorar seus produtos: ótimo para testar, pense duas vezes antes de mandar um documento pessoal ou um recado de voz.
+- **Groq** ([groq.com](https://groq.com)) — free tier para transcrição com Whisper, rápido o suficiente para recados.
+- **OpenRouter** ([openrouter.ai](https://openrouter.ai)) — modelos `:free` para todas as modalidades, com limite de requisições.
+
+Uma chave gratuita do Gemini e um bot no Telegram já são o conjunto completo mais barato: um provedor, duas funções.
+
+## O que ele faz
+
+- **Texto** — o padrão; sem prefixo, sem cerimônia.
+- **Imagem** — modelo que lê imagem recebe a imagem; modelo só-texto recebe uma descrição do `VISION_MODEL`.
+- **Recado de voz** — transcrito para o texto do turno; o áudio nunca entra no contexto nem no histórico.
+- **Origem explícita** — a mensagem convertida chega como `[áudio transcrito · {"origin":"audio","model":"whisper-1"}]`, então o modelo não confunde transcrição com algo digitado. Falha de transcrição é admitida com o motivo, não descartada.
+- **Agendamentos** — crie um cron pelo chat; execuções agendadas nunca aprovam nada e nunca criam novos agendamentos.
+- **Aprovações** — toda ferramenta com efeito vira um cartão com Aprovar, Negar e Editar; o resultado é registrado antes de ser entregue.
 
 ## Comandos
 
-| Comando     | Função                                                                                       |
-| ----------- | -------------------------------------------------------------------------------------------- |
-| `/model`    | Menu inline de modelo do catálogo `llm`                                                      |
-| `/thinking` | Menu inline dos esforços suportados pelo modelo                                              |
-| `/crons`    | Listar, criar, editar, pausar, retomar e excluir; criação/edição/exclusão exigem confirmação |
-| `/stop`     | Interromper execução/fila e invalidar aprovações deste tópico; preservar crons futuros       |
-| `/status`   | Modelo/esforço, execuções, MCPs/pendências/incertezas, versão e verificação externa          |
-| `/help`     | Ajuda                                                                                        |
+| Comando     | O que faz                                      |
+| ----------- | ---------------------------------------------- |
+| `/status`   | os três modelos em uso, esforço, MCPs e versão |
+| `/model`    | provedor e modelo desta conversa               |
+| `/thinking` | esforço desta conversa                         |
+| `/crons`    | criar e gerenciar agendamentos                 |
+| `/stop`     | interromper o que está rodando neste tópico    |
+| `/help`     | a mesma lista, no chat                         |
 
-Não há `/new`, `/topics` ou `/compact`. `//` envia barra literal. A compactação automática da versão instalada usa **modelo e esforço ativos da conversa** ao começar; conserva as entradas originais. Defaults upstream intactos: enabled=true, reserva 16384 tokens, recentes 20000, offset de background 32768. Sem Jev e sem modelo separado de resumo. Há teste comportamental da compactação real com provedor mock.
+## Limites que vale saber
 
-## Aprovações reais MCP/Executor
+- **O modelo de transcrição precisa aceitar OGG/Opus** — é o único formato que o Telegram manda num recado de voz. `whisper-1`, Gemini e Groq aceitam; a família `gpt-4o-transcribe` não lista ogg.
+- **A descoberta informa só ids.** Sem `LLM_MODELS`, todo modelo declara não ter raciocínio e o `/thinking` oferece apenas `off`.
+- **Compactação** resume turnos antigos automaticamente, para a conversa não crescer sem fim.
+- Histórico, credenciais e registro são tão privados quanto o volume e o host: proteja o volume e os backups.
 
-O bot reconhece `approval-required`/`input-required` com `requestId`, expiração e invocação original. Mostra ação, destino e conteúdo completo, com botões aprovar/negar quando a revisão é segura. Aprovar usa `resume({requestId,response:{action:"accept",content:{}}})`; negar usa `decline`. **Nunca reexecuta o programa original**. O agente não pode usar `resume` para se autoaprovar. Elicitação MCP nativa responde à requisição pendente existente. Configure Executor em modo MODEL (requestId/response) ou NATIVE (elicitação). Modo BROWSER (approvalUrl/retomada sem response) é recusado, sem exibir o ticket privado.
+## Projetos
 
-Callbacks vinculam proprietário autorizado, chat, tópico, conversa, ID/payload da pendência, mensagem original entregue, credencial, nonce de uso único e expiração. Todas as partes da revisão precisam estar entregues. Cliques concorrentes são reivindicados antes da rede. Reinício preserva a pendência Executor; elicitação nativa ao vivo expira sem seu waiter original. Crash após reivindicar uma retomada deixa resultado incerto, sem reenvio. Nova pausa exige novo cartão.
+| Projeto          | Site                                                    | Código                                                                              |
+| ---------------- | ------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| pi.dev           | [pi.dev](https://pi.dev)                                | [earendil-works/pi](https://github.com/earendil-works/pi)                           |
+| pi-durable       | o harness deste app                                     | [packages/durable](https://github.com/earendil-works/pi/tree/main/packages/durable) |
+| Executor         | [executor.sh](https://executor.sh)                      | [UsefulSoftwareCo/executor](https://github.com/UsefulSoftwareCo/executor)           |
+| Telegram Bot API | [core.telegram.org](https://core.telegram.org/bots/api) | —                                                                                   |
+| Pi-Agent         | este projeto                                            | [forge-z/pi-agent-telegram](https://github.com/forge-z/pi-agent-telegram)           |
 
-**Limites:** formulário vazio e contrato de revisão reconhecido são necessários. O contrato atual é conservador e limitado a **envio direto de email em texto simples**: aliases explícitos de send-email/send-mail, ou send/send-message/messages-send em namespace mail/Gmail/Outlook; objeto direto com endereços de email explícitos em `to`, `cc`/`bcc` opcionais, `subject` presente e `body` textual não vazio. Endereços podem ser string separada por vírgulas ou array. Aliases exatos aceitos: `recipients`, `to_addresses`/`toAddresses`, `cc_addresses`/`ccAddresses`, `bcc_addresses`/`bccAddresses`; corpo em `text`, `body_text`/`bodyText`. Aliases duplicados, outra capitalização dos campos e qualquer campo adicional são recusados.
-
-Rascunhos/IDs de mensagem/template, reply/forward/resend, wrappers, operações desconhecidas, anexos, raw/MIME/base64/HTML, controles invisíveis, ausência de destinatários/corpo, OAuth/URLs privadas, formulários com campos e revisão ocultada/excessiva ficam **sem Aprovar**. Isso inclui outros MCPs até existir contrato específico de revisão. Permanece Negar e a orientação para o fluxo seguro existente do serviço; o bot não consulta rascunho, inventa conteúdo, decodifica entrada opaca nem repete o programa. Elicitação NATIVE de wrappers `execute`/`code` não comprova a ação subjacente pela prosa: exige revisão externa. Ferramenta nativa direta com argumentos suportados pode responder ao waiter existente; MODEL usa a invocação estruturada.
-
-O envio é reconhecido por vários sinais, não por um único nome: aliases send-email/send-mail, send/send-message/messages-send em namespace mail/Gmail/Outlook, verbos draft/reply/forward/resend, e campos de identificador no topo (`draftId`, `messageId`, `templateId`, `threadId`, `raw`, `mime`, `rfc822`) mesmo com outro nome de ferramenta. `id` sozinho só conta junto com namespace de e-mail ou um desses verbos; o id de um evento de calendário não vira e-mail. Reconhecer não aprova e não busca a mensagem. Se o sinal existe e o contrato não fecha, o cartão fica só com **Negar** e pede revisão no serviço externo.
-
-A invocação Executor só pode ser aprovada com as chaves exatas `app`, `tool` e `input`. Um `draftId` ou qualquer outro campo irmão aparece no cartão e é recusado, mesmo quando `input` tem o e-mail completo. Corpo que é só um token base64 com padding (inclusive curto, como `SGVsbG8=`) é recusado; texto curto comum, como `Hi`, continua aprovável. Objetos aninhados, outra capitalização e aliases duplicados continuam recusados. `JSON.parse` fica com a última chave duplicada. Endereços são ASCII; domínios unicode/punycode são recusados. Este cliente não prova que o servidor remoto envia só os campos revisados e não decodifica conteúdo opaco para achar uma mensagem escondida.
-
-O JSON aparece literalmente, inclusive Markdown, links e backticks. O mesmo contrato é revalidado no clique. Cartões antigos ficam inertes e uma revisão versionada é emitida para a pendência existente, sem executar/retomar a chamada. Nomes e formatos suportados não provam honestidade do servidor nem verificam sua conta externa; use MCPs confiáveis. O cliente não obriga todos os servidores a pedir confirmação de cada efeito.
-
-`/stop` cancela a espera local e aborta transporte; uma execução já pausada no Executor fica para expirar no serviço, sem autorização local. Isso não desfaz efeitos externos. `/status` mostra resultados incertos e mantém esse servidor bloqueado na conversa. Após verificar externamente, o dono pode confirmar o resultado observado pelos controles inline. Esse registro é uma declaração do usuário, não uma repetição da ação. Se a revisão não puder ser exibida com segurança, mantenha bloqueado e inspecione o serviço.
-
-## Crons, volume e operação
-
-O botão criar em `/crons` pede quatro linhas: título, cron de 5 campos ou data ISO com offset, fuso IANA, instrução completa (pode ocupar mais linhas). Em seguida apresenta prévia e confirmação. Chat/usuário/tópico/bot/conversa de origem são imutáveis no cron e em cada ocorrência admitida. Destino removido/revogado/fechado falha explicitamente, sem fallback. Pausa/exclusão impede ocorrências futuras; execução já admitida pode terminar. Agendar não aprova ações externas futuras.
-
-### Execuções agendadas
-
-Cada ocorrência fica registrada por **7 dias**: início/fim, status (`ok`, `erro`, `silencioso`), resumo curto e as ferramentas MCP que concluíram — mais as que tiveram aprovação pulada. O assistente lê com a ferramenta `tasks_runs`, filtrando por agendamento e período (padrão: últimas 24h).
-
-A entrega é o tópico do próprio agendamento. `tasks_edit` alterna entre **origin** (posta naquele tópico) e **none** (nenhuma mensagem, só efeitos colaterais). Não existe destino web, e o agendamento nunca muda de chat ou tópico.
-
-Resposta vazia, só espaços ou apenas `<silent/>` não posta nada e é registrada como `silencioso`; o sentinela nunca é enviado. Dentro de uma execução agendada, um pedido de aprovação MCP não é aguardado: o passo é pulado, marcado como `skipped` no ledger e no log, e a execução segue. O assistente continua sem aprovar ou retomar pendências por conta própria.
-
-Uma foto — ou um documento cujo tipo é imagem — chega como **parte de imagem na entrada do modelo**: o modelo lê direto, e a legenda vira o texto do turno (`[imagem]` quando não há). Aplicamos um teto próprio de 5 MB sobre o limite de download do Telegram; acima disso, e para qualquer outro tipo de anexo (áudio, PDF), o chat recebe uma recusa curta em vez de silêncio. O ledger e a chave de deduplicação continuam textuais, então um update reentregue segue deduplicado, e a imagem não sai da tua infraestrutura.
-
-Um recado de voz é transcrito e **a transcrição vira o texto do turno** — o áudio em si nunca entra no contexto do modelo. A transcrição roda no sandbox do Executor, contra a integração que expuser uma tool de transcrição (hoje o Gemini, porque ele aceita base64 dentro de JSON); nenhuma credencial do provedor fica neste app. Recados de até 10 MB são aceitos, e uma transcrição que falha responde no chat em vez de admitir um turno vazio.
-
-Turno que termina **sem resposta** não fica mais em silêncio: o chat recebe a **categoria** que o pi-durable reporta (`model_error`, `no_model`, `stale`, `reset`) e o log de execução guarda a categoria mais o detalhe upstream, legível com `tasks_runs`. A exceção é `/stop`: aborto pedido pelo usuário continua silencioso. Só a categoria chega ao chat — texto cru do provedor nunca é repassado, então um erro de provider não vaza segredo nem o texto. Se aparecer `model_error` com detalhe de compactação, confira se o `LLM_MODELS` declara os limites reais do modelo: sem ele os padrões conservadores da descoberta (32768 de contexto / 4096 de saída) não deixam quase espaço para a compactação automática, e o resumo dela falha.
-
-O volume mantém `app.sqlite` e `durable.sqlite` com WAL: histórico, mapeamentos, preferências, crons e registros de entrega/aprovação. Use uma réplica; o lock impede dois donos do diretório. Pare o container para copiar o volume inteiro. `docker compose down` preserva os dados; **`down -v` apaga o volume**. Reconstrua passando `SOURCE_COMMIT` para identificar a versão em `/status`.
-
-Container sem root (uid 1000), filesystem somente leitura, capabilities removidas, SIGTERM/SIGINT gracioso. Healthcheck verifica heartbeat local fresco após polling bem-sucedido e fila; não chama IA/ferramentas e não garante que todos os MCPs estejam online. Erros transitórios têm backoff. Resultado ambíguo de envio Telegram exige verificação, sem reenvio automático que poderia duplicar mensagem.
-
-```sh
-npm ci
-npm run check
-npm run lint
-npm run format:check
-npm run build
-npm test
-docker compose config --quiet
-```
-
-Testes usam mocks, SDK MCP real em loopback, SQLite temporário e smoke de container offline. Nenhum email, bot real, chamada paga ou deploy é necessário. [Evidências e limites](docs/verification.md).
+Notas de deploy em Coolify e VPS estão em [docs/coolify.md](docs/coolify.md) e [docs/verification.md](docs/verification.md).
