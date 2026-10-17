@@ -76,8 +76,11 @@ substituídas pelo par `LLM_*`.
 
 O `docker-compose.yml` repassa explicitamente ao container apenas
 `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `SOURCE_COMMIT`, `LLM_BASE_URL`,
-`LLM_API_KEY`, `LLM_MODELS`, `EXECUTOR_TOKEN` e `EXECUTOR_MCP_URL` (além de `NODE_ENV`
-e `DATA_DIR`, fixados no arquivo).
+`LLM_API_KEY`, `LLM_MODELS`, `LLM_INPUT`, `VISION_MODE`, `VISION_MODEL`,
+`VISION_BASE_URL`, `VISION_API_KEY`, `AUDIO_MODEL`, `AUDIO_API`, `AUDIO_BASE_URL`,
+`AUDIO_API_KEY`, `AUDIO_LANGUAGE`, `EXECUTOR_TOKEN` e `EXECUTOR_MCP_URL` (além de
+`NODE_ENV` e `DATA_DIR`, fixados no arquivo). Em branco significam "não configurado":
+o bot sobe sem visão e sem áudio e responde explicando o que falta.
 
 As demais variáveis chegam ao processo pelo `env_file: .env`, opcional e relativo ao
 diretório do compose. O Coolify normalmente materializa as variáveis do painel nesse

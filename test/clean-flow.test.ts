@@ -43,7 +43,7 @@ async function until(check: () => boolean) {
   }
   assert.ok(check());
 }
-async function fixture() {
+async function fixture(bootstrap: { modelId?: string; effort?: string } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "pi-clean-"));
   const models = createModels();
   models.setProvider(
@@ -118,7 +118,7 @@ async function fixture() {
     initialize: (store: Runtime["store"]) =>
       configureTelegram(store, config, { id: 123, username: "test_bot" }),
   };
-  let app = await Runtime.open(options);
+  let app = await Runtime.open({ ...options, ...bootstrap });
   type View = {
     id: number;
     text: string;
@@ -131,14 +131,16 @@ async function fixture() {
   let nextId = 1,
     messageId = 500,
     fail = false;
+  const downloads: string[] = [];
   const engine = () =>
     new Telegram(
       app,
       {
-        downloadFile: async () => ({
+        downloadFile: async (fileId: string) => {
+          downloads.push(fileId);
           // minimal valid PNG header; the model layer never decodes it in tests
-          data: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]),
-        }),
+          return { data: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]) };
+        },
         send: async (chat, text, opts) => {
           if (fail) throw new TelegramSendRefused(400);
           const id = messageId++;
@@ -227,6 +229,7 @@ async function fixture() {
     return b.callback_data;
   };
   return {
+    downloads,
     get app() {
       return app;
     },
@@ -781,11 +784,11 @@ test("configuration only registers API credentials and validates endpoint/model 
   );
   await assert.rejects(
     () => environmentModels({ LLM_BASE_URL: "https://llm.example/v1" }),
-    /LLM_API_KEY/,
+    /chave de API/,
   );
   await assert.rejects(
     () => environmentModels({ LLM_API_KEY: "synthetic-key" }),
-    /LLM_BASE_URL/,
+    /endpoint do provedor/,
   );
   await assert.rejects(
     () =>
@@ -1606,7 +1609,7 @@ test("clean accepts legacy group chat type in allowlist", async () => {
     };
     await f.bot.receive(update);
     await f.bot.flush();
-    assert.match(f.views.at(-1)!.text, /Modelo:/);
+    assert.match(f.views.at(-1)!.text, /Modelos:/);
   } finally {
     await f.close();
   }
@@ -1666,6 +1669,471 @@ test("an unsupported attachment answers with what is accepted instead of staying
     assert.match(f.views.at(-1)!.text, /só leio imagens/);
     // nada foi admitido: nem conversa foi criada para este chat
     assert.equal(f.app.telegramChats.selection(f.owner), undefined);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a voice note is transcribed and the transcription becomes the turn text", async () => {
+  const f = await fixture();
+  const originalFetch = globalThis.fetch;
+  const before = {
+    model: process.env.AUDIO_MODEL,
+    key: process.env.AUDIO_API_KEY,
+    base: process.env.AUDIO_BASE_URL,
+  };
+  try {
+    process.env.AUDIO_MODEL = "whisper-1";
+    process.env.AUDIO_API_KEY = "sk-audio";
+    process.env.AUDIO_BASE_URL = "https://audio.example/v1";
+    const requests: { url: string; form?: FormData }[] = [];
+    globalThis.fetch = (async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      requests.push({
+        url: String(input),
+        ...(init?.body instanceof FormData ? { form: init.body } : {}),
+      });
+      return new Response(JSON.stringify({ text: "reunião sexta às dez" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    await f.bot.receive({
+      update_id: 900003,
+      message: {
+        message_id: 900003,
+        from: { id: 42 },
+        chat: { id: -100123, type: "supergroup" },
+        message_thread_id: 11,
+        voice: {
+          file_id: "voice-1",
+          mime_type: "audio/ogg",
+          file_size: 2048,
+          duration: 3,
+        },
+      },
+    });
+    await f.bot.flush();
+    assert.equal(requests.length, 1);
+    assert.match(requests[0].url, /\/audio\/transcriptions$/);
+    assert.equal(requests[0].form?.get("model"), "whisper-1");
+    // Telegram sends OGG/Opus, so the upload must carry that name
+    assert.equal((requests[0].form?.get("file") as File).name, "voice.ogg");
+    const conversationId = f.app.telegramChats.selection(f.owner)!;
+    const conversation = await f.app.conversation(conversationId);
+    const page = await conversation.entries({}, 50, undefined, context);
+    const user = page.items.filter((entry) => entry.kind === "pi.user");
+    assert.equal(user.length, 1);
+    assert.match(JSON.stringify(user[0].model), /reunião sexta às dez/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const [name, value] of [
+      ["AUDIO_MODEL", before.model],
+      ["AUDIO_API_KEY", before.key],
+      ["AUDIO_BASE_URL", before.base],
+    ] as const) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    await f.close();
+  }
+});
+
+test("a photo pick stays legible and inside the byte budget", async () => {
+  const f = await fixture();
+  try {
+    await f.bot.receive({
+      update_id: 900004,
+      message: {
+        message_id: 900004,
+        from: { id: 42 },
+        chat: { id: -100123, type: "supergroup" },
+        message_thread_id: 11,
+        photo: [
+          { file_id: "tiny", width: 320, height: 240, file_size: 12_000 },
+          { file_id: "legible", width: 1280, height: 960, file_size: 100_000 },
+          { file_id: "huge", width: 2560, height: 1920, file_size: 900_000 },
+        ],
+      },
+    });
+    await f.bot.flush();
+    // the download request carries the chosen file id, never the over-budget size
+    assert.deepEqual(f.downloads, ["legible"]);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a text-only chat model receives the image as a vision description", async () => {
+  const f = await fixture();
+  const originalFetch = globalThis.fetch;
+  const before = {
+    model: process.env.VISION_MODEL,
+    key: process.env.VISION_API_KEY,
+  };
+  try {
+    // same model id, now declaring text only: the routing must notice
+    f.app.models.setProvider(
+      fauxProvider({
+        models: [
+          { id: "faux-1", reasoning: true, input: ["text"] },
+          { id: "faux-2", reasoning: true },
+        ],
+      }).provider,
+    );
+    process.env.VISION_MODEL = "vision-1";
+    process.env.VISION_API_KEY = "sk-vision";
+    const urls: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      urls.push(String(input));
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: "TEXTO DA IMAGEM" } }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+    await f.bot.receive({
+      update_id: 900005,
+      message: {
+        message_id: 900005,
+        from: { id: 42 },
+        chat: { id: -100123, type: "supergroup" },
+        message_thread_id: 11,
+        photo: [
+          { file_id: "photo-9", width: 1280, height: 960, file_size: 90_000 },
+        ],
+      },
+    });
+    await f.bot.flush();
+    assert.equal(urls.length, 1);
+    assert.match(urls[0], /\/chat\/completions$/);
+    const conversationId = f.app.telegramChats.selection(f.owner)!;
+    const conversation = await f.app.conversation(conversationId);
+    const page = await conversation.entries({}, 50, undefined, context);
+    const user = page.items.filter((entry) => entry.kind === "pi.user");
+    assert.equal(user.length, 1);
+    // the description replaced the image part: the history stays text
+    assert.match(JSON.stringify(user[0].model), /TEXTO DA IMAGEM/);
+    assert.doesNotMatch(JSON.stringify(user[0].model), /"type":"image"/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (before.model === undefined) delete process.env.VISION_MODEL;
+    else process.env.VISION_MODEL = before.model;
+    if (before.key === undefined) delete process.env.VISION_API_KEY;
+    else process.env.VISION_API_KEY = before.key;
+    await f.close();
+  }
+});
+
+test("the setup record persists vision and audio under one key", async () => {
+  const f = await fixture();
+  try {
+    assert.equal(f.app.settings.setup(), undefined);
+    f.app.store.run(
+      "INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      `setup:${f.app.options.mode ?? "demo"}`,
+      JSON.stringify({
+        providerId: "custom",
+        baseUrl: "https://api.example/v1",
+        modelId: "m-1",
+        vision: { modelId: "vision-1" },
+        audio: {
+          modelId: "whisper-1",
+          api: "openai",
+          baseUrl: "https://api.openai.com/v1",
+          language: "pt",
+        },
+      }),
+    );
+    const setup = f.app.settings.setup();
+    assert.equal(setup?.vision?.modelId, "vision-1");
+    assert.equal(setup?.audio?.language, "pt");
+  } finally {
+    await f.close();
+  }
+});
+/** Temporary env values, restored afterwards. */
+async function withEnv(
+  vars: Record<string, string | undefined>,
+  body: () => Promise<void>,
+) {
+  const before: Record<string, string | undefined> = {};
+  for (const [name, value] of Object.entries(vars)) {
+    before[name] = process.env[name];
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+  try {
+    await body();
+  } finally {
+    for (const [name, value] of Object.entries(before)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
+/** Raw text of the newest user turn: the string the chat model actually reads. */
+async function lastUserText(f: Awaited<ReturnType<typeof fixture>>) {
+  const id = f.app.telegramChats.selection(f.owner)!;
+  const conversation = await f.app.conversation(id);
+  const page = await conversation.entries({}, 50, undefined, context);
+  const user = page.items.filter((entry) => entry.kind === "pi.user");
+  const messages = user.at(-1)!.model as readonly {
+    role: string;
+    content: unknown;
+  }[];
+  const content = messages.find((message) => message.role === "user")?.content;
+  return typeof content === "string" ? content : JSON.stringify(content);
+}
+
+const voiceUpdate = (id: number) => ({
+  update_id: id,
+  message: {
+    message_id: id,
+    from: { id: 42 },
+    chat: { id: -100123, type: "supergroup" },
+    message_thread_id: 11,
+    voice: {
+      file_id: "voice-1",
+      mime_type: "audio/ogg",
+      file_size: 2048,
+      duration: 3,
+    },
+  },
+});
+
+test("origin: a transcript reaches the model marked as audio, verbatim", async () => {
+  const f = await fixture();
+  const originalFetch = globalThis.fetch;
+  try {
+    await withEnv(
+      {
+        AUDIO_MODEL: "whisper-1",
+        AUDIO_API_KEY: "sk-audio",
+        AUDIO_BASE_URL: "https://audio.example/v1",
+      },
+      async () => {
+        globalThis.fetch = (async () =>
+          new Response(JSON.stringify({ text: "reunião sexta às dez" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })) as typeof fetch;
+        await f.bot.receive(voiceUpdate(901001));
+        await f.bot.flush();
+      },
+    );
+    const text = await lastUserText(f);
+    assert.match(
+      text,
+      /^\[áudio transcrito · \{"origin":"audio","model":"whisper-1"\}\]/,
+    );
+    // verbatim: the transcription is not corrected, summarized or wrapped
+    assert.match(text, /reunião sexta às dez$/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await f.close();
+  }
+});
+
+test("origin: an automated image description is marked as image", async () => {
+  const f = await fixture();
+  const originalFetch = globalThis.fetch;
+  try {
+    // the model cannot see, so the auxiliary backend describes the picture
+    f.app.models.setProvider(
+      fauxProvider({
+        models: [
+          { id: "faux-1", reasoning: true, input: ["text"] },
+          { id: "faux-2", reasoning: true },
+        ],
+      }).provider,
+    );
+    await withEnv(
+      { VISION_MODEL: "vision-1", VISION_API_KEY: "sk-vision" },
+      async () => {
+        globalThis.fetch = (async () =>
+          new Response(
+            JSON.stringify({
+              choices: [{ message: { content: "um gráfico de vendas" } }],
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          )) as typeof fetch;
+        await f.bot.receive({
+          update_id: 901002,
+          message: {
+            message_id: 901002,
+            from: { id: 42 },
+            chat: { id: -100123, type: "supergroup" },
+            message_thread_id: 11,
+            photo: [
+              {
+                file_id: "photo-1",
+                width: 1280,
+                height: 960,
+                file_size: 90_000,
+              },
+            ],
+          },
+        });
+        await f.bot.flush();
+      },
+    );
+    const text = await lastUserText(f);
+    assert.match(
+      text,
+      /^\[imagem: descrição automática · \{"origin":"image","model":"vision-1"\}\]/,
+    );
+    assert.match(text, /um gráfico de vendas/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await f.close();
+  }
+});
+
+test("origin: typed text carries no prefix and no metadata", async () => {
+  const f = await fixture();
+  try {
+    // user 42 is in the allowlist; anything else is dropped before the turn
+    await f.send("bom dia, tudo certo?", 11, -100123, 42);
+    const text = await lastUserText(f);
+    assert.equal(text, "bom dia, tudo certo?");
+  } finally {
+    await f.close();
+  }
+});
+
+test("origin: a failed transcription is admitted with the error, never dropped", async () => {
+  const f = await fixture();
+  const originalFetch = globalThis.fetch;
+  try {
+    await withEnv(
+      {
+        AUDIO_MODEL: "whisper-1",
+        AUDIO_API_KEY: "sk-audio",
+        AUDIO_BASE_URL: "https://audio.example/v1",
+      },
+      async () => {
+        globalThis.fetch = (async () =>
+          new Response("nope", { status: 500 })) as typeof fetch;
+        await f.bot.receive(voiceUpdate(901004));
+        await f.bot.flush();
+      },
+    );
+    const text = await lastUserText(f);
+    assert.match(
+      text,
+      /^\[áudio · \{"origin":"audio","error":"resposta 500"\}\]/,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    await f.close();
+  }
+});
+
+test("the stored setup bootstraps the default until a choice is stored", async () => {
+  // the setup is a bootstrap, not a policy: it seeds the first default
+  const boot = await fixture({ modelId: "faux-2", effort: "low" });
+  try {
+    assert.deepEqual(boot.app.settings.defaults(), {
+      provider: "faux",
+      modelId: "faux-2",
+      effort: "low",
+    });
+  } finally {
+    await boot.close();
+  }
+  // a typo must fail at startup instead of silently running another model
+  await assert.rejects(() => fixture({ modelId: "does-not-exist" }));
+});
+
+test("/status shows the chat, vision and transcription models", async () => {
+  const f = await fixture();
+  try {
+    // exactly what the wizard writes: one record, one key per function
+    f.app.store.run(
+      "INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      `setup:${f.app.options.mode ?? "demo"}`,
+      JSON.stringify({
+        providerId: "custom",
+        baseUrl: "https://api.chat.example/v1",
+        modelId: "faux-1",
+        effort: "high",
+        vision: {
+          modelId: "gemini-3.5-flash-lite",
+          baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+        },
+        audio: {
+          modelId: "whisper-1",
+          api: "openai",
+          baseUrl: "https://api.openai.com/v1",
+          language: "pt",
+        },
+      }),
+    );
+    for (const [provider, key] of [
+      ["llm", "sk-chat"],
+      ["llm-vision", "g-key"],
+      ["llm-audio", "o-key"],
+    ])
+      f.app.store.run(
+        "INSERT INTO credentials VALUES (?,?) ON CONFLICT(provider) DO UPDATE SET value=excluded.value",
+        provider,
+        JSON.stringify({ type: "api_key", key }),
+      );
+    await f.send("/status", 11, -100123, 42);
+    const text = f.views.at(-1)!.text;
+    assert.match(
+      text,
+      /^Modelos:\nTexto: faux-1\nVisão: gemini-3\.5-flash-lite\nÁudio: whisper-1 \(pt\)\nEsforço: /,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("the probed chatVision decides whether an image is native", async () => {
+  const f = await fixture();
+  try {
+    // the catalog says text only, but the probe said the model reads images
+    f.app.models.setProvider(
+      fauxProvider({
+        models: [
+          { id: "faux-1", reasoning: true, input: ["text"] },
+          { id: "faux-2", reasoning: true },
+        ],
+      }).provider,
+    );
+    f.app.store.run(
+      "INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      `setup:${f.app.options.mode ?? "demo"}`,
+      JSON.stringify({
+        providerId: "custom",
+        baseUrl: "https://api.example/v1",
+        modelId: "faux-1",
+        chatVision: true,
+      }),
+    );
+    await f.bot.receive({
+      update_id: 902001,
+      message: {
+        message_id: 902001,
+        from: { id: 42 },
+        chat: { id: -100123, type: "supergroup" },
+        message_thread_id: 11,
+        photo: [
+          { file_id: "photo-1", width: 1280, height: 960, file_size: 50_000 },
+        ],
+      },
+    });
+    await f.bot.flush();
+    const text = await lastUserText(f);
+    // native: the image itself reached the model, no description, no refusal
+    assert.match(text, /"type":"image"|\[imagem/);
+    assert.doesNotMatch(text, /descrição automática/);
   } finally {
     await f.close();
   }

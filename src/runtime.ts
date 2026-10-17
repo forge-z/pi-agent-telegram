@@ -117,6 +117,8 @@ interface RuntimeOptions {
   models?: MutableModels;
   mode?: "demo" | "live";
   modelId?: string;
+  /** Bootstrap thinking level from the stored setup; a later choice always wins. */
+  effort?: string;
   provider?: string;
   webOrigin?: string;
   now?: () => number;

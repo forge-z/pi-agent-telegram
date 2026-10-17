@@ -1,3 +1,4 @@
+import type { StoredSetup } from "./setup.js";
 import { readFileSync } from "node:fs";
 import {
   createModels,
@@ -5,6 +6,7 @@ import {
   type MutableModels,
 } from "@earendil-works/pi-ai/models";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+import { knownModelRows } from "./providers.js";
 import type {
   ModelThinkingLevel,
   ThinkingLevelMap,
@@ -321,13 +323,6 @@ export async function discoverLlmModels(
     reasoning: false,
   }));
 }
-/** Validated `LLM_BASE_URL`: HTTPS (loopback may use HTTP), no credentials/query, no trailing slash. */
-export function llmBaseUrl(env: Env = process.env) {
-  const raw = env.LLM_BASE_URL?.trim();
-  if (!raw)
-    throw new Error("Configure LLM_BASE_URL (endpoint OpenAI-compatible).");
-  return endpoint(raw);
-}
 /** Friendly names for endpoints we can identify. Anything else falls back to its host. */
 const KNOWN_ENDPOINTS: Record<string, string> = {
   "api.deepseek.com": "DeepSeek",
@@ -367,18 +362,56 @@ export function providerNameFromEndpoint(baseUrl: string) {
   return label ? label.charAt(0).toUpperCase() + label.slice(1) : host;
 }
 /**
+ * What the chat model accepts. The catalog cannot tell vision apart, so it is declared:
+ * LLM_INPUT=text makes a text-only model honest instead of letting the provider replace
+ * an image with a text marker.
+ */
+function declaredInput(env: Env) {
+  const raw = env.LLM_INPUT?.trim().toLowerCase();
+  if (!raw) return ["text" as const, "image" as const];
+  const images = raw
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part === "image");
+  return ["text" as const, ...images.map(() => "image" as const)];
+}
+/**
  * Registers the one OpenAI-compatible provider from LLM_BASE_URL and LLM_API_KEY.
  * LLM_MODELS declares the catalog explicitly (and is the only way to enable
  * reasoning); without it the catalog is read from `GET {LLM_BASE_URL}/models`.
  * No credential store or OAuth registration: only server-side API keys.
  */
+/**
+ * No usable provider: the bot waits for `npm run setup` instead of exiting, so the
+ * container keeps the terminal needed to fix it.
+ */
+export class SetupRequiredError extends Error {
+  constructor(missing = "provedor, chave") {
+    super(
+      `Configuração inicial ausente (${missing}). Rode \`npm run setup\` no terminal do container.`,
+    );
+  }
+}
 export async function environmentModels(
   env: Env = process.env,
-  deps: { fetch?: typeof fetch } = {},
+  deps: {
+    fetch?: typeof fetch;
+    /** Written by `npm run setup`; env stays the declarative override. */
+    /** Exactly what `readStoredSetup` returns: one shape, so the two cannot drift. */
+    stored?: StoredSetup;
+  } = {},
 ): Promise<MutableModels> {
-  const baseUrl = llmBaseUrl(env);
-  const key = operatorSecret(env, "LLM_API_KEY");
-  if (!key) throw new Error("Configure LLM_API_KEY ou LLM_API_KEY_FILE.");
+  // Env wins, as documented everywhere else: an operator who exports LLM_* keeps
+  // control, and the stored setup covers the case where nothing is exported.
+  const rawBase =
+    env.LLM_BASE_URL?.trim() || deps.stored?.record?.baseUrl?.trim();
+  const key = operatorSecret(env, "LLM_API_KEY") || deps.stored?.apiKey;
+  // Half a configuration is still "not configured": waiting is recoverable, exiting
+  // leaves a container that the platform restarts forever.
+  if (!rawBase && !key) throw new SetupRequiredError();
+  if (!rawBase) throw new SetupRequiredError("endpoint do provedor");
+  if (!key) throw new SetupRequiredError("chave de API");
+  const baseUrl = endpoint(rawBase);
   let catalog = parseLlmModels(env.LLM_MODELS);
   if (!catalog) {
     try {
@@ -389,6 +422,19 @@ export async function environmentModels(
         `Catálogo de modelos indisponível em LLM_BASE_URL${reason}; defina LLM_MODELS explicitamente.`,
       );
     }
+    // Discovery reports ids only, so every model would claim no reasoning and offer
+    // "off" alone. Curated rows restore limits and levels for the ids we know;
+    // anything else keeps the conservative defaults.
+    const known = knownModelRows(baseUrl);
+    if (Object.keys(known).length)
+      catalog =
+        parseLlmModels(
+          catalog
+            .map(
+              (model) => known[model.id.replace(/^models\//, "")] ?? model.id,
+            )
+            .join(","),
+        ) ?? catalog;
   }
   if (!catalog.length)
     throw new Error(
@@ -407,10 +453,8 @@ export async function environmentModels(
         provider: LLM_PROVIDER_ID,
         baseUrl,
         // The declared input is what the provider uses to decide whether an image
-        // part is sent or replaced by a text marker; the catalog cannot tell vision
-        // apart. deepseek-flash reads images, and a text-only model now fails loudly
-        // on the first image instead of silently getting a marker.
-        input: ["text" as const, "image" as const],
+        // part is sent or replaced by a text marker; LLM_INPUT declares it.
+        input: declaredInput(env),
         reasoning: model.reasoning,
         contextWindow: model.contextWindow,
         maxTokens: model.maxTokens,

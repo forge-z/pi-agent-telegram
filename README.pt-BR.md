@@ -44,33 +44,77 @@ Ou `npm run diagnose`. O script valida variáveis (sem mostrar segredos), `readC
 bash scripts/diagnose-tg-deploy.sh .
 ```
 
+## Primeira subida: rode o setup
+
+**Só duas variáveis são obrigatórias para subir:** `TELEGRAM_BOT_TOKEN` e `TELEGRAM_ALLOWED_USERS`. O resto — provedor, endpoint, chave, modelo, esforço, e os modelos de visão e áudio — é escolhido uma vez no terminal e fica gravado no volume.
+
+```sh
+# com o container de pé (ele fica esperando quando ainda não há configuração)
+docker exec -it <container> npm run setup
+# com compose puro, antes da primeira subida:
+docker compose run --rm pi-agent-tg npm run setup
+```
+
+O bot **não** morre sem provedor: registra que falta configuração, mantém o container vivo e começa a responder sozinho poucos segundos depois do assistente terminar — sem restart.
+
+O que fica gravado: provedor, endpoint, modelo, esforço e os modelos de visão/áudio em `meta` (`setup:live`), e a chave em `credentials` — o mesmo lugar de onde o pi-ai já lê credenciais. `LLM_*` / `VISION_*` / `AUDIO_*` continuam valendo como override declarativo e, quando presentes, **vencem** o registro do volume.
+
 ## Ambiente e modelos
 
-**A primeira configuração é no terminal, não no Telegram.** Abra o terminal do container (Coolify → terminal do serviço) e defina o padrão global ali:
+**A primeira configuração é no terminal, não no Telegram:** `npm run setup` (veja a seção de primeira subida). Depois disso, `/model` e `/thinking` mudam só aquela conversa, e rodar o setup de novo move o padrão global.
 
-```sh
-npm run setup-model -- --list
-npm run setup-model -- --model llm/<id> --effort high
-```
-
-Esse é o passo inicial pretendido: lista o catálogo e grava o padrão usado por conversas novas. O que os menus do Telegram mudam depois (`/model`, `/thinking`) vale **só para aquela conversa**; o `setup-model` é a única forma de mover o padrão global de dentro do deploy.
-
-`MODEL_PROVIDER` e `MODEL_ID` foram removidas: não há modelo fixado no ambiente. `LLM_BASE_URL` + `LLM_API_KEY` registram um único provedor OpenAI-compatible com id `llm`. A URL é usada literalmente como raiz (`https://api.openai.com/v1`, `https://api.deepseek.com`). Sem `LLM_MODELS`, o catálogo vem de `GET {LLM_BASE_URL}/models`; como a descoberta não informa capacidades, `/thinking` fica só em `off`. Declare o catálogo com limites e níveis: cada entrada é `id` ou `id|contextWindow|maxTokens|reasoning`, e `reasoning` aceita `false`, `true` ou os níveis exatos separados por `+` (ex.: `LLM_MODELS=deepseek-flash|1000000|384000|off+low+high+max` — a DeepSeek recusa `minimal`/`medium` e aceita `max`). Uma conversa sem seleção salva usa o **primeiro item do catálogo** e o bot avisa uma vez por conversa até existir escolha. `/model` e `/thinking` persistem na conversa após restart/redeploy e sempre têm precedência.
-
-Para definir o padrão global (novas conversas) direto do terminal do container:
-
-```sh
-npm run setup-model -- --list
-npm run setup-model -- --model llm/<id> --effort high
-```
-
-Sem argumentos, num terminal interativo, abre um menu numerado. Exemplos das variáveis em [.env.example](.env.example). Não há OAuth de assinatura.
+Só duas variáveis são obrigatórias: `TELEGRAM_BOT_TOKEN` e `TELEGRAM_ALLOWED_USERS`. O provider (`LLM_*`, `VISION_*`, `AUDIO_*`) é gravado pelo setup e continua valendo como override quando definido — e nesse caso **vence** o registro do volume. O Compose declara apenas as duas do Telegram e as duas do Executor; o resto chega por `env_file: .env`. Sem `LLM_MODELS`, o catálogo vem de `GET {LLM_BASE_URL}/models`, que não informa capacidades, então `/thinking` fica só em `off` — declarar o catálogo (`id|contextWindow|maxTokens|reasoning`) é o que habilita esforço e limites reais.
 
 O Compose injeta `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODELS`, `EXECUTOR_MCP_URL` e `EXECUTOR_TOKEN`. **Variável do painel que o compose não declara não chega ao container** — o Coolify só repassa o que o bloco `environment:` mapeia; acrescente a linha ali antes de configurar `TELEGRAM_ALLOWED_CHATS`, `MCP_SERVERS_JSON`, `MCP_CONFIG_FILE` ou `*_FILE`. Os opcionais — `TELEGRAM_ALLOWED_CHATS` (grupos), `LLM_MODELS` (raciocínio além de `off`), `MCP_SERVERS_JSON`, `*_FILE` — **não** são declarados no compose, para não aparecerem como variáveis dele: defina no painel ou no `.env`. Build local: `npm run compose:up` exporta `SOURCE_COMMIT`. Não é preciso habilitar nada no painel do Coolify para o SHA aparecer em `/status`. Substitua os placeholders do `.env.example` por valores reais. A subida imprime mensagens seguras (por exemplo falta de `LLM_API_KEY` ou token Telegram inválido); falhas de rede continuam genéricas.
 
 `EXECUTOR_MCP_URL` define o endpoint HTTPS do Executor neste deploy (auto-hospedado ou nuvem). **Não há URL real no git** — configure na UI do Coolify ou no `.env` do servidor. O Executor só entra na configuração MCP quando `EXECUTOR_TOKEN` também estiver definido (sem token, o bot ainda pode subir, mas ferramentas MCP ficam indisponíveis). `EXECUTOR_TOKEN` é a chave crua (`Authorization: Bearer` é montado pela aplicação). Se `MCP_SERVERS_JSON` estiver preenchido e não for `[]`, ele substitui `EXECUTOR_MCP_URL` (vários servidores). Fora do Compose, vale a mesma regra, ou use `MCP_CONFIG_FILE`. [Exemplo MCP](docs/mcp.example.json). Endpoints exigem HTTPS; HTTP só em loopback para testes/desenvolvimento.
 
 Segredos são variáveis de runtime no servidor/Coolify, nunca argumentos de build. Chaves/tokens aceitam `NAME_FILE` com arquivo montado somente leitura. A aplicação guarda apenas fingerprint do token Telegram no ledger; chaves de IA ficam em memória. Históricos e resultados podem ser sensíveis: proteja volume e backups. Exceções cruas não entram nos logs; valores secretos conhecidos são redigidos na saída Telegram.
+
+## Visão e áudio (opcional)
+
+Nada disso é obrigatório. Modelo multimodal e nenhuma variável extra é o padrão: imagem vai direto para ele, e recado de voz responde com uma nota curta dizendo que áudio não está configurado.
+
+| Modelo do chat                  | `VISION_MODEL` | O que acontece com a imagem                                               |
+| ------------------------------- | -------------- | ------------------------------------------------------------------------- |
+| lê imagem (`LLM_INPUT` ausente) | ausente        | vai como parte de imagem (mais barato, fidelidade total)                  |
+| lê imagem                       | definido       | continua como parte de imagem; `VISION_MODE=text` força o modelo auxiliar |
+| só texto (`LLM_INPUT=text`)     | definido       | o modelo auxiliar descreve e entra como texto                             |
+| só texto                        | ausente        | o bot explica que o modelo não lê imagem                                  |
+
+Áudio é sempre texto: o `pi-ai` não tem parte de áudio, então o recado é transcrito e **a transcrição vira o texto do turno**. O áudio nunca entra no contexto do modelo nem no histórico.
+
+Toda mensagem convertida diz ao modelo de texto de onde ela veio, no próprio texto que ele lê:
+
+```
+[áudio transcrito · {"origin":"audio","model":"whisper-1"}]
+reunião sexta às dez
+[imagem: descrição automática · {"origin":"image","model":"gemini-3-flash"}]
+um gráfico de vendas
+```
+
+Texto digitado vai sem prefixo. A transcrição chega ao modelo verbatim. Quando um especialista falha, a mensagem é admitida mesmo assim, com a origem e o motivo (`{"origin":"audio","error":"resposta 500"}`), para o modelo responder ao usuário em vez de ficar em silêncio.
+
+**O modelo de áudio precisa aceitar OGG/Opus.** É o único formato que o Telegram usa num recado de voz. `whisper-1`, Gemini e Groq leem direto; a família `gpt-4o-transcribe` não lista `ogg` e falha, porque converter exigiria ffmpeg na imagem. A falha responde no chat, nunca em silêncio.
+
+```sh
+# visão, mesmo provedor do chat (chave/endpoint vazios herdam os do chat)
+VISION_MODEL=<modelo com visão>
+# visão em outro provedor: superfície OpenAI-compatible do Gemini
+VISION_MODEL=gemini-3-flash
+VISION_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+VISION_API_KEY=<chave do Gemini>
+# áudio via multipart compatível com OpenAI
+AUDIO_MODEL=whisper-1
+AUDIO_API_KEY=sk-...
+# áudio via Gemini (JSON com base64, não multipart)
+AUDIO_MODEL=gemini-3-flash
+AUDIO_API=gemini
+```
+
+`VISION_API_KEY` / `AUDIO_API_KEY` vazios herdam `LLM_API_KEY` **só quando o endpoint é do mesmo host** do chat (a Groq serve chat e áudio assim); em qualquer outro host, defina a chave, senão a função fica desligada em vez de falhar com um 401 confuso.
+
+Escolha os modelos no terminal com `npm run setup-model` (o menu pergunta chat, imagem e áudio); as chaves ficam no ambiente e nunca são gravadas no banco nem mostradas na tela.
 
 ## Comandos
 
@@ -116,6 +160,8 @@ A entrega é o tópico do próprio agendamento. `tasks_edit` alterna entre **ori
 Resposta vazia, só espaços ou apenas `<silent/>` não posta nada e é registrada como `silencioso`; o sentinela nunca é enviado. Dentro de uma execução agendada, um pedido de aprovação MCP não é aguardado: o passo é pulado, marcado como `skipped` no ledger e no log, e a execução segue. O assistente continua sem aprovar ou retomar pendências por conta própria.
 
 Uma foto — ou um documento cujo tipo é imagem — chega como **parte de imagem na entrada do modelo**: o modelo lê direto, e a legenda vira o texto do turno (`[imagem]` quando não há). Aplicamos um teto próprio de 5 MB sobre o limite de download do Telegram; acima disso, e para qualquer outro tipo de anexo (áudio, PDF), o chat recebe uma recusa curta em vez de silêncio. O ledger e a chave de deduplicação continuam textuais, então um update reentregue segue deduplicado, e a imagem não sai da tua infraestrutura.
+
+Um recado de voz é transcrito e **a transcrição vira o texto do turno** — o áudio em si nunca entra no contexto do modelo. A transcrição roda no sandbox do Executor, contra a integração que expuser uma tool de transcrição (hoje o Gemini, porque ele aceita base64 dentro de JSON); nenhuma credencial do provedor fica neste app. Recados de até 10 MB são aceitos, e uma transcrição que falha responde no chat em vez de admitir um turno vazio.
 
 Turno que termina **sem resposta** não fica mais em silêncio: o chat recebe a **categoria** que o pi-durable reporta (`model_error`, `no_model`, `stale`, `reset`) e o log de execução guarda a categoria mais o detalhe upstream, legível com `tasks_runs`. A exceção é `/stop`: aborto pedido pelo usuário continua silencioso. Só a categoria chega ao chat — texto cru do provedor nunca é repassado, então um erro de provider não vaza segredo nem o texto. Se aparecer `model_error` com detalhe de compactação, confira se o `LLM_MODELS` declara os limites reais do modelo: sem ele os padrões conservadores da descoberta (32768 de contexto / 4096 de saída) não deixam quase espaço para a compactação automática, e o resumo dela falha.
 

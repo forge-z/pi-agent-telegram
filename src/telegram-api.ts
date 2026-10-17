@@ -9,7 +9,7 @@ type Method =
   | "answerCallbackQuery"
   | "editMessageText"
   | "getFile";
-export interface TelegramFile {
+interface TelegramFile {
   data: Uint8Array;
 }
 export interface TelegramApi {

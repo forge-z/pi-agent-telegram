@@ -5,6 +5,7 @@ import {
 } from "@earendil-works/pi-ai/models";
 import type { Credential, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Runtime } from "./runtime.js";
+import { functionKeyId, setupKey, type SetupRecord } from "./setup.js";
 import { LLM_PROVIDER_ID } from "./config.js";
 
 export interface ModelSettings {
@@ -31,6 +32,40 @@ export class Settings {
       this.defaultsKey,
       JSON.stringify(this.defaults()),
     );
+  }
+  /** Keys the wizard stored for a backend on another host, keyed by function. */
+  setupKeys(): { vision?: string; audio?: string } {
+    const read = (id: string) => {
+      const row = this.app.store.get<{ value: string }>(
+        "SELECT value FROM credentials WHERE provider=?",
+        id,
+      );
+      if (!row) return undefined;
+      try {
+        return (JSON.parse(row.value) as { key?: string }).key || undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    return {
+      vision: read(functionKeyId("vision")),
+      audio: read(functionKeyId("audio")),
+    };
+  }
+  /** The record written by `npm run setup`: provider, model and the optional backends. */
+  setup(): SetupRecord | undefined {
+    const row = this.app.store.get<{ value: string }>(
+      "SELECT value FROM meta WHERE key=?",
+      setupKey(this.app.options.mode ?? "demo"),
+    );
+    if (!row) return undefined;
+    try {
+      const parsed = JSON.parse(row.value) as SetupRecord;
+      return parsed && typeof parsed.modelId === "string" ? parsed : undefined;
+    } catch {
+      /* A hand-edited row must not break the turn; the setup just stays unset. */
+      return undefined;
+    }
   }
   private get initialProvider() {
     return (
@@ -85,10 +120,23 @@ export class Settings {
         "Nenhum modelo disponível. Confira LLM_BASE_URL/LLM_MODELS e rode npm run setup-model.",
       );
     const model = this.app.models.getModel(provider, modelId);
+    // The stored setup is a bootstrap, so a model it names must exist: failing here is
+    // better than silently running another one.
+    if (this.app.options.modelId && !model)
+      throw new SettingsError(
+        `O modelo ${this.app.options.modelId} do setup não está no catálogo do provedor. Rode npm run setup.`,
+      );
+    const wanted = this.app.options.effort;
+    const levels = model ? getSupportedThinkingLevels(model) : [];
     return {
       provider,
       modelId,
-      effort: model ? clampThinkingLevel(model, "high") : "high",
+      effort:
+        wanted && levels.includes(wanted as ModelThinkingLevel)
+          ? (wanted as ModelThinkingLevel)
+          : model
+            ? clampThinkingLevel(model, "high")
+            : "high",
     };
   }
   catalog(provider = this.provider) {

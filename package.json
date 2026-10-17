@@ -8,11 +8,12 @@
     "node": ">=24.0.0"
   },
   "scripts": {
+    "setup": "node scripts/setup-model.mjs",
     "dev": "node --import tsx src/main.ts",
     "start": "node dist/src/main.js",
     "build": "tsc -p tsconfig.json && node scripts/write-build-info.mjs",
     "check": "tsc --noEmit",
-    "lint": "eslint src test",
+    "lint": "eslint src test scripts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "node --import tsx --test --test-concurrency=2 test/*.test.ts",

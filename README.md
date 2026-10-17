@@ -30,57 +30,86 @@ Use a dedicated bot and the new `pi_agent_tg_data` volume. Do not attach another
 
 Configure `TELEGRAM_ALLOWED_USERS`. `TELEGRAM_ALLOWED_CHATS` is optional and defaults to the same IDs (private DM). Set it only for groups or supergroups (negative chat IDs). An update must pass both the user and chat allowlists. Private chats and native forum supergroups (negative chat IDs) are supported. A conversation is scoped to **chat + user + native topic ID**. Use private chats or trusted groups: Telegram group members can see messages even when only allowlisted users can control the bot. Ensure the bot can receive the intended group messages, using Telegram's own group/privacy settings. A pre-existing webhook or a second polling consumer causes a safe startup failure; this app does not remove webhooks.
 
+## First start: run the setup wizard
+
+**Only two variables are required to boot:** `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USERS`. Everything else — provider, endpoint, API key, model, thinking level, vision and audio backends — is chosen once in the terminal and stored in the volume.
+
+```sh
+# while the container is up (it stays up, waiting, when nothing is configured yet)
+docker exec -it <container> npm run setup
+# with plain compose, before the first start:
+docker compose run --rm pi-agent-tg npm run setup
+```
+
+The bot does **not** crash without a provider: it logs that setup is missing, keeps the container alive, and starts answering by itself a few seconds after the wizard finishes — no restart needed.
+
+What the wizard stores: the provider id, endpoint, model, effort and the optional vision/audio models in `meta` (`setup:live`), and the API key in the `credentials` table — the same place pi-ai already reads credentials from. `LLM_*` / `VISION_*` / `AUDIO_*` keep working as a declarative override and, when present, **win** over the stored record.
+
 ## Configuration
 
-| Variable                               | Meaning                                                                           |
-| -------------------------------------- | --------------------------------------------------------------------------------- |
-| `TELEGRAM_BOT_TOKEN`                   | Bot token, server side only                                                       |
-| `TELEGRAM_ALLOWED_USERS`               | Comma-separated user IDs (required)                                               |
-| `LLM_BASE_URL`                         | OpenAI-compatible endpoint registered as the single provider `llm`                |
-| `LLM_API_KEY`                          | API key for that endpoint (raw; no `Bearer` prefix)                               |
-| `LLM_MODELS`                           | Catalog declaration. Needed for `/thinking`: discovery reports no capabilities    |
-| `EXECUTOR_MCP_URL`                     | Executor MCP HTTPS endpoint for this deployment (self-hosted or cloud); see below |
-| `EXECUTOR_TOKEN`                       | Raw Executor API key (`Authorization: Bearer` is added by the app)                |
-| `MCP_SERVERS_JSON` / `MCP_CONFIG_FILE` | Optional full MCP list; when non-empty and not `[]`, replaces `EXECUTOR_MCP_URL`  |
+Required — the container cannot be a bot without them:
 
-The rest of the optional set — `TELEGRAM_ALLOWED_CHATS` (groups/supergroups), `NAME_FILE` variants, `MCP_SERVERS_JSON`, `MCP_CONFIG_FILE` — lives in [.env.example](.env.example). **A panel variable that the compose does not declare never reaches the container**: Coolify forwards only what the `environment:` block maps, so add the line there first. Everything else the image needs is fixed in the Dockerfile or injected by the platform.
+| Variable                 | Meaning                          |
+| ------------------------ | -------------------------------- |
+| `TELEGRAM_BOT_TOKEN`     | Bot token, server side only      |
+| `TELEGRAM_ALLOWED_USERS` | Comma-separated numeric user IDs |
 
-API keys and bot/MCP env tokens also support `NAME_FILE`, pointing to an operator-mounted file. Use runtime secret variables in Coolify; never build arguments. MCP config accepts `tokenEnv` or an operator-mounted `tokenFile`, optional `allowedTools` / `deniedTools`, and only direct mode. Endpoints require HTTPS; HTTP is restricted to loopback for local development/tests. Subscription credentials are unsupported. The `llm` provider speaks the OpenAI-compatible completion API; catalog entries need explicit `contextWindow`, `maxTokens` and `reasoning` because `GET /models` cannot report them.
+Everything else is optional:
 
-Compose injects the variables the process needs to start: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODELS`, `EXECUTOR_MCP_URL` and `EXECUTOR_TOKEN`. `NODE_ENV`, `DATA_DIR` and the commit SHA are not operator configuration: `NODE_ENV` and `DATA_DIR` are fixed by the image and the SHA is injected by the platform at deploy time. Set `EXECUTOR_MCP_URL` per host (self-hosted Executor vs cloud) in `.env`, Coolify, or your shell — the repository does not ship a real Executor URL. Executor MCP is registered only when `EXECUTOR_TOKEN` is also set; until then the bot can start but MCP tools stay unavailable. A non-empty `MCP_SERVERS_JSON` other than `[]` still overrides and supports multiple servers. `EXECUTOR_TOKEN` is the raw API key. The process adds `Authorization: Bearer` itself — do not include the `Bearer ` prefix in the variable.
+| Group      | How to set it                                                                                               |
+| ---------- | ----------------------------------------------------------------------------------------------------------- |
+| Provider   | `npm run setup`. `LLM_*`, `VISION_*`, `AUDIO_*` still work as an override and **win** over it               |
+| MCP        | `EXECUTOR_MCP_URL` + `EXECUTOR_TOKEN`, or a full list in `MCP_SERVERS_JSON` / `MCP_CONFIG_FILE`             |
+| Everything | `TELEGRAM_ALLOWED_CHATS` (groups), `*_FILE` variants for mounted secrets — see [.env.example](.env.example) |
 
-## Choosing the model
+The compose declares only the four variables a working bot needs: the two Telegram ones and the two Executor ones. Anything else reaches the process through `env_file: .env`, so the declaration list does not grow there.
 
-**The first configuration is done in the terminal, not in Telegram.** Open the container terminal (Coolify → service terminal) and set the global default there:
+Notes that change behaviour: API keys and tokens accept `NAME_FILE` for an operator-mounted secret (never build arguments — they stay in the image layer); endpoints require HTTPS, HTTP only on loopback for tests; MCP is direct mode with optional `allowedTools` / `deniedTools`; Executor MCP registers only when both variables are set, and a non-empty `MCP_SERVERS_JSON` overrides it. `EXECUTOR_TOKEN` is the raw key — the process adds `Authorization: Bearer` itself. Catalog entries need explicit `contextWindow`, `maxTokens` and `reasoning` in `LLM_MODELS`, because `GET /models` reports neither.
 
-```sh
-npm run setup-model -- --list
-npm run setup-model -- --model llm/<id> --effort high
+## Vision and audio (optional)
+
+Neither is required. A multimodal chat model and no extra variables is the default: images go straight to it, and a voice note answers with a short note saying audio is not configured.
+
+| Chat model                       | `VISION_MODEL` | What happens to an image                                           |
+| -------------------------------- | -------------- | ------------------------------------------------------------------ |
+| reads images (`LLM_INPUT` unset) | unset          | sent as an image part (cheapest, full fidelity)                    |
+| reads images                     | set            | still an image part; `VISION_MODE=text` forces the auxiliary model |
+| text only (`LLM_INPUT=text`)     | set            | described by that model, admitted as text                          |
+| text only                        | unset          | the bot explains the model cannot read images                      |
+
+Audio is always text: `pi-ai` has no audio content part, so the voice note is transcribed and **the transcription becomes the turn text**. The audio never enters the model context or the conversation history.
+
+Every converted message tells the chat model where it came from, in the text it reads:
+
+```
+[áudio transcrito · {"origin":"audio","model":"whisper-1"}]
+reunião sexta às dez
+[imagem: descrição automática · {"origin":"image","model":"gemini-3-flash"}]
+um gráfico de vendas
 ```
 
-That is the intended first step: it lists the catalog and writes the default used by new conversations. Everything the Telegram menus change afterwards (`/model`, `/thinking`) applies to **one conversation only**, and `setup-model` is the only way to move the global default from inside the deployment.
+Typed text has no prefix. The transcription reaches the model verbatim. When a specialist fails, the message is still admitted, carrying the origin and the reason (`{"origin":"audio","error":"resposta 500"}`), so the model answers the user instead of staying silent.
 
-No model is pinned in the environment. Without `LLM_MODELS` the catalog is read from `GET {LLM_BASE_URL}/models`; discovery cannot report capabilities, so `/thinking` offers only `off`. The URL is the API root used verbatim — `https://api.openai.com/v1`, `https://api.deepseek.com`.
-
-Each `LLM_MODELS` entry is `id` or `id|contextWindow|maxTokens|reasoning`, where `reasoning` is `false`, `true` (standard levels) or exactly the `+` separated levels the upstream model accepts:
+**The audio model must accept OGG/Opus.** That is the only format Telegram uses for a voice note. `whisper-1`, Gemini and Groq read it as-is; the `gpt-4o-transcribe` family does not list `ogg` and will fail, because converting would need ffmpeg in the image. The failure is answered in the chat, not silently.
 
 ```sh
-LLM_MODELS=chat-model,reasoning-model|65536|8192|true
-LLM_MODELS=deepseek-flash|1000000|384000|off+low+high+max
+# vision only, same provider as chat (empty key/endpoint inherit the chat ones)
+VISION_MODEL=<vision-capable model>
+# vision on another provider: Gemini's OpenAI-compatible surface
+VISION_MODEL=gemini-3-flash
+VISION_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+VISION_API_KEY=<gemini key>
+# audio via OpenAI-compatible multipart
+AUDIO_MODEL=whisper-1
+AUDIO_API_KEY=sk-...
+# audio via Gemini (inline base64 JSON instead of multipart)
+AUDIO_MODEL=gemini-3-flash
+AUDIO_API=gemini
 ```
 
-The second line is the DeepSeek recipe: its catalog rejects `minimal` and `medium` and supports `max`. A conversation with no saved selection uses the **first catalog entry** and the bot warns once per conversation until a choice is stored.
+An empty `VISION_API_KEY` / `AUDIO_API_KEY` inherits `LLM_API_KEY` **only when the endpoint is the same host** as the chat one (Groq serves chat and audio this way); for any other host, set the key explicitly, otherwise the function stays off instead of failing with a confusing 401.
 
-Set the global default from the container terminal with `npm run setup-model`: it lists the catalog and writes the default for new conversations.
-
-```sh
-npm run setup-model -- --list
-npm run setup-model -- --model llm/<id> --effort high
-```
-
-Run it without arguments in an interactive terminal for a numbered menu. `/model` and `/thinking` in Telegram stay per conversation and always take precedence, including across restart. See [docs/coolify.md](docs/coolify.md). Startup logs print safe configuration hints (for example a missing `LLM_API_KEY`); transport failures stay generic. Replace placeholder values in `.env` with real Telegram, LLM and Executor credentials before expecting a healthy container.
-
-Credentials remain in process memory/config files; the Telegram credential ledger stores a fingerprint, not the token. Histories, tool payloads and results can still be sensitive. Protect volume/backups and the host. Logs omit raw exceptions and known configured secrets are redacted from Telegram output. Redaction is not a substitute for choosing trustworthy MCP servers.
+Choose the models in the terminal with `npm run setup-model` (the menu offers chat, image and audio); keys stay in the environment and are never written to the database or shown on screen.
 
 ## Telegram commands
 
@@ -128,6 +157,8 @@ Delivery is the schedule's own Telegram topic. `tasks_edit` can switch a schedul
 An answer that is empty, whitespace-only, or only `<silent/>` posts nothing and is logged as `silencioso`; the sentinel itself is never sent. Inside a scheduled occurrence, an MCP request for human approval is not awaited: the step is skipped, recorded as `skipped` in the ledger and in the run log, and the run continues. The assistant still never approves or resumes a pending request on its own.
 
 A photo — or a document whose type is an image — arrives as an **image part of the model input**: the model reads it directly, and the caption becomes the turn text (`[imagem]` when there is none). Our own 5 MB bound applies on top of Telegram's download cap; anything larger, and any other attachment type (audio, PDF), gets a short refusal in the chat instead of silence. The ledger and the deduplication key stay textual, so a redelivered update is still deduplicated, and the image never leaves your infrastructure.
+
+A voice note is transcribed and **the transcription becomes the turn text** — the audio itself never enters the model context. Transcription runs in the Executor's sandbox, against whichever integration exposes a `transcribe` tool (today Gemini, because it takes base64 inside JSON); no provider credential lives in this app. Notes up to 10 MB are accepted, and a failed transcription answers in the chat instead of admitting an empty turn.
 
 A turn that ends **without an answer** is never silent again: the chat gets the category pi-durable reports (`model_error`, `no_model`, `stale`, `reset`) and the run log keeps the category plus the upstream detail, readable with `tasks_runs`. `/stop` is the exception — a user-initiated abort stays silent. Only the category reaches a chat: raw upstream text is never forwarded, so a provider error can leak neither a secret nor its wording. If you see `model_error` with a compaction detail, check that `LLM_MODELS` declares the model's real limits: without it the conservative discovery defaults (32768 context / 4096 output) leave the automatic compaction almost no room, and its summary fails.
 

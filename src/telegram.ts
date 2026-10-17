@@ -24,6 +24,9 @@ import {
   ConversationError,
   type Runtime,
 } from "./runtime.js";
+import { resolveFunctions } from "./functions.js";
+import { transcribeAudio } from "./transcribe.js";
+import { describeImage } from "./vision.js";
 import { hash, type Delivery } from "./store.js";
 import { CommandError } from "./commands.js";
 import { SettingsError } from "./settings.js";
@@ -71,6 +74,12 @@ export interface TelegramUpdate {
     forum_topic_reopened?: object;
     text?: string;
     caption?: string;
+    voice?: {
+      file_id: string;
+      mime_type?: string;
+      file_size?: number;
+      duration?: number;
+    };
     photo?: {
       file_id: string;
       width: number;
@@ -100,19 +109,71 @@ export interface TelegramUpdate {
   };
 }
 /** One image input part, in the shape pi-ai and pi-durable both accept. */
-export type TelegramImage = { type: "image"; data: string; mimeType: string };
+type TelegramImage = { type: "image"; data: string; mimeType: string };
 type ImageRef = { fileId: string; mimeType: string; size?: number };
+
+/**
+ * Short marker plus the machine-readable origin. The text model reads this, so it can
+ * tell a typed message from a transcription or an automated image description - a
+ * transcription that arrived unlabelled was once answered with "no audio arrived".
+ */
+/** Short failure reason for the origin header; the raw provider text stays in the log. */
+function describeFailure(error: unknown) {
+  const message = error instanceof Error ? error.message : "";
+  return /^vision \d{3}$/.test(message)
+    ? `resposta ${message.slice(-3)}`
+    : "falha ao descrever";
+}
+/** Same rule for transcription: a status code, never the provider body. */
+function transcribeFailure(error: unknown) {
+  const message = error instanceof Error ? error.message : "";
+  const status = /(\d{3})$/.exec(message)?.[1];
+  return status ? `resposta ${status}` : "falha na transcrição";
+}
+function originHeader(label: string, value: Record<string, unknown>) {
+  return `[${label} · ${JSON.stringify(value)}]`;
+}
+type VoiceRef = { fileId: string; mimeType: string; size?: number };
 const IMAGE_MIME = /^image\/(jpeg|png|webp|gif)$/;
 /** Telegram photos are JPEG up to 10 MB; the model does not need more than this. */
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+/** Bytes one image may cost per turn. Telegram already re-encodes phone photos to a few
+ * tens of KB, so this only matters for a dense screenshot sent as a 2 MB document. */
+const MAX_IMAGE_TARGET_BYTES = 256 * 1024;
+/** Voice notes are OGG/Opus and tiny; the cap keeps the base64 well under the 20 MB request limit. */
+const MAX_VOICE_BYTES = 10 * 1024 * 1024;
+/** The voice note a message carries; Telegram sends OGG/Opus. */
+function voiceOf(
+  message: NonNullable<TelegramUpdate["message"]>,
+): VoiceRef | undefined {
+  const voice = message.voice;
+  if (!voice?.file_id) return undefined;
+  return {
+    fileId: voice.file_id,
+    mimeType: voice.mime_type ?? "audio/ogg",
+    size: voice.file_size,
+  };
+}
 function imageOf(
   message: NonNullable<TelegramUpdate["message"]>,
 ): ImageRef | undefined {
-  // Telegram sends every size ascending: the smallest one that is still sharp beats
-  // the largest, which the provider would only downscale again (tokens and base64).
+  // Telegram sends every size ascending and already re-encodes: the legible ones
+  // (>=1024px wide) are the pool, and inside it the largest that stays within the byte
+  // budget wins. Resolution beats bytes for text in screenshots, so a pool that is
+  // entirely over budget keeps the biggest rather than the cheapest.
   const photos = message.photo ?? [];
+  const legible = photos.filter((candidate) => candidate.width >= 1024);
+  const pool = legible.length ? legible : photos;
   const photo =
-    photos.find((candidate) => candidate.width >= 1024) ?? photos.at(-1);
+    pool
+      .filter(
+        (candidate) =>
+          (candidate.file_size ?? Number.POSITIVE_INFINITY) <=
+          MAX_IMAGE_TARGET_BYTES,
+      )
+      .at(-1) ??
+    pool.at(-1) ??
+    photos.at(-1);
   if (photo?.file_id)
     return {
       fileId: photo.file_id,
@@ -765,7 +826,12 @@ export class Telegram {
       return { ignored: true };
     const identity = this.updateIdentity(update);
     const image = imageOf(message);
-    if (!image && (typeof message.text !== "string" || !message.text)) {
+    const voice = voiceOf(message);
+    if (
+      !image &&
+      !voice &&
+      (typeof message.text !== "string" || !message.text)
+    ) {
       if (message.forum_topic_created)
         await this.transport.settleTopicCreates?.();
       const service =
@@ -778,7 +844,7 @@ export class Telegram {
           this.app.store.queueTelegram(
             `telegram:clean:${update.update_id}`,
             chat,
-            "Anexo recebido, mas por enquanto só leio imagens (foto ou arquivo JPEG/PNG/WebP/GIF).",
+            "Anexo recebido, mas por enquanto só leio imagens (foto ou JPEG/PNG/WebP/GIF) e recados de voz.",
             3500,
             undefined,
             messageThreadId,
@@ -853,14 +919,17 @@ export class Telegram {
       await this.editImplicitTopicTitle(update.update_id, eventBot);
       return { observed: true };
     }
-    const command = image ? undefined : this.commandText(message.text ?? "");
+    const command =
+      image || voice ? undefined : this.commandText(message.text ?? "");
     const text = image
       ? message.caption?.trim() || "[imagem]"
-      : command === "/crons"
-        ? command
-        : cronReplyReceipt(this.app, owner, message)
-          ? message.text
-          : command;
+      : voice
+        ? "[áudio]"
+        : command === "/crons"
+          ? command
+          : cronReplyReceipt(this.app, owner, message)
+            ? message.text
+            : command;
     if (text === undefined) return { ignored: true };
     const fingerprint = hash(
       JSON.stringify(
@@ -1026,6 +1095,7 @@ export class Telegram {
       text,
       messageThreadId,
       image,
+      voice,
     ).then(
       (response) => {
         tracked.accepting = false;
@@ -1108,6 +1178,7 @@ export class Telegram {
     text: string,
     messageThreadId?: number,
     image?: ImageRef,
+    voice?: VoiceRef,
   ) {
     const owner: TelegramOwner = {
       chat,
@@ -1160,7 +1231,13 @@ export class Telegram {
       return result;
     }
     // Telegram-only build: every text goes straight to the clean command surface.
-    const result = await this.acceptClean(owner, text, update.update_id, image);
+    const result = await this.acceptClean(
+      owner,
+      text,
+      update.update_id,
+      image,
+      voice,
+    );
     this.app.store.run(
       "INSERT OR IGNORE INTO meta VALUES (?,?)",
       commandKey,
@@ -1173,6 +1250,7 @@ export class Telegram {
     text: string,
     updateId: number,
     image?: ImageRef,
+    voice?: VoiceRef,
   ) {
     let id: string;
     try {
@@ -1233,8 +1311,13 @@ export class Telegram {
         const ledger =
           calls.map((c) => `${c.server} / ${c.tool}: ${c.state}`).join("\n") ||
           "Nenhuma chamada pendente/incerta";
+        const functions = resolveFunctions(
+          process.env,
+          this.app.settings.setup(),
+          this.app.settings.setupKeys(),
+        );
         reply(
-          `Modelo: ${settings.provider} / ${settings.modelId}\nEsforço: ${settings.effort}\nExecuções neste tópico: ${active.length}\nAprovações pendentes: ${pending}\nRegistro MCP:\n${ledger}\nSe houver resultado incerto, verifique o serviço externo; a chamada não será repetida. /stop encerra esperas locais; efeitos externos exigem verificação.\nMCPs:\n${mcps}\nVersão: ${info.version ?? "dev"} (${info.commit ?? "sem SHA"})\nCompactação automática: modelo e esforço ativos desta conversa.`,
+          `Modelos:\nTexto: ${settings.modelId}\nVisão: ${this.featureLabel(functions.vision, this.mainSeesImages() ? "mesmo do chat" : "desativado")}\nÁudio: ${this.featureLabel(functions.audio, "desativado")}\nEsforço: ${settings.effort}\nExecuções neste tópico: ${active.length}\nAprovações pendentes: ${pending}\nRegistro MCP:\n${ledger}\nSe houver resultado incerto, verifique o serviço externo; a chamada não será repetida. /stop encerra esperas locais; efeitos externos exigem verificação.\nMCPs:\n${mcps}\nVersão: ${info.version ?? "dev"} (${info.commit ?? "sem SHA"})\nCompactação automática: modelo e esforço ativos desta conversa.`,
         );
         queueMcpChecks(this.app, owner, id, updateId);
       } else if (text === "/help" || text === "/start")
@@ -1254,15 +1337,16 @@ export class Telegram {
           this.app.settings.markModelNoticeShown(id);
           reply(notice);
         }
-        const images = image ? await this.loadImage(image, reply) : undefined;
-        if (!image || images)
-          await this.app.admit(
-            id,
-            `telegram:${updateId}`,
-            text,
-            { source: "telegram", ...owner },
-            images,
-          );
+        const picture = image ? await this.pictureTurn(image, text) : undefined;
+        const spoken = voice ? await this.transcribeVoice(voice) : undefined;
+        // Typed text keeps no prefix; a specialist's output carries its origin.
+        await this.app.admit(
+          id,
+          `telegram:${updateId}`,
+          spoken?.text ?? picture?.text ?? text,
+          { source: "telegram", ...owner },
+          picture?.images,
+        );
       }
     } catch (error) {
       if (error instanceof SettingsError || error instanceof CommandError)
@@ -1271,25 +1355,153 @@ export class Telegram {
     }
     return { conversationId: id, control: text.startsWith("/") };
   }
+  /** One line for `/status`: the model, its host when it is not the chat one, or off. */
+  /**
+   * One line for `/status`. `whenMissing` is what absence means: the chat model can
+   * stand in for vision, but never for audio - pi-ai has no audio content part.
+   */
+  private featureLabel(
+    feature: { modelId: string; language?: string } | undefined,
+    whenMissing: string,
+  ) {
+    if (!feature) return whenMissing;
+    return feature.language
+      ? `${feature.modelId} (${feature.language})`
+      : feature.modelId;
+  }
+  /** Id of the chat model serving this turn, for the origin header. */
+  private chatModelId() {
+    const choice = this.app.settings.defaults();
+    return `${choice.provider}/${choice.modelId}`;
+  }
+  /** Whether the chat model reads images; LLM_INPUT=text is how a text-only model says so. */
+  private mainSeesImages() {
+    // The wizard probed the model itself; that beats the declared catalog input, which
+    // defaults to "text,image" for everyone.
+    const probed = this.app.settings.setup()?.chatVision;
+    if (probed !== undefined) return probed;
+    const choice = this.app.settings.defaults();
+    const model = this.app.models.getModel(choice.provider, choice.modelId);
+    return Boolean(model?.input?.includes("image"));
+  }
+  /**
+   * Routes one image: a native part when the chat model reads it, a separate vision
+   * model's description when it does not, and a clear refusal when neither exists.
+   */
+  private async pictureTurn(
+    image: ImageRef,
+    caption: string,
+  ): Promise<{ images?: TelegramImage[]; text: string }> {
+    const { vision, imageMode } = resolveFunctions(
+      process.env,
+      this.app.settings.setup(),
+      this.app.settings.setupKeys(),
+    );
+    const native =
+      imageMode === "native" || (imageMode === "auto" && this.mainSeesImages());
+    if (native) {
+      const loaded = await this.loadImage(image);
+      if (Array.isArray(loaded))
+        return {
+          images: loaded,
+          text: `${originHeader("imagem", { origin: "image", model: this.chatModelId() })}\n${caption}`,
+        };
+      return {
+        text: `${originHeader("imagem", { origin: "image", error: loaded.error })}\n${caption}`,
+      };
+    }
+    if (vision) {
+      const loaded = await this.loadImage(image);
+      if (!Array.isArray(loaded))
+        return {
+          text: `${originHeader("imagem", { origin: "image", error: loaded.error })}\n${caption}`,
+        };
+      try {
+        const description = await describeImage(vision, loaded[0]);
+        return {
+          text: `${originHeader("imagem: descrição automática", { origin: "image", model: vision.modelId })}\n${caption}\n${description}`,
+        };
+      } catch (error) {
+        return {
+          text: `${originHeader("imagem", { origin: "image", error: describeFailure(error) })}\n${caption}`,
+        };
+      }
+    }
+    return {
+      text: `${originHeader("imagem", { origin: "image", error: "nenhum modelo lê imagens (defina VISION_MODEL)" })}\n${caption}`,
+    };
+  }
+
+  /**
+   * Transcribes a voice note. The transcription becomes the turn text, prefixed with the
+   * origin so the chat model knows the message arrived as audio. A failure is admitted
+   * too: the model tells the user instead of the message disappearing.
+   */
+  private async transcribeVoice(voice: VoiceRef): Promise<{ text: string }> {
+    const { audio } = resolveFunctions(
+      process.env,
+      this.app.settings.setup(),
+      this.app.settings.setupKeys(),
+    );
+    if (!audio)
+      return {
+        text: originHeader("áudio", {
+          origin: "audio",
+          error: "nenhum modelo transcreve (defina AUDIO_MODEL)",
+        }),
+      };
+    if ((voice.size ?? 0) > MAX_VOICE_BYTES)
+      return {
+        text: originHeader("áudio", {
+          origin: "audio",
+          error: "áudio acima do limite de 10 MB",
+        }),
+      };
+    if (!this.transport.downloadFile)
+      return {
+        text: originHeader("áudio", {
+          origin: "audio",
+          error: "este ambiente não consegue baixar anexos",
+        }),
+      };
+    try {
+      const { data } = await this.transport.downloadFile(voice.fileId);
+      if (data.byteLength > MAX_VOICE_BYTES)
+        return {
+          text: originHeader("áudio", {
+            origin: "audio",
+            error: "áudio acima do limite de 10 MB",
+          }),
+        };
+      const transcription = await transcribeAudio(audio, {
+        data,
+        mimeType: voice.mimeType,
+      });
+      // Verbatim: the specialist's words reach the model unchanged.
+      return {
+        text: `${originHeader("áudio transcrito", { origin: "audio", model: audio.modelId })}\n${transcription}`,
+      };
+    } catch (error) {
+      return {
+        text: originHeader("áudio", {
+          origin: "audio",
+          error: transcribeFailure(error),
+        }),
+      };
+    }
+  }
   /** Downloads one image into a model input part; on failure replies and returns undefined. */
   private async loadImage(
     image: ImageRef,
-    reply: (message: string) => void,
-  ): Promise<TelegramImage[] | undefined> {
-    if ((image.size ?? 0) > MAX_IMAGE_BYTES) {
-      reply("Imagem grande demais (limite 5 MB). Envie uma versão menor.");
-      return undefined;
-    }
-    if (!this.transport.downloadFile) {
-      reply("Este ambiente não consegue baixar anexos.");
-      return undefined;
-    }
+  ): Promise<TelegramImage[] | { error: string }> {
+    if ((image.size ?? 0) > MAX_IMAGE_BYTES)
+      return { error: "imagem acima do limite de 5 MB" };
+    if (!this.transport.downloadFile)
+      return { error: "este ambiente não consegue baixar anexos" };
     try {
       const { data } = await this.transport.downloadFile(image.fileId);
-      if (data.byteLength > MAX_IMAGE_BYTES) {
-        reply("Imagem grande demais (limite 5 MB).");
-        return undefined;
-      }
+      if (data.byteLength > MAX_IMAGE_BYTES)
+        return { error: "imagem acima do limite de 5 MB" };
       return [
         {
           type: "image",
@@ -1298,8 +1510,7 @@ export class Telegram {
         },
       ];
     } catch {
-      reply("Não consegui baixar a imagem agora. Tente novamente.");
-      return undefined;
+      return { error: "falha ao baixar a imagem" };
     }
   }
   flush() {
