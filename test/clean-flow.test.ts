@@ -23,6 +23,7 @@ import {
   type TelegramReplyMarkup,
 } from "../src/telegram-controls.js";
 import { decideMcp } from "../src/telegram-approvals.js";
+import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { hash } from "../src/store.js";
 import { telegramConversationRoute } from "../src/task-telegram.js";
 import {
@@ -134,6 +135,10 @@ async function fixture() {
     new Telegram(
       app,
       {
+        downloadFile: async () => ({
+          // minimal valid PNG header; the model layer never decodes it in tests
+          data: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]),
+        }),
         send: async (chat, text, opts) => {
           if (fail) throw new TelegramSendRefused(400);
           const id = messageId++;
@@ -814,6 +819,8 @@ test("configuration only registers API credentials and validates endpoint/model 
     ["a", "b"],
   );
   assert.equal(discovered.getModels("llm")[0].reasoning, false);
+  // Sem "image" o provider troca a imagem por um marcador de texto.
+  assert.ok(discovered.getModels("llm")[0].input.includes("image"));
   // Deploy-diagnostic errors must name the cause without leaking the key.
   const keyEnv = {
     LLM_BASE_URL: "https://llm.example/v1",
@@ -1600,6 +1607,65 @@ test("clean accepts legacy group chat type in allowlist", async () => {
     await f.bot.receive(update);
     await f.bot.flush();
     assert.match(f.views.at(-1)!.text, /Modelo:/);
+  } finally {
+    await f.close();
+  }
+});
+
+test("an image message reaches the model as an image part, with the caption as text", async () => {
+  const f = await fixture();
+  try {
+    await f.bot.receive({
+      update_id: 900001,
+      message: {
+        message_id: 900001,
+        caption: "o que é isso?",
+        from: { id: 42 },
+        chat: { id: -100123, type: "supergroup" },
+        message_thread_id: 11,
+        photo: [
+          { file_id: "photo-1", width: 1280, height: 960, file_size: 2048 },
+        ],
+      },
+    });
+    await f.bot.flush();
+    const conversationId = f.app.telegramChats.selection(f.owner)!;
+    const conversation = await f.app.conversation(conversationId);
+    const page = await conversation.entries({}, 50, undefined, context);
+    const user = page.items.filter((entry) => entry.kind === "pi.user");
+    assert.equal(user.length, 1);
+    const content = JSON.stringify(user[0].model);
+    assert.match(content, /"type":"image"/);
+    assert.match(content, /"mimeType":"image\/jpeg"/);
+    // a legenda vira o texto do turno
+    assert.match(content, /o que é isso\?/);
+  } finally {
+    await f.close();
+  }
+});
+
+test("an unsupported attachment answers with what is accepted instead of staying silent", async () => {
+  const f = await fixture();
+  try {
+    await f.bot.receive({
+      update_id: 900002,
+      message: {
+        message_id: 900002,
+        from: { id: 42 },
+        chat: { id: -100123, type: "supergroup" },
+        message_thread_id: 11,
+        document: {
+          file_id: "doc-1",
+          file_name: "contrato.pdf",
+          mime_type: "application/pdf",
+          file_size: 2048,
+        },
+      },
+    });
+    await f.bot.flush();
+    assert.match(f.views.at(-1)!.text, /só leio imagens/);
+    // nada foi admitido: nem conversa foi criada para este chat
+    assert.equal(f.app.telegramChats.selection(f.owner), undefined);
   } finally {
     await f.close();
   }

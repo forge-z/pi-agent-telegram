@@ -11,8 +11,8 @@ It is built around [Executor](https://executor.sh): the preferred way to expose 
 Use Docker Engine and Compose v2.24+ on Linux amd64 or arm64. The official `node:24-bookworm-slim` image has both architectures. Runtime persistence uses built-in `node:sqlite`, with no application-specific native binary. Local verification covers amd64; arm64 execution was not exercised here.
 
 ```sh
-git clone https://github.com/forge-z/pi-agent-telegram.git
-cd pi-agent-telegram
+git clone https://github.com/forge-z/pi-agent-tg.git
+cd pi-agent-tg
 cp .env.example .env
 # Edit .env ON THE SERVER with your own credentials and Telegram numeric IDs.
 chmod 600 .env
@@ -126,6 +126,8 @@ Every occurrence is logged for **7 days**: start/end, status (`ok`, `erro`, `sil
 Delivery is the schedule's own Telegram topic. `tasks_edit` can switch a schedule between **origin** (post results in that topic) and **none** (no message at all, side effects only). There is no web destination, and a schedule can never be moved to another chat or topic.
 
 An answer that is empty, whitespace-only, or only `<silent/>` posts nothing and is logged as `silencioso`; the sentinel itself is never sent. Inside a scheduled occurrence, an MCP request for human approval is not awaited: the step is skipped, recorded as `skipped` in the ledger and in the run log, and the run continues. The assistant still never approves or resumes a pending request on its own.
+
+A photo — or a document whose type is an image — arrives as an **image part of the model input**: the model reads it directly, and the caption becomes the turn text (`[imagem]` when there is none). Our own 5 MB bound applies on top of Telegram's download cap; anything larger, and any other attachment type (audio, PDF), gets a short refusal in the chat instead of silence. The ledger and the deduplication key stay textual, so a redelivered update is still deduplicated, and the image never leaves your infrastructure.
 
 A turn that ends **without an answer** is never silent again: the chat gets the category pi-durable reports (`model_error`, `no_model`, `stale`, `reset`) and the run log keeps the category plus the upstream detail, readable with `tasks_runs`. `/stop` is the exception — a user-initiated abort stays silent. Only the category reaches a chat: raw upstream text is never forwarded, so a provider error can leak neither a secret nor its wording. If you see `model_error` with a compaction detail, check that `LLM_MODELS` declares the model's real limits: without it the conservative discovery defaults (32768 context / 4096 output) leave the automatic compaction almost no room, and its summary fails.
 

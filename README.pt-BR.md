@@ -11,8 +11,8 @@ Foi feito para rodar com o [Executor](https://executor.sh): a forma preferida de
 Requer Docker e Compose v2.24+ em Linux amd64/arm64. A imagem oficial Node oferece ambas as arquiteturas e a persistência usa `node:sqlite`. O teste local executa amd64; não houve execução ARM64 neste ambiente.
 
 ```sh
-git clone https://github.com/forge-z/pi-agent-telegram.git
-cd pi-agent-telegram
+git clone https://github.com/forge-z/pi-agent-tg.git
+cd pi-agent-tg
 cp .env.example .env
 # Edite .env NO SERVIDOR: token do bot, IDs permitidos e chaves de API.
 chmod 600 .env
@@ -114,6 +114,8 @@ Cada ocorrência fica registrada por **7 dias**: início/fim, status (`ok`, `err
 A entrega é o tópico do próprio agendamento. `tasks_edit` alterna entre **origin** (posta naquele tópico) e **none** (nenhuma mensagem, só efeitos colaterais). Não existe destino web, e o agendamento nunca muda de chat ou tópico.
 
 Resposta vazia, só espaços ou apenas `<silent/>` não posta nada e é registrada como `silencioso`; o sentinela nunca é enviado. Dentro de uma execução agendada, um pedido de aprovação MCP não é aguardado: o passo é pulado, marcado como `skipped` no ledger e no log, e a execução segue. O assistente continua sem aprovar ou retomar pendências por conta própria.
+
+Uma foto — ou um documento cujo tipo é imagem — chega como **parte de imagem na entrada do modelo**: o modelo lê direto, e a legenda vira o texto do turno (`[imagem]` quando não há). Aplicamos um teto próprio de 5 MB sobre o limite de download do Telegram; acima disso, e para qualquer outro tipo de anexo (áudio, PDF), o chat recebe uma recusa curta em vez de silêncio. O ledger e a chave de deduplicação continuam textuais, então um update reentregue segue deduplicado, e a imagem não sai da tua infraestrutura.
 
 Turno que termina **sem resposta** não fica mais em silêncio: o chat recebe a **categoria** que o pi-durable reporta (`model_error`, `no_model`, `stale`, `reset`) e o log de execução guarda a categoria mais o detalhe upstream, legível com `tasks_runs`. A exceção é `/stop`: aborto pedido pelo usuário continua silencioso. Só a categoria chega ao chat — texto cru do provedor nunca é repassado, então um erro de provider não vaza segredo nem o texto. Se aparecer `model_error` com detalhe de compactação, confira se o `LLM_MODELS` declara os limites reais do modelo: sem ele os padrões conservadores da descoberta (32768 de contexto / 4096 de saída) não deixam quase espaço para a compactação automática, e o resumo dela falha.
 

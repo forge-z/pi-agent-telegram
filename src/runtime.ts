@@ -10,7 +10,7 @@ import {
   fauxProvider,
   fauxAssistantMessage,
 } from "@earendil-works/pi-ai/providers/faux";
-import { Type } from "@earendil-works/pi-ai";
+import { Type, type ImageContent } from "@earendil-works/pi-ai";
 import {
   Harness,
   createRegistry,
@@ -24,6 +24,7 @@ import {
   type Submission,
   type SubmissionId,
   type EntryId,
+  type UserInput,
 } from "@earendil-works/pi-durable";
 import {
   openNodeSqliteDatabase,
@@ -1374,6 +1375,7 @@ export class Runtime {
     requestId: string,
     text: string,
     access: CommandAccess,
+    images?: ImageContent[],
   ) {
     if (this.closing) throw new CommandError("Serviço encerrando");
     if (!REQUEST_ID.test(requestId) || !text.trim() || text.length > MAX_TEXT)
@@ -1388,7 +1390,7 @@ export class Runtime {
       return pending.work;
     }
     const work = Promise.resolve().then(() =>
-      this.admitOnce(conversationId, requestId, text, access),
+      this.admitOnce(conversationId, requestId, text, access, images),
     );
     this.admissions.set(key, { text, actor, work });
     void work.finally(() => this.admissions.delete(key)).catch(() => {});
@@ -1399,6 +1401,7 @@ export class Runtime {
     requestId: string,
     text: string,
     access: CommandAccess,
+    images?: ImageContent[],
   ) {
     const escaped = text.trimStart().startsWith("//")
       ? text.replace("/", "")
@@ -1412,6 +1415,7 @@ export class Runtime {
         access.source,
         access.source === "telegram" ? access.chat : null,
         () => this.commands.authorize(conversationId, access),
+        images,
       )),
     };
   }
@@ -1422,9 +1426,18 @@ export class Runtime {
     source = "web",
     chat: string | null = null,
     authorize?: () => void,
+    images?: ImageContent[],
   ) {
     return this.withProviderAdmission(() =>
-      this.submitOnce(conversationId, requestId, text, source, chat, authorize),
+      this.submitOnce(
+        conversationId,
+        requestId,
+        text,
+        source,
+        chat,
+        authorize,
+        images,
+      ),
     );
   }
   async withProviderAdmission<T>(operation: () => Promise<T>): Promise<T> {
@@ -1446,6 +1459,7 @@ export class Runtime {
     source = "web",
     chat: string | null = null,
     authorize?: () => void,
+    images?: ImageContent[],
   ) {
     if (source === "web") this.assertWebWritable(conversationId);
     if (this.closing) throw new Error("Serviço encerrando");
@@ -1539,8 +1553,12 @@ export class Runtime {
       existing.chat !== chat
     )
       throw new Error("requestId já utilizado com conteúdo diferente");
+    // The ledger and the dedupe key stay textual; images only widen what the model reads.
+    const content: UserInput = images?.length
+      ? [{ type: "text", text }, ...images]
+      : text;
     const submission = await conversation.submit(
-      { type: "input", content: text, requestId, whenBusy: "followUp" },
+      { type: "input", content, requestId, whenBusy: "followUp" },
       context,
     );
     if (source !== "system")

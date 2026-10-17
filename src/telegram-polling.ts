@@ -77,6 +77,10 @@ export class TelegramPolling {
     this.engine = new Telegram(
       app,
       {
+        downloadFile: (fileId: string) => {
+          if (!api.downloadFile) throw new TelegramApiError("unavailable");
+          return api.downloadFile(fileId, signal);
+        },
         answerCallback: (id, text) =>
           api.call(
             "answerCallbackQuery",

@@ -406,7 +406,11 @@ export async function environmentModels(
         api: "openai-completions" as const,
         provider: LLM_PROVIDER_ID,
         baseUrl,
-        input: ["text" as const],
+        // The declared input is what the provider uses to decide whether an image
+        // part is sent or replaced by a text marker; the catalog cannot tell vision
+        // apart. deepseek-flash reads images, and a text-only model now fails loudly
+        // on the first image instead of silently getting a marker.
+        input: ["text" as const, "image" as const],
         reasoning: model.reasoning,
         contextWindow: model.contextWindow,
         maxTokens: model.maxTokens,

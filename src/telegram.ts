@@ -70,6 +70,19 @@ export interface TelegramUpdate {
     forum_topic_closed?: object;
     forum_topic_reopened?: object;
     text?: string;
+    caption?: string;
+    photo?: {
+      file_id: string;
+      width: number;
+      height: number;
+      file_size?: number;
+    }[];
+    document?: {
+      file_id: string;
+      file_name?: string;
+      mime_type?: string;
+      file_size?: number;
+    };
     from?: { id: number; is_bot?: boolean; language_code?: string };
     chat: { id: number; type: string };
   };
@@ -86,7 +99,54 @@ export interface TelegramUpdate {
     };
   };
 }
+/** One image input part, in the shape pi-ai and pi-durable both accept. */
+export type TelegramImage = { type: "image"; data: string; mimeType: string };
+type ImageRef = { fileId: string; mimeType: string; size?: number };
+const IMAGE_MIME = /^image\/(jpeg|png|webp|gif)$/;
+/** Telegram photos are JPEG up to 10 MB; the model does not need more than this. */
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+function imageOf(
+  message: NonNullable<TelegramUpdate["message"]>,
+): ImageRef | undefined {
+  // Telegram sends every size ascending: the smallest one that is still sharp beats
+  // the largest, which the provider would only downscale again (tokens and base64).
+  const photos = message.photo ?? [];
+  const photo =
+    photos.find((candidate) => candidate.width >= 1024) ?? photos.at(-1);
+  if (photo?.file_id)
+    return {
+      fileId: photo.file_id,
+      mimeType: "image/jpeg",
+      size: photo.file_size,
+    };
+  const document = message.document;
+  if (
+    document?.file_id &&
+    document.mime_type &&
+    IMAGE_MIME.test(document.mime_type)
+  )
+    return {
+      fileId: document.file_id,
+      mimeType: document.mime_type,
+      size: document.file_size,
+    };
+  return undefined;
+}
+function hasAttachment(message: NonNullable<TelegramUpdate["message"]>) {
+  const extra = message as Record<string, unknown>;
+  return Boolean(
+    message.photo ||
+    message.document ||
+    extra.voice ||
+    extra.audio ||
+    extra.video ||
+    extra.animation ||
+    extra.sticker,
+  );
+}
 export interface TelegramTransport {
+  /** Downloads a received file. A transport without it cannot take attachments. */
+  downloadFile?(fileId: string): Promise<{ data: Uint8Array }>;
   settleTopicCreates?(): Promise<void>;
   editTopicName?(chat: string, thread: number, name: string): Promise<unknown>;
   answerCallback?(id: string, text: string): Promise<unknown>;
@@ -704,7 +764,8 @@ export class Telegram {
     )
       return { ignored: true };
     const identity = this.updateIdentity(update);
-    if (typeof message.text !== "string" || !message.text) {
+    const image = imageOf(message);
+    if (!image && (typeof message.text !== "string" || !message.text)) {
       if (message.forum_topic_created)
         await this.transport.settleTopicCreates?.();
       const service =
@@ -712,7 +773,18 @@ export class Telegram {
         message.forum_topic_edited ||
         message.forum_topic_closed ||
         message.forum_topic_reopened;
-      if (!service) return { ignored: true };
+      if (!service) {
+        if (hasAttachment(message))
+          this.app.store.queueTelegram(
+            `telegram:clean:${update.update_id}`,
+            chat,
+            "Anexo recebido, mas por enquanto só leio imagens (foto ou arquivo JPEG/PNG/WebP/GIF).",
+            3500,
+            undefined,
+            messageThreadId,
+          );
+        return { ignored: true };
+      }
       if (identity.seen) {
         if (
           !this.app.options.telegramOnly &&
@@ -781,9 +853,10 @@ export class Telegram {
       await this.editImplicitTopicTitle(update.update_id, eventBot);
       return { observed: true };
     }
-    const command = this.commandText(message.text);
-    const text =
-      command === "/crons"
+    const command = image ? undefined : this.commandText(message.text ?? "");
+    const text = image
+      ? message.caption?.trim() || "[imagem]"
+      : command === "/crons"
         ? command
         : cronReplyReceipt(this.app, owner, message)
           ? message.text
@@ -792,8 +865,8 @@ export class Telegram {
     const fingerprint = hash(
       JSON.stringify(
         messageThreadId === undefined
-          ? [user, chat, message.text]
-          : [user, chat, message.text, messageThreadId],
+          ? [user, chat, message.text ?? text, image?.fileId]
+          : [user, chat, message.text ?? text, image?.fileId, messageThreadId],
       ),
     );
     const previous = this.app.store.get<{ fingerprint: string }>(
@@ -952,6 +1025,7 @@ export class Telegram {
       fingerprint,
       text,
       messageThreadId,
+      image,
     ).then(
       (response) => {
         tracked.accepting = false;
@@ -1033,6 +1107,7 @@ export class Telegram {
     fingerprint: string,
     text: string,
     messageThreadId?: number,
+    image?: ImageRef,
   ) {
     const owner: TelegramOwner = {
       chat,
@@ -1085,7 +1160,7 @@ export class Telegram {
       return result;
     }
     // Telegram-only build: every text goes straight to the clean command surface.
-    const result = await this.acceptClean(owner, text, update.update_id);
+    const result = await this.acceptClean(owner, text, update.update_id, image);
     this.app.store.run(
       "INSERT OR IGNORE INTO meta VALUES (?,?)",
       commandKey,
@@ -1097,6 +1172,7 @@ export class Telegram {
     owner: TelegramOwner,
     text: string,
     updateId: number,
+    image?: ImageRef,
   ) {
     let id: string;
     try {
@@ -1178,10 +1254,15 @@ export class Telegram {
           this.app.settings.markModelNoticeShown(id);
           reply(notice);
         }
-        await this.app.admit(id, `telegram:${updateId}`, text, {
-          source: "telegram",
-          ...owner,
-        });
+        const images = image ? await this.loadImage(image, reply) : undefined;
+        if (!image || images)
+          await this.app.admit(
+            id,
+            `telegram:${updateId}`,
+            text,
+            { source: "telegram", ...owner },
+            images,
+          );
       }
     } catch (error) {
       if (error instanceof SettingsError || error instanceof CommandError)
@@ -1189,6 +1270,37 @@ export class Telegram {
       else throw error;
     }
     return { conversationId: id, control: text.startsWith("/") };
+  }
+  /** Downloads one image into a model input part; on failure replies and returns undefined. */
+  private async loadImage(
+    image: ImageRef,
+    reply: (message: string) => void,
+  ): Promise<TelegramImage[] | undefined> {
+    if ((image.size ?? 0) > MAX_IMAGE_BYTES) {
+      reply("Imagem grande demais (limite 5 MB). Envie uma versão menor.");
+      return undefined;
+    }
+    if (!this.transport.downloadFile) {
+      reply("Este ambiente não consegue baixar anexos.");
+      return undefined;
+    }
+    try {
+      const { data } = await this.transport.downloadFile(image.fileId);
+      if (data.byteLength > MAX_IMAGE_BYTES) {
+        reply("Imagem grande demais (limite 5 MB).");
+        return undefined;
+      }
+      return [
+        {
+          type: "image",
+          data: Buffer.from(data).toString("base64"),
+          mimeType: image.mimeType,
+        },
+      ];
+    } catch {
+      reply("Não consegui baixar a imagem agora. Tente novamente.");
+      return undefined;
+    }
   }
   flush() {
     if (this.closing) return Promise.resolve();
