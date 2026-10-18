@@ -92,7 +92,7 @@ test("polling readiness, health and graceful stop stay offline and create no top
     assert.equal(f.app.store.all("SELECT * FROM conversations").length, 0);
     assert.deepEqual(
       cleanCommands.map((c) => c.command),
-      ["model", "thinking", "crons", "stop", "status", "help"],
+      ["model", "thinking", "crons", "stop", "status", "reload", "help"],
     );
     // The base list and the Portuguese copy an earlier implementation wrote: a
     // client in that language must not keep the old commands.

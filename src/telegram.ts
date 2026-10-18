@@ -28,6 +28,7 @@ import { resolveFunctions } from "./functions.js";
 import { transcribeAudio } from "./transcribe.js";
 import { describeImage } from "./vision.js";
 import { hash, type Delivery } from "./store.js";
+import { imageVerdict, type OutboundMedia } from "./outbound.js";
 import { CommandError } from "./commands.js";
 import { SettingsError } from "./settings.js";
 import { TaskError } from "./tasks.js";
@@ -206,6 +207,12 @@ function hasAttachment(message: NonNullable<TelegramUpdate["message"]>) {
   );
 }
 export interface TelegramTransport {
+  /** Sends a file the turn produced: by URL when it has one, else by upload. */
+  sendMedia?(
+    chat: string,
+    media: OutboundMedia,
+    options?: { messageThreadId?: number },
+  ): Promise<unknown>;
   /** Downloads a received file. A transport without it cannot take attachments. */
   downloadFile?(fileId: string): Promise<{ data: Uint8Array }>;
   settleTopicCreates?(): Promise<void>;
@@ -1320,9 +1327,16 @@ export class Telegram {
           `Modelos:\nTexto: ${settings.modelId}\nVisão: ${this.featureLabel(functions.vision, this.mainSeesImages() ? "mesmo do chat" : "desativado")}\nÁudio: ${this.featureLabel(functions.audio, "desativado")}\nEsforço: ${settings.effort}\nExecuções neste tópico: ${active.length}\nAprovações pendentes: ${pending}\nRegistro MCP:\n${ledger}\nSe houver resultado incerto, verifique o serviço externo; a chamada não será repetida. /stop encerra esperas locais; efeitos externos exigem verificação.\nMCPs:\n${mcps}\nVersão: ${info.version ?? "dev"} (${info.commit ?? "sem SHA"})\nCompactação automática: modelo e esforço ativos desta conversa.`,
         );
         queueMcpChecks(this.app, owner, id, updateId);
+      } else if (text === "/reload") {
+        // A conversation that cannot answer (a bad image in history, a broken
+        // compaction) must be recoverable without a new topic.
+        this.app.telegramChats.reload(owner);
+        reply(
+          "Conversa reiniciada. A próxima mensagem abre uma conversa nova; o histórico anterior continua salvo, mas não é mais enviado ao modelo.",
+        );
       } else if (text === "/help" || text === "/start")
         reply(
-          "/model — provedor e modelo\n/thinking — esforço\n/crons — criar e gerenciar agendamentos\n/stop — interromper este tópico\n/status — estado\n/help — ajuda\nCada tópico nativo tem histórico próprio. Crie tópicos no Telegram. Escolhas de modelo persistem após reinício. Compactação automática usa o modelo e esforço ativos.",
+          "/model — provedor e modelo\n/thinking — esforço\n/crons — criar e gerenciar agendamentos\n/stop — interromper este tópico\n/status — estado\n/reload — começar uma conversa nova\n/help — ajuda\nCada tópico nativo tem histórico próprio. Crie tópicos no Telegram. Escolhas de modelo persistem após reinício. Compactação automática usa o modelo e esforço ativos.",
         );
       else if (
         text.startsWith("/") &&
@@ -1502,16 +1516,44 @@ export class Telegram {
       const { data } = await this.transport.downloadFile(image.fileId);
       if (data.byteLength > MAX_IMAGE_BYTES)
         return { error: "imagem acima do limite de 5 MB" };
-      return [
-        {
-          type: "image",
-          data: Buffer.from(data).toString("base64"),
-          mimeType: image.mimeType,
-        },
-      ];
+      const base64 = Buffer.from(data).toString("base64");
+      // A provider refuses an unusable image and the part then fails every later turn;
+      // the chat hears why instead of the conversation getting poisoned.
+      const verdict = imageVerdict(base64, image.mimeType);
+      if (!verdict.ok)
+        return { error: `imagem não utilizável: ${verdict.reason}` };
+      return [{ type: "image", data: base64, mimeType: image.mimeType }];
     } catch {
       return { error: "falha ao baixar a imagem" };
     }
+  }
+  /** Sends the files a delivery carries; each failure is recorded, none is thrown. */
+  private async sendMedia(delivery: Delivery) {
+    const media = delivery.media
+      ? (JSON.parse(delivery.media) as OutboundMedia[])
+      : [];
+    if (!media.length) return undefined;
+    const results: unknown[] = [];
+    for (const item of media) {
+      if (!this.transport.sendMedia) {
+        results.push({ error: "transporte sem envio de arquivo" });
+        continue;
+      }
+      try {
+        results.push(
+          await this.transport.sendMedia(delivery.chat, item, {
+            ...(delivery.messageThreadId == null
+              ? {}
+              : { messageThreadId: delivery.messageThreadId }),
+          }),
+        );
+      } catch (error) {
+        results.push({
+          error: error instanceof Error ? error.message : "falha no envio",
+        });
+      }
+    }
+    return results;
   }
   flush() {
     if (this.closing) return Promise.resolve();
@@ -1664,28 +1706,35 @@ export class Telegram {
           "SELECT 1 FROM meta WHERE key=?",
           `telegram:force-reply:${delivery.id}`,
         );
-        const result = await this.transport.send(
-          delivery.chat,
-          this.app.options.redact?.(delivery.text) ?? delivery.text,
-          delivery.messageThreadId == null &&
-            delivery.parseMode !== "HTML" &&
-            !replyMarkup &&
-            !forceReply
-            ? undefined
-            : {
-                ...(replyMarkup ? { replyMarkup } : {}),
-                ...(forceReply ? { forceReply } : {}),
-                ...(delivery.parseMode === "HTML"
-                  ? { parseMode: "HTML" as const }
-                  : {}),
-                ...(delivery.messageThreadId == null
-                  ? {}
-                  : { messageThreadId: delivery.messageThreadId }),
-              },
-        );
+        let result: unknown;
+        // A reply may carry only a file; empty text is not sent at all.
+        if (delivery.text)
+          result = await this.transport.send(
+            delivery.chat,
+            this.app.options.redact?.(delivery.text) ?? delivery.text,
+            delivery.messageThreadId == null &&
+              delivery.parseMode !== "HTML" &&
+              !replyMarkup &&
+              !forceReply
+              ? undefined
+              : {
+                  ...(replyMarkup ? { replyMarkup } : {}),
+                  ...(forceReply ? { forceReply } : {}),
+                  ...(delivery.parseMode === "HTML"
+                    ? { parseMode: "HTML" as const }
+                    : {}),
+                  ...(delivery.messageThreadId == null
+                    ? {}
+                    : { messageThreadId: delivery.messageThreadId }),
+                },
+          );
+        // The text is already delivered: a failed upload is recorded, never fatal.
+        const media = await this.sendMedia(delivery);
         this.app.store.run(
           "UPDATE deliveries SET state='sent',result=? WHERE id=?",
-          JSON.stringify(result),
+          media
+            ? JSON.stringify({ sent: result, media })
+            : JSON.stringify(result),
           delivery.id,
         );
       } catch (error) {

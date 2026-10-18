@@ -170,6 +170,29 @@ export class TelegramChats {
       ...(owner.messageThreadId === undefined ? [] : [owner.messageThreadId]),
     )?.conversationId;
   }
+  /**
+   * Forget which conversation this chat/topic uses, so the next message starts a new one.
+   * The old conversation keeps its history; it is simply no longer the selected one.
+   */
+  reload(owner: TelegramOwner) {
+    this.connection(owner);
+    this.app.store.run(
+      owner.messageThreadId === undefined
+        ? "DELETE FROM telegram_chat_selection WHERE chat=? AND user=?"
+        : "DELETE FROM telegram_topic_selection WHERE chat=? AND user=? AND messageThreadId=?",
+      owner.chat,
+      owner.user,
+      ...(owner.messageThreadId === undefined ? [] : [owner.messageThreadId]),
+    );
+    // A topic also remembers "this thread already created a conversation" in a receipt;
+    // without clearing it the next message would select the old one again.
+    const route = this.configuredOwner(owner);
+    if (route && owner.messageThreadId !== undefined)
+      this.app.store.run(
+        "DELETE FROM meta WHERE key=?",
+        `telegram:native-topic-create:${route.botId}:${owner.chat}:${owner.user}:${owner.messageThreadId}`,
+      );
+  }
   select(id: string, owner: TelegramOwner) {
     this.authorize(id, owner);
     this.app.store.run(

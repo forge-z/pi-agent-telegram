@@ -1,3 +1,5 @@
+import { mediaTarget, type OutboundMedia } from "./outbound.js";
+
 type Method =
   | "getMe"
   | "getWebhookInfo"
@@ -13,6 +15,12 @@ interface TelegramFile {
   data: Uint8Array;
 }
 export interface TelegramApi {
+  /** Sends a file: by URL when it has one, by multipart upload otherwise. */
+  sendMedia?(
+    chat: string,
+    media: OutboundMedia,
+    options?: { messageThreadId?: number },
+  ): Promise<unknown>;
   call(
     method: Method,
     payload?: Record<string, unknown>,
@@ -81,6 +89,86 @@ export class TelegramBotApi implements TelegramApi {
       throw new TelegramApiError("unavailable");
     return { data };
   }
+  /**
+   * Sends a file the turn produced. A URL is handed to Telegram, which fetches it; bytes
+   * are uploaded as multipart. The method comes from the kind: audio, voice, photo or
+   * document.
+   */
+  /** One place for Telegram's error codes, shared by JSON and multipart calls. */
+  private unwrap(body: unknown, status: number) {
+    const data = (body ?? {}) as {
+      ok?: boolean;
+      result?: unknown;
+      error_code?: number;
+      parameters?: { retry_after?: number };
+    };
+    const code = data.error_code ?? status;
+    if (data.ok !== true) {
+      const refused =
+        data.ok === false && code >= 400 && code < 500 ? code : undefined;
+      if (code === 401 || code === 404)
+        throw new TelegramApiError("invalid_token", 0, refused);
+      if (code === 409) throw new TelegramApiError("conflict", 0, refused);
+      if (code === 429)
+        throw new TelegramApiError(
+          "rate_limit",
+          Number(data.parameters?.retry_after) || 1,
+          refused,
+        );
+      throw new TelegramApiError("unavailable", 0, refused);
+    }
+    return data.result;
+  }
+
+  async sendMedia(
+    chat: string,
+    media: OutboundMedia,
+    options: { messageThreadId?: number } = {},
+  ) {
+    const { method, field } = mediaTarget(media);
+    const payload: Record<string, unknown> = {
+      chat_id: chat,
+      ...(options.messageThreadId == null
+        ? {}
+        : { message_thread_id: options.messageThreadId }),
+    };
+    if (media.url)
+      return this.call(method as Method, { ...payload, [field]: media.url });
+    if (!media.data) throw new TelegramApiError("unavailable");
+    const form = new FormData();
+    for (const [name, value] of Object.entries(payload))
+      form.set(name, String(value));
+    form.set(
+      field,
+      new Blob([new Uint8Array(Buffer.from(media.data, "base64"))], {
+        type: media.mimeType ?? "application/octet-stream",
+      }),
+      media.filename ?? `anexo.${mediaTarget(media).ext}`,
+    );
+    return this.callForm(method as Method, form);
+  }
+  /** Multipart variant of `call`: same error normalization, no credential in messages. */
+  private async callForm(method: Method, form: FormData, signal?: AbortSignal) {
+    try {
+      const response = await fetch(
+        `https://api.telegram.org/bot${this.token}/${method}`,
+        {
+          method: "POST",
+          redirect: "error",
+          body: form,
+          signal: AbortSignal.any([
+            AbortSignal.timeout(60000),
+            ...(signal ? [signal] : []),
+          ]),
+        },
+      );
+      return this.unwrap(await response.json(), response.status);
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason;
+      if (error instanceof TelegramApiError) throw error;
+      throw new TelegramApiError("unavailable");
+    }
+  }
   async call(
     method: Method,
     payload: Record<string, unknown> = {},
@@ -100,28 +188,7 @@ export class TelegramBotApi implements TelegramApi {
           ]),
         },
       );
-      const data = (await response.json()) as {
-        ok?: boolean;
-        result?: unknown;
-        error_code?: number;
-        parameters?: { retry_after?: number };
-      };
-      const code = data.error_code ?? response.status;
-      if (!response.ok || data.ok !== true) {
-        const refused =
-          data.ok === false && code >= 400 && code < 500 ? code : undefined;
-        if (code === 401 || code === 404)
-          throw new TelegramApiError("invalid_token", 0, refused);
-        if (code === 409) throw new TelegramApiError("conflict", 0, refused);
-        if (code === 429)
-          throw new TelegramApiError(
-            "rate_limit",
-            Number(data.parameters?.retry_after) || 1,
-            refused,
-          );
-        throw new TelegramApiError("unavailable", 0, refused);
-      }
-      return data.result;
+      return this.unwrap(await response.json(), response.status);
     } catch (error) {
       if (signal?.aborted) throw signal.reason;
       // Raw fetch failures and Telegram descriptions may contain the credential URL.

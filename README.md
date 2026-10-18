@@ -91,27 +91,22 @@ Every step after the first can be skipped with Enter, and `npm run setup` can be
 
 Audio is configured separately because a chat endpoint does not transcribe: OpenAI, Groq and Gemini are offered with their default model.
 
-## Recommended MCPs
+## There's an API or MCP for that
 
-Everything the assistant can _do_ beyond talking comes from MCP servers. Add one in [Executor](https://executor.sh) and it shows up as a tool, with an approval card before anything is written.
+Steve Jobs closed the 2010 iPad event with "there's an app for that" ([CBS](https://www.cbsnews.com/news/steve-jobs-at-the-heavenly-gates-theres-an-app-for-that/)). The modern version: before the assistant answers that it cannot do something, check whether an API or an MCP server already does it. Add it in [Executor](https://executor.sh) and it becomes a tool, with an approval card before anything is written.
 
-| Service                               | What it adds                                                                                                 | Free tier                                                   |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------- |
-| [AgentMail](https://www.agentmail.to) | an inbox as a tool: receive mail, reply, send — the approval card is the last chance before a message leaves | 3 inboxes, 3,000 emails/month, 3 GB storage, no credit card |
-| [TinyFish](https://www.tinyfish.ai)   | web search and page fetch, so the answer comes from a page instead of memory                                 | Search and Fetch APIs free on every plan                    |
-| [Fish Audio](https://fish.audio)      | speech synthesis the assistant can call ([MCP docs](https://docs.fish.audio/overview/mcp))                   | 8,000 credits/month, about 7 minutes of generation          |
+| Service                                | What it adds                                                                                                |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| [AgentMail](https://www.agentmail.to)  | an inbox as a tool: receive, reply, send — 3 inboxes and 3,000 emails/month, no card                        |
+| [TinyFish](https://www.tinyfish.ai)    | web search and page fetch — free on every plan                                                              |
+| [Fish Audio](https://fish.audio)       | speech synthesis the assistant can call ([MCP](https://docs.fish.audio/overview/mcp)) — 8,000 credits/month |
+| [Firecrawl](https://www.firecrawl.dev) | crawl a whole site and extract it as clean text                                                             |
+| [Browser Use](https://browser-use.com) | a real browser for pages that need clicking, not just reading                                               |
+| [Cal.com](https://cal.com)             | scheduling: availability and bookings as tools                                                              |
+| [GitHub](https://github.com)           | repositories, issues and pull requests ([official MCP](https://github.com/github/github-mcp-server))        |
+| [Freestyle](https://www.freestyle.sh)  | a disposable sandbox with Docker and GPU when a job needs a machine                                         |
 
-These three are the ones worth wiring first: mail, web and voice cover most of what a personal assistant is asked to do. None of them needs a card to start, which also means the whole setup can be tried for free before committing to anything.
-
-**Voice is a link, not a bubble.** Fish Audio returns a URL for the audio it generated, so the assistant posts the link in the chat. A Telegram voice bubble would need the audio encoded as OGG/Opus and delivered by this app, which is not implemented: today the reply itself is always text.
-
-## Free tiers are enough to try it
-
-- **Google AI Studio** ([aistudio.google.com](https://aistudio.google.com), [pricing](https://ai.google.dev/pricing)) — the Gemini free tier covers **vision** (an image becomes a description) and **audio** (a voice note is transcribed), without a credit card. Quotas are per minute and per day, and Google may use free-tier content to improve its products: fine for testing, think twice before sending a personal document or a voice note.
-- **Groq** ([groq.com](https://groq.com)) — free tier for Whisper transcription, fast enough for voice notes.
-- **OpenRouter** ([openrouter.ai](https://openrouter.ai)) — `:free` models exist for every modality, rate-limited.
-
-A free Gemini key plus a Telegram bot is the cheapest complete setup: one provider, two functions.
+Roughly in the order a personal assistant needs them: mail, web, voice, then scraping, browsing, calendar, code and compute. Voice here means the _agent_ producing audio as a tool result: the bot still answers in text, and a Telegram voice bubble is not implemented.
 
 ## What it does
 

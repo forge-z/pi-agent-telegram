@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
+import type { OutboundMedia } from "./outbound.js";
 import { mkdirSync } from "node:fs";
 import {
   formatTelegramMessage,
@@ -34,6 +35,8 @@ export interface Delivery {
   id: string;
   chat: string;
   text: string;
+  /** JSON array of OutboundMedia the reply carries, sent after the text. */
+  media: string | null;
   state: string;
   parseMode: "HTML" | null;
   messageThreadId: number | null;
@@ -78,7 +81,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS telegram_topic_selection(chat TEXT,user TEXT,messageThreadId INTEGER NOT NULL CHECK(messageThreadId>0),conversationId TEXT NOT NULL,PRIMARY KEY(chat,user,messageThreadId));
       CREATE TABLE IF NOT EXISTS telegram_updates(id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS telegram_purged_updates(id INTEGER PRIMARY KEY);
-      CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY, chat TEXT, text TEXT, state TEXT DEFAULT 'pending', result TEXT, parseMode TEXT);
+      CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY, chat TEXT, text TEXT, state TEXT DEFAULT 'pending', result TEXT, parseMode TEXT, media TEXT);
       CREATE TABLE IF NOT EXISTS credentials(provider TEXT PRIMARY KEY, value TEXT);
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
       CREATE INDEX IF NOT EXISTS actions_conversation ON actions(conversationId);
@@ -253,6 +256,12 @@ export class Store {
       )
     )
       this.db.exec("ALTER TABLE deliveries ADD COLUMN parseMode TEXT");
+    if (
+      !this.all<{ name: string }>("PRAGMA table_info(deliveries)").some(
+        (c) => c.name === "media",
+      )
+    )
+      this.db.exec("ALTER TABLE deliveries ADD COLUMN media TEXT");
     // Only exact request parts are mirrors. Request ids may contain colons;
     // a prefix match can otherwise cancel a different Telegram request or cron.
     for (const part of this.all<{ id: string; conversationId: string }>(
@@ -330,6 +339,7 @@ export class Store {
     conversationId?: string,
     messageThreadId?: number | null,
     role?: TelegramMessageRole,
+    media?: OutboundMedia[],
   ) {
     conversationId ??= /^([1-9]\d*):/.exec(prefix)?.[1];
     messageThreadId ??= conversationId
@@ -343,6 +353,8 @@ export class Store {
       ...childIds(prefix),
     ).filter((row) => /^\d+$/.test(row.id.slice(prefix.length + 1)));
     const legacy = prior.some((row) => row.parseMode === null);
+    // A reply can be only a file: one row with empty text carries the media.
+    const onlyMedia = !!media?.length && !text.trim();
     const chunks: string[] = [];
     if (legacy) {
       for (let offset = 0; offset < text.length;) {
@@ -353,7 +365,9 @@ export class Store {
       }
     } else
       chunks.push(
-        ...formatTelegramMessage(text, prior.length ? undefined : role),
+        ...(onlyMedia
+          ? [""]
+          : formatTelegramMessage(text, prior.length ? undefined : role)),
       );
     // Commands already commit their receipt and acknowledgement together.
     // A savepoint keeps this batch atomic both inside and outside that transaction.
@@ -361,12 +375,14 @@ export class Store {
     try {
       chunks.forEach((chunk, index) => {
         this.run(
-          "INSERT OR IGNORE INTO deliveries(id,chat,text,parseMode,messageThreadId) VALUES (?,?,?,?,?)",
+          "INSERT OR IGNORE INTO deliveries(id,chat,text,parseMode,messageThreadId,media) VALUES (?,?,?,?,?,?)",
           `${prefix}:${index}`,
           chat,
           chunk,
           legacy ? null : "HTML",
           messageThreadId ?? null,
+          // Attachments ride the first chunk, so a partial reply never repeats them.
+          index === 0 && media?.length ? JSON.stringify(media) : null,
         );
         if (conversationId)
           this.run(

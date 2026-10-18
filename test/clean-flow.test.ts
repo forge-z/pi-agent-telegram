@@ -24,6 +24,49 @@ import {
 } from "../src/telegram-controls.js";
 import { decideMcp } from "../src/telegram-approvals.js";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
+import { deflateSync } from "node:zlib";
+
+/** A real 64x64 PNG: providers refuse tiny images, and so does our guard. */
+function samplePng() {
+  const size = 64;
+  const raw = Buffer.alloc((size * 3 + 1) * size);
+  for (let y = 0; y < size; y += 1) {
+    const row = y * (size * 3 + 1);
+    for (let x = 0; x < size; x += 1) {
+      raw[row + 1 + x * 3] = 200;
+      raw[row + 2 + x * 3] = 60;
+      raw[row + 3 + x * 3] = 60;
+    }
+  }
+  const crc32 = (bytes: Buffer) => {
+    let crc = 0xffffffff;
+    for (const byte of bytes) {
+      crc ^= byte;
+      for (let bit = 0; bit < 8; bit += 1)
+        crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type: string, data: Buffer) => {
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const sum = Buffer.alloc(4);
+    sum.writeUInt32BE(crc32(body));
+    return Buffer.concat([length, body, sum]);
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(size, 0);
+  header.writeUInt32BE(size, 4);
+  header[8] = 8;
+  header[9] = 2;
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", header),
+    chunk("IDAT", deflateSync(raw)),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
 import { hash } from "../src/store.js";
 import { telegramConversationRoute } from "../src/task-telegram.js";
 import {
@@ -132,14 +175,32 @@ async function fixture(bootstrap: { modelId?: string; effort?: string } = {}) {
     messageId = 500,
     fail = false;
   const downloads: string[] = [];
+  const media: {
+    chat: string;
+    kind: string;
+    url?: string;
+    hasBytes: boolean;
+    thread?: number;
+  }[] = [];
+  let mediaFails = false;
   const engine = () =>
     new Telegram(
       app,
       {
         downloadFile: async (fileId: string) => {
           downloads.push(fileId);
-          // minimal valid PNG header; the model layer never decodes it in tests
-          return { data: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]) };
+          return { data: new Uint8Array(samplePng()) };
+        },
+        sendMedia: async (chat, item, opts) => {
+          if (mediaFails) throw new Error("upload refused");
+          media.push({
+            chat,
+            kind: item.kind,
+            url: item.url,
+            hasBytes: !!item.data,
+            thread: opts?.messageThreadId,
+          });
+          return { message_id: messageId++ };
         },
         send: async (chat, text, opts) => {
           if (fail) throw new TelegramSendRefused(400);
@@ -230,6 +291,10 @@ async function fixture(bootstrap: { modelId?: string; effort?: string } = {}) {
   };
   return {
     downloads,
+    media,
+    set mediaFails(value: boolean) {
+      mediaFails = value;
+    },
     get app() {
       return app;
     },
@@ -2134,6 +2199,126 @@ test("the probed chatVision decides whether an image is native", async () => {
     // native: the image itself reached the model, no description, no refusal
     assert.match(text, /"type":"image"|\[imagem/);
     assert.doesNotMatch(text, /descrição automática/);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a reply that carries a file delivers it after the text", async () => {
+  const f = await fixture();
+  try {
+    const conversationId = await f.app.create("anexo de saída");
+    f.app.store.queueTelegram(
+      `${conversationId}:outbound-1`,
+      "-100123",
+      "",
+      3500,
+      conversationId,
+      11,
+      undefined,
+      [
+        {
+          kind: "audio",
+          url: "https://example.test/a.mp3",
+          mimeType: "audio/mpeg",
+        },
+        {
+          kind: "document",
+          data: "QUJD",
+          mimeType: "application/pdf",
+          filename: "a.pdf",
+        },
+      ],
+    );
+    await f.bot.flush();
+    // Nothing to say, so no text message: only the files.
+    assert.equal(f.views.length, 0);
+    assert.deepEqual(
+      f.media.map((m) => [m.kind, m.url ?? m.hasBytes, m.thread]),
+      [
+        ["audio", "https://example.test/a.mp3", 11],
+        ["document", true, 11],
+      ],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("a failed upload is recorded and does not swallow the text", async () => {
+  const f = await fixture();
+  try {
+    const conversationId = await f.app.create("anexo que falha");
+    f.mediaFails = true;
+    f.app.store.queueTelegram(
+      `${conversationId}:outbound-2`,
+      "-100123",
+      "segue o relatório",
+      3500,
+      conversationId,
+      11,
+      undefined,
+      [
+        {
+          kind: "audio",
+          url: "https://example.test/a.mp3",
+          mimeType: "audio/mpeg",
+        },
+      ],
+    );
+    await f.bot.flush();
+    // The text arrived; the upload error is in the delivery row, not in the chat.
+    assert.equal(f.views.length, 1);
+    assert.match(f.views[0]!.text, /segue o relatório/);
+    const row = f.app.store.get<{ state: string; result: string }>(
+      "SELECT state,result FROM deliveries WHERE id=?",
+      `${conversationId}:outbound-2:0`,
+    );
+    assert.equal(row?.state, "sent");
+    assert.match(String(row?.result), /upload refused/);
+  } finally {
+    await f.close();
+  }
+});
+
+test("an empty answer with no file still sends nothing", async () => {
+  const f = await fixture();
+  try {
+    const conversationId = await f.app.create("resposta silenciosa");
+    f.app.store.queueTelegram(
+      `${conversationId}:outbound-3`,
+      "-100123",
+      "",
+      3500,
+      conversationId,
+      11,
+    );
+    await f.bot.flush();
+    assert.equal(f.views.length, 0);
+    assert.equal(f.media.length, 0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("/reload starts a new conversation in the same chat and keeps the old one", async () => {
+  const f = await fixture();
+  try {
+    await f.send("primeira mensagem", 11, -100123, 42);
+    const first = f.app.telegramChats.selection(f.owner)!;
+    assert.ok(first);
+    await f.send("/reload", 11, -100123, 42);
+    assert.match(f.views.at(-1)!.text, /Conversa reiniciada/);
+    // Nothing is selected until the next message, which opens a fresh conversation.
+    assert.equal(f.app.telegramChats.selection(f.owner), undefined);
+    await f.send("depois do reload", 11, -100123, 42);
+    const second = f.app.telegramChats.selection(f.owner)!;
+    assert.notEqual(second, first);
+    // The old conversation is still there: its history is not sent to the model, but
+    // it is not deleted either.
+    const old = await f.app.conversation(first);
+    const page = await old.entries({}, 50, undefined, context);
+    assert.equal(page.items.length > 0, true);
   } finally {
     await f.close();
   }

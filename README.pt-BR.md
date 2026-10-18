@@ -91,33 +91,29 @@ Qualquer passo depois do primeiro pode ser pulado com Enter, e o `npm run setup`
 
 Áudio é configurado à parte, porque endpoint de chat não transcreve: OpenAI, Groq e Gemini aparecem com o modelo padrão de cada um.
 
-## MCPs recomendados
+## Existe uma API ou um MCP para isso
 
-Tudo o que o assistente **faz** além de conversar vem de servidores MCP. Adicione um no [Executor](https://executor.sh) e ele aparece como ferramenta, com cartão de aprovação antes de qualquer escrita.
+Steve Jobs fechou o evento do iPad em 2010 com "there's an app for that" ([CBS](https://www.cbsnews.com/news/steve-jobs-at-the-heavenly-gates-theres-an-app-for-that/)). A versão de hoje: antes de o assistente responder que não consegue, vale verificar se já existe uma API ou um servidor MCP que faz. Adicione no [Executor](https://executor.sh) e ele vira ferramenta, com cartão de aprovação antes de qualquer escrita.
 
-| Serviço                               | O que acrescenta                                                                                                                  | Free tier                                                |
-| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| [AgentMail](https://www.agentmail.to) | uma caixa de entrada como ferramenta: recebe, responde e envia — o cartão de aprovação é a última chance antes de a mensagem sair | 3 caixas, 3.000 e-mails/mês, 3 GB, sem cartão de crédito |
-| [TinyFish](https://www.tinyfish.ai)   | busca na web e leitura de página, para a resposta vir da página em vez da memória                                                 | APIs de Search e Fetch grátis em todos os planos         |
-| [Fish Audio](https://fish.audio)      | síntese de voz que o assistente pode chamar ([docs de MCP](https://docs.fish.audio/overview/mcp))                                 | 8.000 créditos/mês, cerca de 7 minutos de geração        |
+| Serviço                                | O que acrescenta                                                                                         |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| [AgentMail](https://www.agentmail.to)  | uma caixa de entrada como ferramenta: recebe, responde, envia — 3 caixas e 3.000 e-mails/mês, sem cartão |
+| [TinyFish](https://www.tinyfish.ai)    | busca na web e leitura de página — grátis em todos os planos                                             |
+| [Fish Audio](https://fish.audio)       | síntese de voz que o assistente chama ([MCP](https://docs.fish.audio/overview/mcp)) — 8.000 créditos/mês |
+| [Firecrawl](https://www.firecrawl.dev) | varre um site inteiro e devolve texto limpo                                                              |
+| [Browser Use](https://browser-use.com) | um navegador de verdade para páginas que exigem clique, não só leitura                                   |
+| [Cal.com](https://cal.com)             | agenda: disponibilidade e marcações como ferramentas                                                     |
+| [GitHub](https://github.com)           | repositórios, issues e pull requests ([MCP oficial](https://github.com/github/github-mcp-server))        |
+| [Freestyle](https://www.freestyle.sh)  | sandbox descartável com Docker e GPU quando o trabalho precisa de máquina                                |
 
-Esses três são os primeiros que valem ligar: e-mail, web e voz cobrem a maior parte do que se pede a um assistente pessoal. Nenhum deles exige cartão para começar, então dá para testar o conjunto inteiro de graça antes de assumir qualquer coisa.
-
-**Voz é link, não bolha.** O Fish Audio devolve uma URL do áudio gerado, então o assistente manda o link no chat. Bolha de voz no Telegram exigiria o áudio em OGG/Opus entregue por este app, o que não está implementado: hoje a resposta em si é sempre texto.
-
-## Free tiers bastam para experimentar
-
-- **Google AI Studio** ([aistudio.google.com](https://aistudio.google.com), [preços](https://ai.google.dev/pricing)) — o free tier do Gemini cobre **visão** (imagem vira descrição) e **áudio** (recado vira transcrição), sem cartão de crédito. As cotas são por minuto e por dia, e o Google pode usar conteúdo do free tier para melhorar seus produtos: ótimo para testar, pense duas vezes antes de mandar um documento pessoal ou um recado de voz.
-- **Groq** ([groq.com](https://groq.com)) — free tier para transcrição com Whisper, rápido o suficiente para recados.
-- **OpenRouter** ([openrouter.ai](https://openrouter.ai)) — modelos `:free` para todas as modalidades, com limite de requisições.
-
-Uma chave gratuita do Gemini e um bot no Telegram já são o conjunto completo mais barato: um provedor, duas funções.
+Mais ou menos na ordem em que um assistente pessoal precisa: e-mail, web, voz, depois scraping, navegação, agenda, código e computação. Voz aqui é o **agente** produzindo áudio como resultado de ferramenta: o bot continua respondendo em texto, e bolha de voz no Telegram não está implementada.
 
 ## O que ele faz
 
 - **Texto** — o padrão; sem prefixo, sem cerimônia.
 - **Imagem** — modelo que lê imagem recebe a imagem; modelo só-texto recebe uma descrição do `VISION_MODEL`.
 - **Recado de voz** — transcrito para o texto do turno; o áudio nunca entra no contexto nem no histórico.
+- **Anexos de saída** — quando o turno produz um arquivo (áudio, imagem, documento), ele é entregue no chat: áudio como `sendAudio` (bolha de voz quando ogg/opus), imagem como `sendPhoto`, o resto como `sendDocument`. Se o conteúdo traz URL, o Telegram busca o arquivo; só há upload quando existem apenas bytes. Falha de upload não derruba o turno.
 - **Origem explícita** — a mensagem convertida chega como `[áudio transcrito · {"origin":"audio","model":"whisper-1"}]`, então o modelo não confunde transcrição com algo digitado. Falha de transcrição é admitida com o motivo, não descartada.
 - **Agendamentos** — crie um cron pelo chat; execuções agendadas nunca aprovam nada e nunca criam novos agendamentos. Qualquer agendamento pode ser disparado na hora — **Rodar agora** no `/crons`, ou `tasks_run_now` para o modelo — pelo mesmo pipeline e com a mesma entrega, sem mexer no próximo horário.
 - **Aprovações** — toda ferramenta com efeito vira um cartão com Aprovar, Negar e Editar; o resultado é registrado antes de ser entregue.

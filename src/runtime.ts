@@ -1,4 +1,11 @@
 import { discardTelegramControls } from "./telegram-controls.js";
+import {
+  describeMedia,
+  imageVerdict,
+  mediaFromText,
+  outboundMedia,
+  type OutboundMedia,
+} from "./outbound.js";
 import { conversationDeliveries } from "./telegram-deliveries.js";
 import { TelegramChats, type TelegramOwner } from "./telegram-chats.js";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
@@ -175,6 +182,8 @@ export class Runtime {
   private closing = false;
   private conversationChanges = new Set<string>();
   private durableDatabase!: NodeSqliteDatabase;
+  /** Files a turn's tools produced, delivered with its reply; cleared per turn. */
+  private readonly outbound = new Map<string, OutboundMedia[]>();
   private trashTimer?: ReturnType<typeof setInterval>;
   private trashSweep?: Promise<void>;
   private purges = new Set<Promise<unknown>>();
@@ -798,11 +807,37 @@ export class Runtime {
                   callContext.abortSignal,
                   this.scheduledTurn(String(api.conversationId)),
                 );
-                const content = result.content.map((item) =>
-                  item.type === "text" || item.type === "image"
+                const content = result.content.map((item) => {
+                  // A file the tool produced goes to the chat instead of the prompt:
+                  // the model reads one line, not 40 KB of base64. The Executor reports
+                  // one as a JSON descriptor inside a text result, so text counts too.
+                  const media =
+                    outboundMedia(item) ??
+                    (item.type === "text"
+                      ? mediaFromText(item.text)
+                      : undefined);
+                  if (media) {
+                    this.collectOutbound(String(api.conversationId), [media]);
+                    return {
+                      type: "text" as const,
+                      text: describeMedia(media),
+                    };
+                  }
+                  if (item.type === "image") {
+                    // A provider refuses an unsupported image with 400, and the part then
+                    // fails every later turn; refuse it before it enters the history.
+                    const verdict = imageVerdict(item.data, item.mimeType);
+                    if (!verdict.ok)
+                      return {
+                        type: "text" as const,
+                        text: `[imagem ignorada: ${verdict.reason}]`,
+                      };
+                    return item;
+                  }
+                  return item.type === "text"
                     ? item
-                    : { type: "text" as const, text: JSON.stringify(item) },
-                );
+                    : { type: "text" as const, text: JSON.stringify(item) };
+                });
                 if (result.structuredContent)
                   content.push({
                     type: "text",
@@ -1603,6 +1638,17 @@ export class Runtime {
     this.monitorSubmission(conversation, submission, existing);
     return { submissionId: submission.id, conversationId, requestId };
   }
+  private collectOutbound(conversationId: string, media: OutboundMedia[]) {
+    if (!media.length) return;
+    const list = this.outbound.get(conversationId) ?? [];
+    list.push(...media);
+    this.outbound.set(conversationId, list);
+  }
+  private takeOutbound(conversationId: string) {
+    const list = this.outbound.get(conversationId);
+    this.outbound?.delete(conversationId);
+    return list;
+  }
   private monitorSubmission(
     conversation: Awaited<ReturnType<Runtime["conversation"]>>,
     submission: Submission,
@@ -1622,7 +1668,7 @@ export class Runtime {
         let answer = "";
         // One place for the reply route: the mirrored topic when the request came in
         // through Telegram, otherwise the origin chat.
-        const reply = (text: string) => {
+        const reply = (text: string, media?: OutboundMedia[]) => {
           if (mirror && source === "telegram") {
             const currentMirror = this.store.get<RequestTelegramRoute>(
               "SELECT * FROM request_telegram_routes WHERE conversationId=? AND requestId=?",
@@ -1648,7 +1694,16 @@ export class Runtime {
                 requestId,
               );
           } else if (chat && source === "telegram") {
-            this.store.queueTelegram(key, chat, text, 3500, conversationId);
+            this.store.queueTelegram(
+              key,
+              chat,
+              text,
+              3500,
+              conversationId,
+              undefined,
+              undefined,
+              media,
+            );
           }
         };
         if (
@@ -1674,13 +1729,22 @@ export class Runtime {
           // The sentinel never reaches a chat, and an answer that is only the
           // sentinel means "say nothing at all".
           answer = raw.replace(SILENT_ANSWER, "").trim();
-          if (answer) reply(answer);
+          // Drain on every turn, so a task run never leaks its files into the next
+          // chat reply of the same conversation.
+          const media = this.takeOutbound(conversationId);
+          if (answer || media?.length) reply(answer, media);
           this.flushTelegramPending?.();
         }
         // A turn that ended without an answer — a failed compaction, a provider
         // error, a dropped input — must not leave the person waiting in silence.
         if (settled.status !== "done" && source !== "task") {
           const category = settleFailureCategory(settled);
+          // The chat gets the category only. The operator log gets the category and the
+          // provider's HTTP status - never the body, which can carry the request.
+          const status = /^(\d{3})\b/.exec(settleFailureReason(settled))?.[1];
+          console.warn(
+            `Turno sem resposta: ${category}${status ? ` (HTTP ${status})` : ""}.`,
+          );
           if (!/^aborted\b/.test(category))
             reply(`Não foi possível responder: ${category}`);
           this.flushTelegramPending?.();

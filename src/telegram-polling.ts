@@ -20,6 +20,7 @@ export const cleanCommands = [
   { command: "crons", description: "Criar e gerenciar agendamentos" },
   { command: "stop", description: "Interromper execução deste tópico" },
   { command: "status", description: "Modelo, MCPs, execução e versão" },
+  { command: "reload", description: "Começar uma conversa nova" },
   { command: "help", description: "Ajuda" },
 ];
 /**
@@ -80,6 +81,10 @@ export class TelegramPolling {
         downloadFile: (fileId: string) => {
           if (!api.downloadFile) throw new TelegramApiError("unavailable");
           return api.downloadFile(fileId, signal);
+        },
+        sendMedia: (chat, media, options) => {
+          if (!api.sendMedia) throw new TelegramApiError("unavailable");
+          return api.sendMedia(chat, media, options);
         },
         answerCallback: (id, text) =>
           api.call(

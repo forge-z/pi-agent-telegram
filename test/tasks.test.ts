@@ -734,7 +734,25 @@ test("a turn that ends without an answer tells the chat why instead of staying s
       user: "42",
       messageThreadId: 11,
     });
-    await settle(app, conversationId);
+    const logged: string[] = [];
+    const warn = console.warn;
+    console.warn = (...parts: unknown[]) => {
+      logged.push(parts.map(String).join(" "));
+    };
+    try {
+      await settle(app, conversationId);
+    } finally {
+      console.warn = warn;
+    }
+    // The operator log says what happened, never the provider body.
+    assert.ok(
+      logged.some((line) => /model_error/.test(line)),
+      JSON.stringify(logged),
+    );
+    assert.ok(
+      logged.every((line) => !line.includes("provider exploded")),
+      JSON.stringify(logged),
+    );
     const texts = app.store
       .all<{ text: string }>("SELECT text FROM deliveries")
       .map((row) => row.text);
