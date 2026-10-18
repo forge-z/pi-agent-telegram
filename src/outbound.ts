@@ -190,3 +190,43 @@ export function imageVerdict(
     return { ok: false, reason: `${byteLength} bytes, pequena demais` };
   return { ok: true };
 }
+
+/** Extension to kind, for a URL that arrives without a mime type. */
+function kindFromUrl(url: string): "audio" | "voice" | "photo" | "document" {
+  const ext = /\.([a-z0-9]{2,5})(?:[?#].*)?$/i.exec(url)?.[1]?.toLowerCase();
+  if (ext === "ogg" || ext === "opus") return "voice";
+  if (ext && ["mp3", "m4a", "wav", "flac", "aac"].includes(ext)) return "audio";
+  if (ext && ["jpg", "jpeg", "png", "webp", "gif"].includes(ext))
+    return "photo";
+  return "document";
+}
+
+/**
+ * A file the model asks to send: only a URL, because Telegram fetches it. Anything that
+ * is not public http(s) is refused - the app must not fetch it (that is an SSRF door).
+ */
+export function attachmentMedia(input: {
+  url: unknown;
+  kind?: unknown;
+  name?: unknown;
+}): OutboundMedia {
+  const url = typeof input.url === "string" ? input.url.trim() : "";
+  if (!/^https?:\/\//i.test(url))
+    throw new Error("Anexo exige uma URL pública http(s)");
+  const declared =
+    input.kind === "audio" ||
+    input.kind === "voice" ||
+    input.kind === "photo" ||
+    input.kind === "document"
+      ? input.kind
+      : undefined;
+  const name =
+    typeof input.name === "string" && input.name.trim()
+      ? input.name.trim()
+      : undefined;
+  return {
+    kind: declared ?? kindFromUrl(url),
+    url,
+    ...(name ? { filename: name } : {}),
+  };
+}

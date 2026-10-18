@@ -45,6 +45,8 @@ test("model receives task tools and creates/lists the same durable schedule used
       assert.ok(names.includes("tasks_set_enabled"));
       assert.ok(names.includes("tasks_set_delivery"));
       assert.ok(names.includes("tasks_runs"));
+      // The model needs to see that sending a file is possible at all.
+      assert.ok(names.includes("send_attachment"));
       assert.match(
         JSON.stringify(getCurrentTools(transcript.messages)),
         /web_telegram/,

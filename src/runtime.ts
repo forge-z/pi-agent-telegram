@@ -1,5 +1,6 @@
 import { discardTelegramControls } from "./telegram-controls.js";
 import {
+  attachmentMedia,
   describeMedia,
   imageVerdict,
   mediaFromText,
@@ -182,8 +183,6 @@ export class Runtime {
   private closing = false;
   private conversationChanges = new Set<string>();
   private durableDatabase!: NodeSqliteDatabase;
-  /** Files a turn's tools produced, delivered with its reply; cleared per turn. */
-  private readonly outbound = new Map<string, OutboundMedia[]>();
   private trashTimer?: ReturnType<typeof setInterval>;
   private trashSweep?: Promise<void>;
   private purges = new Set<Promise<unknown>>();
@@ -411,6 +410,64 @@ export class Runtime {
                 );
                 return {
                   output: [{ type: "text", text: JSON.stringify(task) }],
+                };
+              },
+            }),
+            defineTool({
+              name: "send_attachment",
+              description:
+                "Send a file to this chat as a real attachment: audio, voice note, photo or document. Use it when the user asks to receive a file, for example an audio link another tool returned. The URL must be public http(s) because Telegram fetches it; local paths and private hosts are refused. Refused inside a scheduled run, whose delivery is text only - quote the link in the answer there.",
+              parameters: Type.Object({
+                url: Type.String({
+                  description: "Public http(s) URL of the file",
+                  minLength: 1,
+                  maxLength: 2000,
+                }),
+                kind: Type.Optional(
+                  Type.Union(
+                    [
+                      Type.Literal("audio"),
+                      Type.Literal("voice"),
+                      Type.Literal("photo"),
+                      Type.Literal("document"),
+                    ],
+                    {
+                      description:
+                        "Normally omit: inferred from the file extension",
+                    },
+                  ),
+                ),
+                name: Type.Optional(
+                  Type.String({
+                    description: "File name shown in the chat",
+                    minLength: 1,
+                    maxLength: 120,
+                  }),
+                ),
+              }),
+              replay: "safe",
+              execute: async (args, api) => {
+                const conversationId = String(api.conversationId);
+                // A scheduled run delivers text only, so promising a file here would lie.
+                if (app!.tasks.inFlight(conversationId))
+                  throw new Error(
+                    "Execução agendada entrega só texto: inclua o link na resposta.",
+                  );
+                const media = attachmentMedia(args);
+                // Queued straight into the durable delivery list: no buffer, so a restart
+                // or an early settlement cannot swallow the file.
+                if (!telegramConversationRoute(app!.store, conversationId))
+                  throw new Error(
+                    "Esta conversa não está vinculada a um chat do Telegram.",
+                  );
+                app!.queueOutbound(conversationId, [media], api.callId);
+                return {
+                  output: [
+                    {
+                      type: "text",
+                      text: `${describeMedia(media)} Enviado a este chat.`,
+                    },
+                  ],
                 };
               },
             }),
@@ -817,7 +874,11 @@ export class Runtime {
                       ? mediaFromText(item.text)
                       : undefined);
                   if (media) {
-                    this.collectOutbound(String(api.conversationId), [media]);
+                    this.queueOutbound(
+                      String(api.conversationId),
+                      [media],
+                      api.callId,
+                    );
                     return {
                       type: "text" as const,
                       text: describeMedia(media),
@@ -1638,16 +1699,29 @@ export class Runtime {
     this.monitorSubmission(conversation, submission, existing);
     return { submissionId: submission.id, conversationId, requestId };
   }
-  private collectOutbound(conversationId: string, media: OutboundMedia[]) {
+  /**
+   * Queues a file straight into the durable delivery list. Nothing is kept in memory, so
+   * a restart, a replay or an early settlement cannot swallow it.
+   */
+  private queueOutbound(
+    conversationId: string,
+    media: OutboundMedia[],
+    key: string,
+  ) {
     if (!media.length) return;
-    const list = this.outbound.get(conversationId) ?? [];
-    list.push(...media);
-    this.outbound.set(conversationId, list);
-  }
-  private takeOutbound(conversationId: string) {
-    const list = this.outbound.get(conversationId);
-    this.outbound?.delete(conversationId);
-    return list;
+    const route = telegramConversationRoute(this.store, conversationId);
+    if (!route) return;
+    this.store.queueTelegram(
+      `${conversationId}:attachment:${key}`,
+      route.chat,
+      "",
+      3500,
+      conversationId,
+      route.messageThreadId,
+      undefined,
+      media,
+    );
+    this.flushTelegramPending?.();
   }
   private monitorSubmission(
     conversation: Awaited<ReturnType<Runtime["conversation"]>>,
@@ -1731,8 +1805,7 @@ export class Runtime {
           answer = raw.replace(SILENT_ANSWER, "").trim();
           // Drain on every turn, so a task run never leaks its files into the next
           // chat reply of the same conversation.
-          const media = this.takeOutbound(conversationId);
-          if (answer || media?.length) reply(answer, media);
+          if (answer) reply(answer);
           this.flushTelegramPending?.();
         }
         // A turn that ended without an answer — a failed compaction, a provider

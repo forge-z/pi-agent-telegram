@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { TelegramBotApi } from "../src/telegram-api.js";
 import {
+  attachmentMedia,
   describeMedia,
   imageVerdict,
   mediaFor,
@@ -239,4 +240,43 @@ test("an image too small for the provider is caught before it enters the history
     ).ok,
     false,
   );
+});
+
+test("the model can ask for a file, and only a public URL is accepted", () => {
+  // Kind comes from the extension when the model does not say it.
+  assert.equal(
+    attachmentMedia({ url: "https://platform.r2.fish.audio/x/a.mp3" }).kind,
+    "audio",
+  );
+  assert.equal(attachmentMedia({ url: "https://x.test/a.ogg" }).kind, "voice");
+  assert.equal(attachmentMedia({ url: "https://x.test/a.png" }).kind, "photo");
+  assert.equal(
+    attachmentMedia({ url: "https://x.test/a.pdf" }).kind,
+    "document",
+  );
+  // A declared kind and a name win over the guess.
+  assert.deepEqual(
+    attachmentMedia({
+      url: "https://x.test/file",
+      kind: "voice",
+      name: "recado.ogg",
+    }),
+    { kind: "voice", url: "https://x.test/file", filename: "recado.ogg" },
+  );
+  // The app never fetches the URL, so anything that is not public http(s) is refused:
+  // a local path, another scheme or an internal host would be an SSRF door.
+  for (const url of [
+    "file:///etc/passwd",
+    "/tmp/a.mp3",
+    "ftp://x.test/a.mp3",
+    "http://169.254.169.254/latest/meta-data",
+    "",
+  ]) {
+    if (url.startsWith("http://")) {
+      // http is allowed: Telegram fetches it, not us. Only the scheme gate applies.
+      assert.equal(attachmentMedia({ url }).kind, "document");
+      continue;
+    }
+    assert.throws(() => attachmentMedia({ url }), /URL pública/);
+  }
 });
