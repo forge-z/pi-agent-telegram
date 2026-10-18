@@ -91,10 +91,16 @@ export function outboundMedia(part: unknown): OutboundMedia | undefined {
 
 /** What the model reads instead of the bytes: it knows a file was sent, without them. */
 export function describeMedia(media: OutboundMedia) {
+  const kind = {
+    audio: "áudio",
+    voice: "voz",
+    photo: "imagem",
+    document: "documento",
+  }[media.kind];
   const size = media.data
-    ? `${Math.round((media.data.length * 3) / 4 / 1024)} KB`
-    : (media.url ?? "");
-  return `[anexo enviado ao chat: ${media.mimeType ?? "binário"}${size ? `, ${size}` : ""}]`;
+    ? `, ${Math.round((media.data.length * 3) / 4 / 1024)} KB`
+    : "";
+  return `[anexo enviado ao chat: ${media.mimeType ?? kind}${size}]`;
 }
 
 const FENCE = /^```(?:json)?\s*([\s\S]*?)\s*```$/i;

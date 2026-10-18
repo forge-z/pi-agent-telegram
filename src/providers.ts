@@ -1,5 +1,5 @@
 /** Providers offered by `npm run setup`. Data, not logic: adding one is a single row. */
-export interface ProviderEntry {
+interface ProviderEntry {
   id: string;
   name: string;
   /** Chat endpoint root, used verbatim (the adapter appends `/chat/completions`). */

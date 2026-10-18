@@ -456,11 +456,15 @@ export class Runtime {
                 const media = attachmentMedia(args);
                 // Queued straight into the durable delivery list: no buffer, so a restart
                 // or an early settlement cannot swallow the file.
-                if (!telegramConversationRoute(app!.store, conversationId))
+                const queued = app!.queueOutbound(
+                  conversationId,
+                  [media],
+                  api.callId,
+                );
+                if (!queued)
                   throw new Error(
                     "Esta conversa não está vinculada a um chat do Telegram.",
                   );
-                app!.queueOutbound(conversationId, [media], api.callId);
                 return {
                   output: [
                     {
@@ -1708,9 +1712,9 @@ export class Runtime {
     media: OutboundMedia[],
     key: string,
   ) {
-    if (!media.length) return;
+    if (!media.length) return false;
     const route = telegramConversationRoute(this.store, conversationId);
-    if (!route) return;
+    if (!route) return false;
     this.store.queueTelegram(
       `${conversationId}:attachment:${key}`,
       route.chat,
@@ -1722,6 +1726,7 @@ export class Runtime {
       media,
     );
     this.flushTelegramPending?.();
+    return true;
   }
   private monitorSubmission(
     conversation: Awaited<ReturnType<Runtime["conversation"]>>,

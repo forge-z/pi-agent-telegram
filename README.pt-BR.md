@@ -28,7 +28,7 @@ O repositório e o container mantêm o nome `pi-agent-tg` para não quebrar volu
 3. Opcional, para grupo: adicione o bot e, no **@BotFather**, `/setprivacy` → **Disable**; sem isso o Telegram só entrega comandos e menções. O id negativo do grupo vai em `TELEGRAM_ALLOWED_CHATS`.
 4. Opcional, para uma conversa por tópico: transforme o grupo em **fórum** (configurações do grupo → Tópicos). Cada tópico fica com histórico, modelo e esforço próprios, sem configuração extra.
 
-O menu de comandos (`/model`, `/thinking`, `/crons`, `/stop`, `/status`, `/help`) é registrado pelo próprio app ao subir e de novo no `/status` — não há `/setcommands` para fazer.
+O menu de comandos (`/model`, `/thinking`, `/crons`, `/stop`, `/status`, `/reload`, `/help`) é registrado pelo próprio app ao subir e de novo no `/status` — não há `/setcommands` para fazer.
 
 ## Instalação
 
@@ -120,14 +120,15 @@ Mais ou menos na ordem em que um assistente pessoal precisa: e-mail, web, voz, d
 
 ## Comandos
 
-| Comando     | O que faz                                      |
-| ----------- | ---------------------------------------------- |
-| `/status`   | os três modelos em uso, esforço, MCPs e versão |
-| `/model`    | provedor e modelo desta conversa               |
-| `/thinking` | esforço desta conversa                         |
-| `/crons`    | criar e gerenciar agendamentos                 |
-| `/stop`     | interromper o que está rodando neste tópico    |
-| `/help`     | a mesma lista, no chat                         |
+| Comando     | O que faz                                                               |
+| ----------- | ----------------------------------------------------------------------- |
+| `/status`   | os três modelos em uso, esforço, MCPs e versão                          |
+| `/reload`   | começar uma conversa nova neste chat; o histórico antigo continua salvo |
+| `/model`    | provedor e modelo desta conversa                                        |
+| `/thinking` | esforço desta conversa                                                  |
+| `/crons`    | criar e gerenciar agendamentos                                          |
+| `/stop`     | interromper o que está rodando neste tópico                             |
+| `/help`     | a mesma lista, no chat                                                  |
 
 ## Limites que vale saber
 

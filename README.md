@@ -26,7 +26,7 @@ The repository and container keep the `pi-agent-tg` name so existing volumes and
 3. Optional, for a group: add the bot, then in **@BotFather** `/setprivacy` → **Disable**, otherwise Telegram only delivers commands and mentions. Put the group's negative id in `TELEGRAM_ALLOWED_CHATS`.
 4. Optional, for one conversation per topic: turn the group into a **forum** (group settings → Topics). Each topic gets its own history, model and effort; no extra configuration.
 
-The command menu (`/model`, `/thinking`, `/crons`, `/stop`, `/status`, `/help`) is registered by the app itself on start and again on `/status`, so there is no `/setcommands` to do.
+The command menu (`/model`, `/thinking`, `/crons`, `/stop`, `/status`, `/reload`, `/help`) is registered by the app itself on start and again on `/status`, so there is no `/setcommands` to do.
 
 ## Install
 
@@ -119,14 +119,15 @@ Roughly in the order a personal assistant needs them: mail, web, voice, then scr
 
 ## Commands
 
-| Command     | What it does                                             |
-| ----------- | -------------------------------------------------------- |
-| `/status`   | the three models in use, effort, MCP servers and version |
-| `/model`    | provider and model for this conversation                 |
-| `/thinking` | effort for this conversation                             |
-| `/crons`    | create and manage schedules                              |
-| `/stop`     | cancel what is running in this topic                     |
-| `/help`     | the same list, in the chat                               |
+| Command     | What it does                                                       |
+| ----------- | ------------------------------------------------------------------ |
+| `/status`   | the three models in use, effort, MCP servers and version           |
+| `/reload`   | start a new conversation in this chat; the old history stays saved |
+| `/model`    | provider and model for this conversation                           |
+| `/thinking` | effort for this conversation                                       |
+| `/crons`    | create and manage schedules                                        |
+| `/stop`     | cancel what is running in this topic                               |
+| `/help`     | the same list, in the chat                                         |
 
 ## Limits worth knowing
 
