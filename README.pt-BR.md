@@ -95,13 +95,15 @@ Qualquer passo depois do primeiro pode ser pulado com Enter, e o `npm run setup`
 
 Tudo o que o assistente **faz** além de conversar vem de servidores MCP. Adicione um no [Executor](https://executor.sh) e ele aparece como ferramenta, com cartão de aprovação antes de qualquer escrita.
 
-| Serviço                               | O que acrescenta                                                                                                                  | Onde         |
-| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ------------ |
-| [AgentMail](https://www.agentmail.to) | uma caixa de entrada como ferramenta: recebe, responde e envia — o cartão de aprovação é a última chance antes de a mensagem sair | agentmail.to |
-| [TinyFish](https://www.tinyfish.ai)   | busca na web e leitura de página, para a resposta vir da página em vez da memória                                                 | tinyfish.ai  |
-| [Fish Audio](https://fish.audio)      | síntese de voz que o assistente pode chamar ([docs de MCP](https://docs.fish.audio/overview/mcp))                                 | fish.audio   |
+| Serviço                               | O que acrescenta                                                                                                                  | Free tier                                                |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| [AgentMail](https://www.agentmail.to) | uma caixa de entrada como ferramenta: recebe, responde e envia — o cartão de aprovação é a última chance antes de a mensagem sair | 3 caixas, 3.000 e-mails/mês, 3 GB, sem cartão de crédito |
+| [TinyFish](https://www.tinyfish.ai)   | busca na web e leitura de página, para a resposta vir da página em vez da memória                                                 | APIs de Search e Fetch grátis em todos os planos         |
+| [Fish Audio](https://fish.audio)      | síntese de voz que o assistente pode chamar ([docs de MCP](https://docs.fish.audio/overview/mcp))                                 | 8.000 créditos/mês, cerca de 7 minutos de geração        |
 
-Esses três são os primeiros que valem ligar: e-mail, web e voz cobrem a maior parte do que se pede a um assistente pessoal. Voz aqui significa o **agente** produzindo áudio como resultado de ferramenta — o bot continua respondendo em texto; resposta falada não está implementada.
+Esses três são os primeiros que valem ligar: e-mail, web e voz cobrem a maior parte do que se pede a um assistente pessoal. Nenhum deles exige cartão para começar, então dá para testar o conjunto inteiro de graça antes de assumir qualquer coisa.
+
+**Voz é link, não bolha.** O Fish Audio devolve uma URL do áudio gerado, então o assistente manda o link no chat. Bolha de voz no Telegram exigiria o áudio em OGG/Opus entregue por este app, o que não está implementado: hoje a resposta em si é sempre texto.
 
 ## Free tiers bastam para experimentar
 

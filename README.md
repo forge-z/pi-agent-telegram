@@ -95,13 +95,15 @@ Audio is configured separately because a chat endpoint does not transcribe: Open
 
 Everything the assistant can _do_ beyond talking comes from MCP servers. Add one in [Executor](https://executor.sh) and it shows up as a tool, with an approval card before anything is written.
 
-| Service                               | What it adds                                                                                                 | Where        |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ------------ |
-| [AgentMail](https://www.agentmail.to) | an inbox as a tool: receive mail, reply, send — the approval card is the last chance before a message leaves | agentmail.to |
-| [TinyFish](https://www.tinyfish.ai)   | web search and page fetch, so the answer comes from a page instead of memory                                 | tinyfish.ai  |
-| [Fish Audio](https://fish.audio)      | speech synthesis the assistant can call ([MCP docs](https://docs.fish.audio/overview/mcp))                   | fish.audio   |
+| Service                               | What it adds                                                                                                 | Free tier                                                   |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------- |
+| [AgentMail](https://www.agentmail.to) | an inbox as a tool: receive mail, reply, send — the approval card is the last chance before a message leaves | 3 inboxes, 3,000 emails/month, 3 GB storage, no credit card |
+| [TinyFish](https://www.tinyfish.ai)   | web search and page fetch, so the answer comes from a page instead of memory                                 | Search and Fetch APIs free on every plan                    |
+| [Fish Audio](https://fish.audio)      | speech synthesis the assistant can call ([MCP docs](https://docs.fish.audio/overview/mcp))                   | 8,000 credits/month, about 7 minutes of generation          |
 
-These three are the ones worth wiring first: mail, web and voice cover most of what a personal assistant is asked to do. Voice here means the _agent_ producing audio as a tool result — the bot still answers in text; spoken replies are not implemented.
+These three are the ones worth wiring first: mail, web and voice cover most of what a personal assistant is asked to do. None of them needs a card to start, which also means the whole setup can be tried for free before committing to anything.
+
+**Voice is a link, not a bubble.** Fish Audio returns a URL for the audio it generated, so the assistant posts the link in the chat. A Telegram voice bubble would need the audio encoded as OGG/Opus and delivered by this app, which is not implemented: today the reply itself is always text.
 
 ## Free tiers are enough to try it
 
