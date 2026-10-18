@@ -280,8 +280,8 @@ export class Runtime {
               "scheduling",
               () =>
                 options.telegramOnly
-                  ? "Use tasks_list and tasks_create only for schedules explicitly requested by the user, with full prompt, a five-field cron or ISO date with offset, and an explicit IANA timezone. Ask for missing details. Every schedule keeps the originating Telegram chat/topic forever; never redirect or create another conversation. /crons manages schedules, /stop cancels only the current topic execution. Scheduled/system turns must not create more schedules. Future external actions still require their own MCP approval."
-                  : `Internal tools tasks_list and tasks_create manage the application's persisted agenda independently of MCP. Use tasks_list to inspect existing schedules. When the user explicitly requests a schedule, use tasks_create with the complete future prompt, a five-field cron or a future ISO date with offset, and the user's IANA timezone. Brasília time means America/Sao_Paulo. Ask for missing instructions, recurrence, or timezone rather than inventing them. Results stay in their original conversation; Telegram histories are accessible only in Telegram. Use /crons in Telegram for schedule management. The server captures the active human request origin and freezes its authorized destination. Omit delivery normally: a canonical conversation with a captured Telegram topic defaults to web_telegram for both web and Telegram requests. The server honors web-only delivery only when the saved human request explicitly says so, such as "somente na web", "só na web", "apenas web", "web only", or "only on the web". A model delivery=web argument cannot suppress the captured topic destination. Ambiguous or quoted destination choices require a fresh clear instruction or an explicit task UI selection. A missing or revoked route blocks delivery with a reason; never invent route IDs or use the selected chat as a fallback. The origin chat/topic of a schedule is immutable. Only claim a change after a successful tool result. Scheduled runs and system notifications must never create further schedules. Scheduling a prompt does not authorize its future external effects: normal MCP permissions and action approvals still apply.`,
+                  ? "Use tasks_list and tasks_create only for schedules explicitly requested by the user, with full prompt, a five-field cron or ISO date with offset, and an explicit IANA timezone. Ask for missing details. Every schedule keeps the originating Telegram chat/topic forever; never redirect or create another conversation. /crons manages schedules, /stop cancels only the current topic execution. Scheduled/system turns must not create more schedules, and must never call tasks_run_now: a run cannot start another run. Use tasks_run_now only when the user asks to run a saved schedule now; it keeps the same prompt, conversation and delivery and does not reschedule. Future external actions still require their own MCP approval."
+                  : `Internal tools tasks_list and tasks_create manage the application's persisted agenda independently of MCP. Use tasks_list to inspect existing schedules. When the user explicitly requests a schedule, use tasks_create with the complete future prompt, a five-field cron or a future ISO date with offset, and the user's IANA timezone. Brasília time means America/Sao_Paulo. Ask for missing instructions, recurrence, or timezone rather than inventing them. Results stay in their original conversation; Telegram histories are accessible only in Telegram. Use /crons in Telegram for schedule management. The server captures the active human request origin and freezes its authorized destination. Omit delivery normally: a canonical conversation with a captured Telegram topic defaults to web_telegram for both web and Telegram requests. The server honors web-only delivery only when the saved human request explicitly says so, such as "somente na web", "só na web", "apenas web", "web only", or "only on the web". A model delivery=web argument cannot suppress the captured topic destination. Ambiguous or quoted destination choices require a fresh clear instruction or an explicit task UI selection. A missing or revoked route blocks delivery with a reason; never invent route IDs or use the selected chat as a fallback. The origin chat/topic of a schedule is immutable. Only claim a change after a successful tool result. Scheduled runs and system notifications must never create further schedules and must never call tasks_run_now. tasks_run_now fires a saved schedule immediately, with the same prompt, conversation and delivery, without moving its next run; use it only on an explicit user request. Scheduling a prompt does not authorize its future external effects: normal MCP permissions and action approvals still apply.`,
               { tag: false },
             ),
             section(
@@ -405,6 +405,31 @@ export class Runtime {
                 };
               },
             }),
+            defineTool({
+              name: "tasks_run_now",
+              description:
+                "Run a saved schedule immediately, outside its planned time, through the same pipeline as a scheduled run: same prompt, same conversation, same delivery. It does not change the next run or reschedule anything. Refused while another run of the same schedule is in progress, and never from inside a run: a scheduled execution must not start another.",
+              parameters: Type.Object({
+                taskId: Type.String({ minLength: 1, maxLength: 120 }),
+              }),
+              replay: "safe",
+              execute: async (args, api) => {
+                const conversationId = String(api.conversationId);
+                // No recursion: a run that starts another run has no end.
+                if (app!.tasks.inFlight(conversationId))
+                  throw new Error(
+                    "Uma execução de agendamento está em andamento; ela não pode disparar outra.",
+                  );
+                const run = await app!.tasks.runNow(
+                  args.taskId,
+                  `chat:${conversationId}:${api.taskId}`,
+                );
+                return {
+                  output: [{ type: "text", text: JSON.stringify(run) }],
+                };
+              },
+            }),
+
             defineTool({
               name: "tasks_edit",
               description:

@@ -23,6 +23,7 @@ export interface CronMenuAction {
     | "list"
     | "detail"
     | "toggle"
+    | "run"
     | "edit"
     | "field"
     | "save"
@@ -307,6 +308,7 @@ function render(
       markup.inline_keyboard.push([
         add(task.enabled ? "Pausar" : "Retomar", { action: "toggle" }),
       ]);
+      markup.inline_keyboard.push([add("Rodar agora", { action: "run" })]);
       markup.inline_keyboard.push([
         add("Editar…", { action: "edit" }),
         add("Excluir…", { action: "delete" }),
@@ -446,93 +448,129 @@ export async function handleCronMenu(
   }
   let view: { text: string; markup: TelegramReplyMarkup } | undefined;
   let menu!: Menu;
-  app.store.savepoint("telegram_cron_action", () => {
-    menu = read(app, action.id, data.owner, action.version);
-    let task = action.taskId
-      ? target(app, data.owner, action.taskId)
-      : undefined;
+  let notice: string | undefined;
+  if (action.action === "run") {
+    // Running a schedule is asynchronous, so it happens before the synchronous savepoint
+    // block; the freshness checks below still guard the menu.
+    const menu = read(app, action.id, data.owner, action.version);
+    app.commands.authorize(menu.conversationId, {
+      source: "telegram",
+      ...menu.owner,
+    });
+    const taskId = action.taskId;
+    if (!taskId) throw invalid();
+    const task = target(app, data.owner, taskId);
     if (
-      task &&
-      (hash(JSON.stringify(task)) !== action.taskHash ||
-        action.authorizationVersion !==
-          app.store.authorizationVersion(data.owner, task.conversationId))
+      hash(JSON.stringify(task)) !== action.taskHash ||
+      action.authorizationVersion !==
+        app.store.authorizationVersion(data.owner, task.conversationId)
     )
       throw invalid();
-    menu.version++;
-    if (action.action === "field") {
-      if (!task || !action.field || !Object.hasOwn(fields, action.field))
-        throw invalid();
-      const guidance =
-        action.field === "schedule"
-          ? task.kind === "cron"
-            ? "Use cron de 5 campos, por exemplo: 0 9 * * *."
-            : "Use data ISO futura com Z/offset."
-          : action.field === "timezone"
-            ? "Use um fuso IANA, por exemplo: America/Sao_Paulo ou UTC."
-            : "";
-      menu.targets = [
-        {
-          taskId: task.id,
-          taskHash: hash(JSON.stringify(task)),
-          authorizationVersion: app.store.authorizationVersion(
-            data.owner,
-            task.conversationId,
-          ),
-        },
-      ];
-      const deliveryId = queue(
-        app,
-        `telegram:cron-edit:${action.id}:${menu.version}`,
-        menu,
-        `Editar ${fields[action.field]} de ${task.title}.\nResponda diretamente a esta mensagem com o novo valor. ${guidance}\nA alteração ainda exigirá confirmação. Use /crons para sair.`,
-        undefined,
-        true,
-      );
-      menu.edit = { action: { ...action, version: menu.version }, deliveryId };
-      app.store.run(
-        "INSERT INTO meta VALUES (?,?)",
-        `telegram:cron-prompt:${deliveryId}`,
-        JSON.stringify({
-          conversationId: menu.conversationId,
-          menuId: action.id,
-          deliveryId,
-          owner: menu.owner,
-        }),
-      );
-    } else {
-      if (action.action === "save") {
-        if (!task || !menu.edit?.value || menu.edit.action.taskId !== task.id)
-          throw invalid();
-        assertFullPreview(app, menu.edit.previewPrefix, messageId);
-        task = app.tasks.edit(task.id, {
-          [menu.edit.action.field!]: menu.edit.value,
-        });
-      } else if (action.action === "toggle") {
-        if (!task) throw invalid();
-        task = app.tasks.setEnabled(task.id, !task.enabled);
-      } else if (action.action === "remove") {
-        if (!task) throw invalid();
-        app.tasks.remove(task.id);
-        task = undefined;
-      }
-      menu.edit = undefined;
-      menu.closed = action.action === "close";
-      view = render(
-        app,
-        action.id,
-        menu,
-        {
-          ...action,
-          action: ["save", "toggle"].includes(action.action)
-            ? "detail"
-            : action.action,
-        },
-        task,
-      );
+    try {
+      await app.tasks.runNow(task.id);
+      notice = `Execução manual de ${task.title} iniciada. O resultado segue a entrega configurada e o próximo horário não muda.`;
+    } catch (error) {
+      notice =
+        error instanceof Error
+          ? error.message
+          : "Não foi possível iniciar a execução.";
     }
+    menu.version++;
     save(app, action.id, menu);
-  });
+    view = render(app, action.id, menu, { ...action, action: "detail" }, task);
+  }
+  if (!view)
+    app.store.savepoint("telegram_cron_action", () => {
+      menu = read(app, action.id, data.owner, action.version);
+      let task = action.taskId
+        ? target(app, data.owner, action.taskId)
+        : undefined;
+      if (
+        task &&
+        (hash(JSON.stringify(task)) !== action.taskHash ||
+          action.authorizationVersion !==
+            app.store.authorizationVersion(data.owner, task.conversationId))
+      )
+        throw invalid();
+      menu.version++;
+      if (action.action === "field") {
+        if (!task || !action.field || !Object.hasOwn(fields, action.field))
+          throw invalid();
+        const guidance =
+          action.field === "schedule"
+            ? task.kind === "cron"
+              ? "Use cron de 5 campos, por exemplo: 0 9 * * *."
+              : "Use data ISO futura com Z/offset."
+            : action.field === "timezone"
+              ? "Use um fuso IANA, por exemplo: America/Sao_Paulo ou UTC."
+              : "";
+        menu.targets = [
+          {
+            taskId: task.id,
+            taskHash: hash(JSON.stringify(task)),
+            authorizationVersion: app.store.authorizationVersion(
+              data.owner,
+              task.conversationId,
+            ),
+          },
+        ];
+        const deliveryId = queue(
+          app,
+          `telegram:cron-edit:${action.id}:${menu.version}`,
+          menu,
+          `Editar ${fields[action.field]} de ${task.title}.\nResponda diretamente a esta mensagem com o novo valor. ${guidance}\nA alteração ainda exigirá confirmação. Use /crons para sair.`,
+          undefined,
+          true,
+        );
+        menu.edit = {
+          action: { ...action, version: menu.version },
+          deliveryId,
+        };
+        app.store.run(
+          "INSERT INTO meta VALUES (?,?)",
+          `telegram:cron-prompt:${deliveryId}`,
+          JSON.stringify({
+            conversationId: menu.conversationId,
+            menuId: action.id,
+            deliveryId,
+            owner: menu.owner,
+          }),
+        );
+      } else {
+        if (action.action === "save") {
+          if (!task || !menu.edit?.value || menu.edit.action.taskId !== task.id)
+            throw invalid();
+          assertFullPreview(app, menu.edit.previewPrefix, messageId);
+          task = app.tasks.edit(task.id, {
+            [menu.edit.action.field!]: menu.edit.value,
+          });
+        } else if (action.action === "toggle") {
+          if (!task) throw invalid();
+          task = app.tasks.setEnabled(task.id, !task.enabled);
+        } else if (action.action === "remove") {
+          if (!task) throw invalid();
+          app.tasks.remove(task.id);
+          task = undefined;
+        }
+        menu.edit = undefined;
+        menu.closed = action.action === "close";
+        view = render(
+          app,
+          action.id,
+          menu,
+          {
+            ...action,
+            action: ["save", "toggle"].includes(action.action)
+              ? "detail"
+              : action.action,
+          },
+          task,
+        );
+      }
+      save(app, action.id, menu);
+    });
   if (!view) return;
+  if (notice) view = { ...view, text: `${notice}\n\n${view.text}` };
   try {
     if (!transport.editMessage) throw new Error("Edit unavailable");
     await transport.editMessage(

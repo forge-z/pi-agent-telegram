@@ -575,3 +575,26 @@ test("expired menus and changed source selections refuse cron mutations", async 
     await f.close();
   }
 });
+
+test("/crons runs a schedule now, marks it manual and does not reschedule", async () => {
+  const f = await fixture();
+  try {
+    const before = f.app.tasks.get(f.task.id)!;
+    await f.send("/crons");
+    await f.click(f.token(/Relatório/));
+    await f.click(f.token(/Rodar agora/));
+    assert.match(f.views.at(-1)!.text, /Execução manual de .+ iniciada/);
+    const runs = f.app.tasks.runs(f.task.id);
+    assert.equal(runs.length, 1);
+    assert.equal(runs[0].trigger, "manual");
+    // The planned time is untouched: a manual trigger is not a reschedule.
+    assert.equal(f.app.tasks.get(f.task.id)!.nextRun, before.nextRun);
+    assert.equal(f.app.tasks.get(f.task.id)!.enabled, before.enabled);
+    // A second press while it is running is refused, with a readable reason.
+    await f.click(f.token(/Rodar agora/));
+    assert.match(f.views.at(-1)!.text, /execução em andamento/);
+    assert.equal(f.app.tasks.runs(f.task.id).length, 1);
+  } finally {
+    await f.close();
+  }
+});

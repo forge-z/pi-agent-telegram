@@ -119,7 +119,7 @@ Uma chave gratuita do Gemini e um bot no Telegram já são o conjunto completo m
 - **Imagem** — modelo que lê imagem recebe a imagem; modelo só-texto recebe uma descrição do `VISION_MODEL`.
 - **Recado de voz** — transcrito para o texto do turno; o áudio nunca entra no contexto nem no histórico.
 - **Origem explícita** — a mensagem convertida chega como `[áudio transcrito · {"origin":"audio","model":"whisper-1"}]`, então o modelo não confunde transcrição com algo digitado. Falha de transcrição é admitida com o motivo, não descartada.
-- **Agendamentos** — crie um cron pelo chat; execuções agendadas nunca aprovam nada e nunca criam novos agendamentos.
+- **Agendamentos** — crie um cron pelo chat; execuções agendadas nunca aprovam nada e nunca criam novos agendamentos. Qualquer agendamento pode ser disparado na hora — **Rodar agora** no `/crons`, ou `tasks_run_now` para o modelo — pelo mesmo pipeline e com a mesma entrega, sem mexer no próximo horário.
 - **Aprovações** — toda ferramenta com efeito vira um cartão com Aprovar, Negar e Editar; o resultado é registrado antes de ser entregue.
 
 ## Comandos

@@ -119,7 +119,7 @@ A free Gemini key plus a Telegram bot is the cheapest complete setup: one provid
 - **Images** — a model that reads them receives the picture itself; a text-only model gets a description from `VISION_MODEL`.
 - **Voice notes** — transcribed into the turn text; the audio never enters the model context or the history.
 - **Origin is explicit** — a converted message arrives as `[áudio transcrito · {"origin":"audio","model":"whisper-1"}]`, so the model never confuses a transcription with something you typed. A failed transcription is admitted with the reason instead of disappearing.
-- **Schedules** — create a cron in the chat; scheduled runs never approve anything and never create new schedules.
+- **Schedules** — create a cron in the chat; scheduled runs never approve anything and never create new schedules. Any schedule can also be fired on demand — **Rodar agora** in `/crons`, or `tasks_run_now` for the model — through the same pipeline and the same delivery, without moving the next run.
 - **Approvals** — every effectful tool call becomes a card with Approve, Deny and Edit; the result is recorded before it is delivered.
 
 ## Commands

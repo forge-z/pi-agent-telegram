@@ -347,12 +347,12 @@ test("cron skips downtime backlog and overlapping pending occurrences", async ()
     await f.tasks.tick();
     assert.equal(f.tasks.runs(task.id)[0].scheduledAt, epoch + 60000);
     assert.equal(f.tasks.get(task.id)?.nextRun, epoch + 11 * 60000);
+    // While that occurrence runs, neither another tick nor a manual trigger adds a
+    // second one: the manual trigger is refused instead of joining it.
     f.time = epoch + 12 * 60000;
-    await Promise.all([
-      f.tasks.tick(),
-      f.tasks.runNow(task.id),
-      f.tasks.tick(),
-    ]);
+    await f.tasks.tick();
+    await assert.rejects(f.tasks.runNow(task.id), /execução em andamento/);
+    await f.tasks.tick();
     assert.equal(f.tasks.runs(task.id).length, 1);
     assert.equal(f.submits, 1);
     f.finish();
@@ -823,21 +823,26 @@ test("TaskError identifies safe module errors without reclassifying external fai
   }
 });
 
-test("manual client keys deduplicate after completion and when joining another pending occurrence", async () => {
+test("a manual client key deduplicates its own occurrence and refuses a second trigger", async () => {
   const f = await fixture();
   try {
     const task = await f.tasks.create({ ...cron, enabled: false });
     const first = await f.tasks.runNow(task.id, "client-key");
-    const duplicate = await f.tasks.runNow(task.id, "client-key");
-    const joined = await f.tasks.runNow(task.id, "other-key");
-    assert.equal(duplicate.id, first.id);
-    assert.equal(joined.id, first.id);
+    // The same key is the same request: it replays, it does not run twice.
+    assert.equal((await f.tasks.runNow(task.id, "client-key")).id, first.id);
+    // A different key while the schedule runs is a second trigger: refused, never joined.
+    await assert.rejects(
+      f.tasks.runNow(task.id, "other-key"),
+      /execução em andamento/,
+    );
     f.finish();
     await f.tasks.tick();
     assert.equal((await f.tasks.runNow(task.id, "client-key")).id, first.id);
-    assert.equal((await f.tasks.runNow(task.id, "other-key")).id, first.id);
-    assert.equal(f.submits, 1);
-    assert.equal(f.tasks.runs(task.id).length, 1);
+    // After it finished, a new key is a new manual run.
+    const second = await f.tasks.runNow(task.id, "other-key");
+    assert.notEqual(second.id, first.id);
+    f.finish();
+    await f.tasks.tick();
     const long = await f.tasks.runNow(task.id, "a".repeat(160));
     assert.ok(long.requestId.length <= 160);
     assert.notEqual(long.id, first.id);
@@ -2104,6 +2109,62 @@ test("prompt edits cannot rewrite an occurrence that is already pending", async 
     );
     assert.equal(f.tasks.runs(task.id)[0].state, "pending");
     assert.equal(f.submits, 0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a manual run is marked in the log and does not reschedule", async () => {
+  const f = await fixture();
+  try {
+    const task = await f.tasks.create(cron);
+    const before = f.tasks.get(task.id)!;
+    const run = await f.tasks.runNow(task.id);
+    assert.equal(run.trigger, "manual");
+    assert.equal(run.scheduledAt, epoch);
+    const after = f.tasks.get(task.id)!;
+    // Same prompt, same conversation, same delivery; nothing scheduled moved.
+    assert.equal(after.nextRun, before.nextRun);
+    assert.equal(after.enabled, true);
+    assert.equal(run.conversationId, task.conversationId);
+    assert.equal(run.delivery, task.delivery);
+    f.finish();
+    await f.tasks.tick();
+
+    f.time = epoch + 3 * 60000;
+    await f.tasks.tick();
+    const [scheduled] = f.tasks.runs(task.id);
+    assert.equal(scheduled.trigger, "scheduled");
+    assert.equal(f.tasks.runs(task.id).length, 2);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a manual run of a running schedule is refused", async () => {
+  const f = await fixture();
+  try {
+    const task = await f.tasks.create(cron);
+    await f.tasks.runNow(task.id);
+    await assert.rejects(f.tasks.runNow(task.id), /execução em andamento/);
+    // The refusal leaves exactly one occurrence and one submitted turn.
+    assert.equal(f.tasks.runs(task.id).length, 1);
+    assert.equal(f.submits, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+test("inFlight tells a run apart from an idle conversation", async () => {
+  const f = await fixture();
+  try {
+    const task = await f.tasks.create(cron);
+    assert.equal(f.tasks.inFlight(task.conversationId), false);
+    await f.tasks.runNow(task.id);
+    assert.equal(f.tasks.inFlight(task.conversationId), true);
+    f.finish();
+    await f.tasks.tick();
+    assert.equal(f.tasks.inFlight(task.conversationId), false);
   } finally {
     await f.close();
   }

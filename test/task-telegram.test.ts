@@ -746,3 +746,39 @@ test(
     }
   },
 );
+
+test("a manual run respects delivery=none and posts nothing", async () => {
+  const f = await fixture();
+  try {
+    const conversation = await f.app.create("Conversa manual silenciosa");
+    f.app.store.run(
+      "INSERT INTO telegram_grants VALUES (?,?,?)",
+      "42",
+      "42",
+      conversation,
+    );
+    f.app.store.run("UPDATE telegram SET conversationId=?", conversation);
+    const task = await f.tasks.create({
+      title: "Só efeitos colaterais",
+      prompt: "Faça sem avisar",
+      kind: "cron",
+      schedule: "* * * * *",
+      timezone: "UTC",
+      conversationId: conversation,
+      delivery: "none",
+    });
+    const run = await f.tasks.runNow(task.id);
+    assert.equal(run.trigger, "manual");
+    await (await f.app.conversation(conversation)).waitForIdle(context);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await f.engine().flush();
+    // Same pipeline, same delivery rule: "none" means nothing is posted, not even a skip.
+    assert.equal(f.sent.length, 0);
+    assert.equal(
+      f.app.store.get("SELECT 1 FROM task_notifications") ?? undefined,
+      undefined,
+    );
+  } finally {
+    await f.close();
+  }
+});

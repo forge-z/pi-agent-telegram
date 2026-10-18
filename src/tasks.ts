@@ -12,6 +12,12 @@ import { logFailure } from "./log.js";
 import { MAX_TEXT, REQUEST_ID } from "./limits.js";
 
 type TaskDelivery = "legacy" | "web" | "web_telegram" | "none";
+/**
+ * Runs as callers see them: `trigger` is derived from the stored `scheduled` flag, so a
+ * manual run is named without a second column to keep in sync.
+ */
+const RUN_SELECT = `SELECT *, CASE scheduled WHEN 1 THEN 'scheduled' ELSE 'manual' END AS trigger FROM task_runs`;
+
 /** The execution log keeps seven days, the window an operator actually reads. */
 const RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const RUN_SWEEP_MS = 60 * 60 * 1000;
@@ -55,6 +61,8 @@ interface TaskRun extends TaskDestination {
   delivery: TaskDelivery;
   conversationId: string;
   id: string;
+  /** `manual` when an operator triggered it: it has no planned time, only a trigger one. */
+  trigger: "scheduled" | "manual";
   scheduledAt: number;
   state: "pending" | "done" | "failed";
   requestId: string;
@@ -866,7 +874,7 @@ export class Tasks {
       values.push(filter.until);
     }
     return this.runtime.store.all<TaskRun>(
-      `SELECT * FROM task_runs WHERE ${conditions.join(" AND ")} ORDER BY rowid DESC LIMIT ?`,
+      `${RUN_SELECT} WHERE ${conditions.join(" AND ")} ORDER BY rowid DESC LIMIT ?`,
       id,
       ...values,
       Math.min(Math.max(Math.trunc(filter.limit ?? 20), 1), 50),
@@ -909,6 +917,13 @@ export class Tasks {
       "DELETE FROM task_run_keys WHERE runId NOT IN (SELECT id FROM task_runs)",
     );
   }
+  /** True while a run of this conversation is executing: a run must not start another. */
+  inFlight(conversationId: string) {
+    return !!this.runtime.store.get(
+      "SELECT 1 FROM task_runs WHERE conversationId=? AND state='pending' AND startedAt IS NOT NULL",
+      conversationId,
+    );
+  }
   runNow(id: string, requestId?: string): Promise<TaskRun> {
     return this.serialize(async () => {
       const task = this.require(id);
@@ -927,7 +942,7 @@ export class Tasks {
       const run = this.claim(id, this.clock(), false, manualRequestId)!;
       await this.dispatch();
       return this.runtime.store.get<TaskRun>(
-        "SELECT * FROM task_runs WHERE id=?",
+        `${RUN_SELECT} WHERE id=?`,
         run.id,
       )!;
     });
@@ -990,18 +1005,18 @@ export class Tasks {
         return undefined;
       }
       if (pending) {
-        // Remember a retried manual request even when it joins an already pending occurrence.
-        if (manualRequestId)
-          store.run(
-            "INSERT INTO task_run_keys VALUES (?,?)",
-            manualRequestId,
-            pending.id,
+        // A manual trigger never joins someone else's execution: if this schedule is
+        // already running, refuse. The catch below rolls back, so no ROLLBACK here.
+        if (!scheduled)
+          throw new TaskError(
+            "Já existe uma execução em andamento deste agendamento.",
           );
         store.db.exec("COMMIT");
         return pending;
       }
       const run: TaskRun = {
         id: randomUUID(),
+        trigger: scheduled ? "scheduled" : "manual",
         scheduledAt: scheduled ? task.nextRun! : now,
         state: "pending",
         requestId: "",

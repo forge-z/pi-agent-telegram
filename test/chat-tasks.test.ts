@@ -432,3 +432,149 @@ test("invalid timezone and cron return tool errors without saving schedules", as
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("the model fires a saved schedule now via tasks_run_now, marked manual", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-chat-task-run-"));
+  const faux = fauxProvider();
+  let taskId = "";
+  faux.setResponses([
+    fauxAssistantMessage(
+      {
+        type: "toolCall",
+        id: "create",
+        name: "tasks_create",
+        arguments: { ...daily },
+      },
+      { stopReason: "toolUse" },
+    ),
+    async (transcript) => {
+      const result = transcript.messages
+        .filter((message) => message.role === "toolResult")
+        .at(-1);
+      assert.ok(result && result.role === "toolResult");
+      const first = result.content[0];
+      assert.ok(first && first.type === "text");
+      taskId = JSON.parse(first.text).id;
+      app.tasks.setDelivery(taskId, "none");
+      return fauxAssistantMessage(
+        {
+          type: "toolCall",
+          id: "run",
+          name: "tasks_run_now",
+          arguments: { taskId },
+        },
+        { stopReason: "toolUse" },
+      );
+    },
+    async (transcript) => {
+      const result = transcript.messages
+        .filter((message) => message.role === "toolResult")
+        .at(-1);
+      assert.ok(result && result.role === "toolResult");
+      const first = result.content[0];
+      assert.ok(first && first.type === "text");
+      const run = JSON.parse(first.text);
+      // Same pipeline as a scheduled run, but the log says it was triggered by hand.
+      assert.equal(run.trigger, "manual");
+      assert.equal(run.delivery, "none");
+      return fauxAssistantMessage("Rodado agora, sem postar nada.");
+    },
+  ]);
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const app = await Runtime.open({ dir, gateway, models });
+  try {
+    const id = await app.create();
+    await app.submit(id, "run-now", "Crie o resumo diário e rode agora");
+    await (await app.conversation(id)).waitForIdle(context);
+    const task = app.tasks.list()[0]!;
+    assert.equal(task.id, taskId);
+    const runs = app.tasks.runs(task.id);
+    assert.equal(runs.length, 1);
+    assert.equal(runs[0].trigger, "manual");
+    // It does not reschedule: the cron keeps its own next run.
+    assert.ok(app.tasks.get(task.id)!.nextRun !== null);
+  } finally {
+    await app.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a run in progress refuses tasks_run_now: no recursion", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-chat-task-recursion-"));
+  const faux = fauxProvider();
+  let taskId = "";
+  faux.setResponses([
+    fauxAssistantMessage(
+      {
+        type: "toolCall",
+        id: "create",
+        name: "tasks_create",
+        arguments: { ...daily },
+      },
+      { stopReason: "toolUse" },
+    ),
+    async (transcript) => {
+      const result = transcript.messages
+        .filter((message) => message.role === "toolResult")
+        .at(-1);
+      assert.ok(result && result.role === "toolResult");
+      const first = result.content[0];
+      assert.ok(first && first.type === "text");
+      taskId = JSON.parse(first.text).id;
+      return fauxAssistantMessage("Agenda criada.");
+    },
+    // While a run is executing, the same conversation asks to fire another one.
+    fauxAssistantMessage(
+      {
+        type: "toolCall",
+        id: "recursive-run",
+        name: "tasks_run_now",
+        arguments: { taskId },
+      },
+      { stopReason: "toolUse" },
+    ),
+    async (transcript) => {
+      const result = transcript.messages
+        .filter((message) => message.role === "toolResult")
+        .at(-1);
+      assert.ok(result && result.role === "toolResult");
+      const first = result.content[0];
+      assert.ok(first && first.type === "text");
+      assert.match(first.text, /não pode disparar outra/);
+      return fauxAssistantMessage(
+        "Não posso disparar outro agendamento de dentro de uma execução.",
+      );
+    },
+  ]);
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const app = await Runtime.open({ dir, gateway, models });
+  try {
+    const id = await app.create();
+    await app.submit(id, "recursion-seed", "Crie o resumo diário");
+    await (await app.conversation(id)).waitForIdle(context);
+    // A run of this conversation is in flight (same shape a scheduled occurrence has).
+    app.store.run(
+      "INSERT INTO task_runs(id,taskId,scheduledAt,requestId,scheduled,startedAt,conversationId,delivery) VALUES (?,?,?,?,?,?,?,?)",
+      randomUUID(),
+      taskId,
+      Date.now(),
+      "task:recursion-guard",
+      1,
+      Date.now(),
+      id,
+      "none",
+    );
+    await app.submit(id, "recursion-attempt", "Rode agora");
+    await (await app.conversation(id)).waitForIdle(context);
+    // The refusal is the only run of that schedule: nothing was admitted.
+    assert.equal(
+      app.tasks.runs(taskId).filter((run) => run.trigger === "manual").length,
+      0,
+    );
+  } finally {
+    await app.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
