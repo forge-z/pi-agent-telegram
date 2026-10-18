@@ -91,6 +91,18 @@ Every step after the first can be skipped with Enter, and `npm run setup` can be
 
 Audio is configured separately because a chat endpoint does not transcribe: OpenAI, Groq and Gemini are offered with their default model.
 
+## Recommended MCPs
+
+Everything the assistant can _do_ beyond talking comes from MCP servers. Add one in [Executor](https://executor.sh) and it shows up as a tool, with an approval card before anything is written.
+
+| Service                               | What it adds                                                                                                 | Where        |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ------------ |
+| [AgentMail](https://www.agentmail.to) | an inbox as a tool: receive mail, reply, send — the approval card is the last chance before a message leaves | agentmail.to |
+| [TinyFish](https://www.tinyfish.ai)   | web search and page fetch, so the answer comes from a page instead of memory                                 | tinyfish.ai  |
+| [Fish Audio](https://fish.audio)      | speech synthesis the assistant can call ([MCP docs](https://docs.fish.audio/overview/mcp))                   | fish.audio   |
+
+These three are the ones worth wiring first: mail, web and voice cover most of what a personal assistant is asked to do. Voice here means the _agent_ producing audio as a tool result — the bot still answers in text; spoken replies are not implemented.
+
 ## Free tiers are enough to try it
 
 - **Google AI Studio** ([aistudio.google.com](https://aistudio.google.com), [pricing](https://ai.google.dev/pricing)) — the Gemini free tier covers **vision** (an image becomes a description) and **audio** (a voice note is transcribed), without a credit card. Quotas are per minute and per day, and Google may use free-tier content to improve its products: fine for testing, think twice before sending a personal document or a voice note.

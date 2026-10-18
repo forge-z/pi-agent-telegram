@@ -91,6 +91,18 @@ Qualquer passo depois do primeiro pode ser pulado com Enter, e o `npm run setup`
 
 Áudio é configurado à parte, porque endpoint de chat não transcreve: OpenAI, Groq e Gemini aparecem com o modelo padrão de cada um.
 
+## MCPs recomendados
+
+Tudo o que o assistente **faz** além de conversar vem de servidores MCP. Adicione um no [Executor](https://executor.sh) e ele aparece como ferramenta, com cartão de aprovação antes de qualquer escrita.
+
+| Serviço                               | O que acrescenta                                                                                                                  | Onde         |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| [AgentMail](https://www.agentmail.to) | uma caixa de entrada como ferramenta: recebe, responde e envia — o cartão de aprovação é a última chance antes de a mensagem sair | agentmail.to |
+| [TinyFish](https://www.tinyfish.ai)   | busca na web e leitura de página, para a resposta vir da página em vez da memória                                                 | tinyfish.ai  |
+| [Fish Audio](https://fish.audio)      | síntese de voz que o assistente pode chamar ([docs de MCP](https://docs.fish.audio/overview/mcp))                                 | fish.audio   |
+
+Esses três são os primeiros que valem ligar: e-mail, web e voz cobrem a maior parte do que se pede a um assistente pessoal. Voz aqui significa o **agente** produzindo áudio como resultado de ferramenta — o bot continua respondendo em texto; resposta falada não está implementada.
+
 ## Free tiers bastam para experimentar
 
 - **Google AI Studio** ([aistudio.google.com](https://aistudio.google.com), [preços](https://ai.google.dev/pricing)) — o free tier do Gemini cobre **visão** (imagem vira descrição) e **áudio** (recado vira transcrição), sem cartão de crédito. As cotas são por minuto e por dia, e o Google pode usar conteúdo do free tier para melhorar seus produtos: ótimo para testar, pense duas vezes antes de mandar um documento pessoal ou um recado de voz.
