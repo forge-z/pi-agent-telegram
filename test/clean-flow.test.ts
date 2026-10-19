@@ -2371,7 +2371,7 @@ test("/status shows the chat, vision and transcription models", async () => {
     const text = f.views.at(-1)!.text;
     assert.match(
       text,
-      /^Modelos:\nTexto: faux-1\nVisão: gemini-3\.5-flash-lite\nÁudio: whisper-1 \(pt\)\nEsforço: /,
+      /^Modelos:\nTexto: faux-1 · Esforço: \S+\nVisão: gemini-3\.5-flash-lite\nÁudio: whisper-1 \(pt\)\n/,
     );
   } finally {
     await f.close();

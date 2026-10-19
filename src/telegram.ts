@@ -1331,10 +1331,10 @@ export class Telegram {
         reply(
           [
             "Modelos:",
-            `Texto: ${settings.modelId}`,
+            // Effort belongs to the text model, so it rides on its line.
+            `Texto: ${settings.modelId} · Esforço: ${settings.effort}`,
             `Visão: ${this.featureLabel(functions.vision, this.mainSeesImages() ? "mesmo do chat" : "desativado")}`,
             `Áudio: ${this.featureLabel(functions.audio, "desativado")}`,
-            `Esforço: ${settings.effort}`,
             "",
             `Execuções neste tópico: ${active.length} · Aprovações pendentes: ${pending}`,
             "",
