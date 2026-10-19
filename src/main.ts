@@ -83,6 +83,8 @@ try {
     initialize: (store) => configureTelegram(store, config, bot),
   });
   const polling = new TelegramPolling(app, api, config, bot);
+  // Jobs that outlive the turn: the poller wakes a turn when one finishes.
+  app.pendingJobs.start();
   app.flushTelegramPending = () => {
     void polling.engine.flush();
   };
@@ -91,6 +93,7 @@ try {
     (closing ??= (async () => {
       rmSync(`${dir}/health.json`, { force: true });
       const draining = polling.close();
+      app.pendingJobs.close();
       const tasks = app.tasks.close();
       await app.mcpCalls?.close();
       await draining;

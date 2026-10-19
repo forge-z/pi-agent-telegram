@@ -12,6 +12,8 @@ The repository and container keep the `pi-agent-tg` name so existing volumes and
 
 **Executor** is the single tool endpoint. It turns any OpenAPI, MCP or GraphQL service into a tool behind one API key, so a mail account, a calendar, a repository or a sandbox appears to the assistant without this app holding those credentials. Every effectful call pauses for an approval card, and the ledger keeps what was decided.
 
+The supported Executor is **v2, the cloud build** (`https://mcp.executor.sh/mcp`). Pi-Agent targets it, and integrations are Executor apps. No version variable is needed: the v1 self-hosted adapter only exists for deployments that still list tools in `ASYNC_JOB_TOOLS`, and it is deprecated (removal 2026-12-31).
+
 ## Create the Telegram bot
 
 1. Open **@BotFather** in Telegram, send `/newbot`, pick a name and a username ending in `bot`. It answers with the **token** — that is `TELEGRAM_BOT_TOKEN`.
@@ -115,6 +117,8 @@ Roughly in the order a personal assistant needs them: mail, web, voice, then scr
 - **Voice notes** — transcribed into the turn text; the audio never enters the model context or the history.
 - **Origin is explicit** — a converted message arrives as `[áudio transcrito · {"origin":"audio","model":"whisper-1"}]`, so the model never confuses a transcription with something you typed. A failed transcription is admitted with the reason instead of disappearing.
 - **Schedules** — create a cron in the chat; scheduled runs never approve anything and never create new schedules. Any schedule can also be fired on demand — **Rodar agora** in `/crons`, or `tasks_run_now` for the model — through the same pipeline and the same delivery, without moving the next run.
+- **Async jobs by manifest** — each job declares how it is dispatched, watched and read; the core only knows state, queue, dedupe and delivery. The official Executor path is built in and needs no configuration. `ASYNC_JOB_TOOLS` (v1) still works and is deprecated (removal 2026-12-31). Reference: [docs/jobs.md](docs/jobs.md).
+- **Container clock** — `TZ` (e.g. `America/Sao_Paulo`) moves log timestamps only; schedules keep their own IANA timezone and never shift.
 - **Approvals** — every effectful tool call becomes a card with Approve, Deny and Edit; the result is recorded before it is delivered.
 
 ## Commands

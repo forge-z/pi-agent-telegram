@@ -38,6 +38,16 @@ export interface McpInteraction {
 }
 const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
+/** Executor tools that describe the executor instead of acting on anything. */
+const READ_ONLY = new Set([
+  "search",
+  "describe",
+  "skills",
+  "list-artifacts",
+  "show-artifact",
+  "resume",
+]);
+
 /** Executor hosted resume often uses executionId + action instead of requestId + response. */
 export function executorUsesExecutionIdResume(
   payload: Record<string, unknown>,
@@ -209,7 +219,9 @@ export class McpCalls {
         "Resultado MCP incerto ou em andamento; a chamada não será reenviada automaticamente",
       );
     }
-    if (this.pending(conversationId))
+    // A pending decision blocks actions, not diagnosis: the Executor's read tools
+    // still answer, so a stuck approval can be looked at instead of guessed about.
+    if (this.pending(conversationId) && !READ_ONLY.has(tool))
       throw new McpNotSentError(
         "Responda à solicitação pendente do servidor MCP antes de continuar",
       );
@@ -223,7 +235,32 @@ export class McpCalls {
       throw new McpNotSentError(
         "Verifique e registre o resultado MCP incerto antes de executar outra chamada neste servidor",
       );
-    if (
+    // A resume is what unlocks the queue, so it never waits behind it. It may only answer a
+    // decision already open in this conversation: the agent cannot invent one.
+    if (tool === "resume") {
+      const requestId =
+        typeof (args as { requestId?: unknown }).requestId === "string"
+          ? (args as { requestId: string }).requestId
+          : "";
+      const open =
+        !!requestId &&
+        this.store.get<{ id: string }>(
+          "SELECT id FROM mcp_interactions WHERE conversationId=? AND state='pending' AND kind='resume' AND json_valid(payload) AND json_extract(payload,'$.requestId')=?",
+          conversationId,
+          requestId,
+        );
+      // A card the user never saw cannot authorize anything.
+      const shown =
+        !!open &&
+        !!this.store.get(
+          "SELECT 1 FROM deliveries WHERE id LIKE ? AND state='sent'",
+          `telegram:mcp:${open.id}%`,
+        );
+      if (!shown)
+        throw new PolicyError(
+          "Retomadas com decisão de permissão devem usar a solicitação do servidor exibida na conversa",
+        );
+    } else if (
       this.store.get(
         "SELECT 1 FROM mcp_calls WHERE conversationId=? AND state IN ('running','paused')",
         conversationId,
@@ -231,11 +268,6 @@ export class McpCalls {
     )
       throw new McpNotSentError(
         "Aguarde a chamada ou retomada MCP em andamento; nenhuma nova ferramenta foi enviada",
-      );
-    // Executor's resume tool is deliberately not an agent-side approval bypass.
-    if (tool === "resume")
-      throw new PolicyError(
-        "Retomadas com decisão de permissão devem usar a solicitação do servidor exibida na conversa",
       );
     const binding = await this.gateway.connectionBinding(server);
     if (this.closed) throw new PolicyError("Aplicação encerrando");
@@ -464,19 +496,46 @@ export class McpCalls {
       );
     }
   }
+  /**
+   * Every object a result carries, outermost first. A pause is not always at the top:
+   * `execute` answers inside its own envelope (`{ok, data:{content:[{text}]}}`) and a
+   * paused tool's payload travels in there, so the search has to descend.
+   */
   private pauseCandidates(result: CallToolResult): Record<string, unknown>[] {
-    const candidates: unknown[] = [result.structuredContent];
-    for (const item of result.content)
-      if (item.type === "text") {
+    const candidates: Record<string, unknown>[] = [];
+    const walk = (value: unknown, depth: number) => {
+      if (depth > 6 || value === undefined || value === null) return;
+      if (typeof value === "string") {
+        const trimmed = value.trim();
+        if (trimmed[0] !== "{" && trimmed[0] !== "[") return;
         try {
-          candidates.push(JSON.parse(item.text));
+          walk(JSON.parse(trimmed), depth + 1);
         } catch {
           /* ordinary text */
         }
+        return;
       }
-    return candidates.filter((value): value is Record<string, unknown> =>
-      object(value),
-    );
+      if (Array.isArray(value)) {
+        for (const item of value) walk(item, depth + 1);
+        return;
+      }
+      if (!object(value)) return;
+      candidates.push(value);
+      for (const key of [
+        "content",
+        "data",
+        "execution",
+        "value",
+        "result",
+        "output",
+        // The paused payload usually arrives as JSON text, not as a field.
+        "text",
+      ])
+        walk(value[key], depth + 1);
+    };
+    walk(result.structuredContent, 0);
+    for (const item of result.content) walk(item, 0);
+    return candidates;
   }
   private executorPauseKind(value: Record<string, unknown>) {
     if (Object.hasOwn(value, "approvalUrl")) return undefined;

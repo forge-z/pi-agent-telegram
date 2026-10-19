@@ -337,6 +337,23 @@ export function formatMcpApprovalDisplay(
     if (request) return request;
     if (hint) return `Referência: \`${hint}\``;
   }
+  // A v2 pause asks one question and then dumps the whole argument object; the
+  // question is what a person needs to decide, so the dump never reaches the card.
+  if (
+    item.kind === "resume" &&
+    payload.protocol === "executor" &&
+    invocation &&
+    typeof invocation.tool === "string" &&
+    // The v2 pause names the app by its Executor id (`app_…`), not by a product name; a
+    // named app was already formatted above.
+    (invocation.app === undefined || /^app_/i.test(String(invocation.app)))
+  ) {
+    const question = request.split(/\n\s*\n/)[0].trim();
+    return question && question.length <= 200
+      ? question
+      : `Aprovar \`${invocation.tool}\`?`;
+  }
+
   return literalReview(review.view.text);
 }
 function opaqueReferenceHint(
@@ -519,16 +536,23 @@ function approvalReview(app: Runtime, item: McpInteraction, call: McpCall) {
     item.kind === "resume" &&
     payload.protocol === "executor" &&
     executorUsesExecutionIdResume(payload);
-  const canAccept =
-    item.kind !== "url" &&
-    emptyForm &&
-    view.complete &&
-    (explicit || executorExecutionPause);
+  // A v2 pause is an Executor-hosted action with an empty form: there is no destination or
+  // body to review, and without this it could only be declined.
+  const executorHostedPause =
+    item.kind === "resume" &&
+    payload.protocol === "executor" &&
+    // The v2 pause names its app by Executor id; a product name has a review of its own.
+    (invocation?.app === undefined || /^app_/i.test(String(invocation.app)));
   const opaque =
     !explicit &&
     (item.kind === "resume"
       ? mailReference(invocation)
       : looksLikeMailSend(call.server, call.tool, nativeInput));
+  const canAccept =
+    item.kind !== "url" &&
+    emptyForm &&
+    view.complete &&
+    (explicit || executorExecutionPause || (executorHostedPause && !opaque));
   return { view, canAccept, opaque, executorExecutionPause };
 }
 
@@ -572,6 +596,35 @@ function card(app: Runtime, item: McpInteraction) {
       ? {}
       : { messageThreadId: route.messageThreadId }),
   };
+  if (
+    typeof payload.expiresAt === "number" &&
+    payload.expiresAt <= Date.now()
+  ) {
+    // Expired without a decision: the topic hears about it once, and nothing is left
+    // half-open for the model to trust later.
+    app.store.savepoint("mcp_expire_card", () => {
+      app.store.run(
+        "UPDATE mcp_interactions SET state='expired' WHERE id=? AND state='pending'",
+        item.id,
+      );
+      app.store.run(
+        "UPDATE mcp_calls SET state='abandoned',updatedAt=? WHERE id=? AND state='paused'",
+        Date.now(),
+        item.callId,
+      );
+    });
+    const invocation = payload.invocation as { tool?: unknown } | undefined;
+    const tool =
+      typeof invocation?.tool === "string" ? `\n\n${invocation.tool}` : "";
+    queueControl(
+      app,
+      `telegram:mcp-expired:${item.id}`,
+      owner,
+      item.conversationId,
+      `**Aprovação MCP expirada**${tool}\n\nNenhuma decisão foi tomada. Nada foi executado e a chamada não será repetida.`,
+    );
+    return;
+  }
   const review = approvalReview(app, item, call);
   const { view, canAccept, opaque, executorExecutionPause } = review;
   const display = formatMcpApprovalDisplay(item, call, review);
@@ -620,10 +673,10 @@ function card(app: Runtime, item: McpInteraction) {
       );
       return token;
     };
-    const controls = [{ text: "Negar", callback_data: make("decline") }];
+    const controls = [{ text: "Recusar", callback_data: make("decline") }];
     if (canAccept)
       controls.unshift({
-        text: "Aprovar esta chamada",
+        text: "Aprovar",
         callback_data: make("accept"),
       });
     queueControl(
@@ -641,24 +694,7 @@ export function queueMcpApprovals(app: Runtime) {
   for (const row of app.store.all<McpInteraction>(
     "SELECT * FROM mcp_interactions WHERE state='pending'",
   )) {
-    const payload = JSON.parse(row.payload);
-    if (
-      typeof payload.expiresAt === "number" &&
-      payload.expiresAt <= Date.now()
-    ) {
-      app.store.savepoint("mcp_expire_card", () => {
-        app.store.run(
-          "UPDATE mcp_interactions SET state='expired' WHERE id=? AND state='pending'",
-          row.id,
-        );
-        app.store.run(
-          "UPDATE mcp_calls SET state='abandoned',updatedAt=? WHERE id=? AND state='paused'",
-          Date.now(),
-          row.callId,
-        );
-      });
-      continue;
-    }
+    // An expired request still needs its topic told, so the card decides.
     card(app, row);
   }
 }

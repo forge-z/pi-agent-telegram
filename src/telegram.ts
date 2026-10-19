@@ -1317,14 +1317,37 @@ export class Telegram {
             .filter((i) => i.state === "pending").length ?? 0;
         const ledger =
           calls.map((c) => `${c.server} / ${c.tool}: ${c.state}`).join("\n") ||
-          "Nenhuma chamada pendente/incerta";
+          "Nenhuma chamada pendente ou incerta.";
+        // The warning only means something when there is an uncertain call to verify.
+        const uncertain =
+          calls.length === 0
+            ? ""
+            : "Se houver resultado incerto, verifique o serviço externo; a chamada não será repetida. /stop encerra esperas locais; efeitos externos exigem verificação.";
         const functions = resolveFunctions(
           process.env,
           this.app.settings.setup(),
           this.app.settings.setupKeys(),
         );
         reply(
-          `Modelos:\nTexto: ${settings.modelId}\nVisão: ${this.featureLabel(functions.vision, this.mainSeesImages() ? "mesmo do chat" : "desativado")}\nÁudio: ${this.featureLabel(functions.audio, "desativado")}\nEsforço: ${settings.effort}\nExecuções neste tópico: ${active.length}\nAprovações pendentes: ${pending}\nRegistro MCP:\n${ledger}\nSe houver resultado incerto, verifique o serviço externo; a chamada não será repetida. /stop encerra esperas locais; efeitos externos exigem verificação.\nMCPs:\n${mcps}\nVersão: ${info.version ?? "dev"} (${info.commit ?? "sem SHA"})\nCompactação automática: modelo e esforço ativos desta conversa.`,
+          [
+            "Modelos:",
+            `Texto: ${settings.modelId}`,
+            `Visão: ${this.featureLabel(functions.vision, this.mainSeesImages() ? "mesmo do chat" : "desativado")}`,
+            `Áudio: ${this.featureLabel(functions.audio, "desativado")}`,
+            `Esforço: ${settings.effort}`,
+            "",
+            `Execuções neste tópico: ${active.length} · Aprovações pendentes: ${pending}`,
+            "",
+            "Registro MCP:",
+            ledger,
+            ...(uncertain ? ["", uncertain] : []),
+            "",
+            "MCPs:",
+            mcps,
+            "",
+            `Versão: ${info.version ?? "dev"} (${info.commit ?? "sem SHA"})`,
+            "Compactação automática: modelo e esforço ativos desta conversa.",
+          ].join("\n"),
         );
         queueMcpChecks(this.app, owner, id, updateId);
       } else if (text === "/reload") {

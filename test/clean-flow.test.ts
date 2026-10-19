@@ -22,7 +22,7 @@ import {
   type TelegramButton,
   type TelegramReplyMarkup,
 } from "../src/telegram-controls.js";
-import { decideMcp } from "../src/telegram-approvals.js";
+import { decideMcp, queueMcpApprovals } from "../src/telegram-approvals.js";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { deflateSync } from "node:zlib";
 
@@ -445,7 +445,9 @@ test("executor waiting_for_interaction with executionId and form elicitation cre
     assert.doesNotMatch(f.views.at(-1)!.text, /"server": "executor"/);
     const card = f.views.at(-1)!;
     assert.ok(
-      card.markup?.inline_keyboard.flat().some((b) => b.text.includes("Negar")),
+      card.markup?.inline_keyboard
+        .flat()
+        .some((b) => b.text.includes("Recusar")),
     );
     assert.ok(
       card.markup?.inline_keyboard
@@ -453,7 +455,7 @@ test("executor waiting_for_interaction with executionId and form elicitation cre
         .some((b) => b.text.includes("Aprovar")),
     );
     const callsBefore = f.calls.length;
-    await f.click(f.button("Negar", card), card);
+    await f.click(f.button("Recusar", card), card);
     await until(() => f.calls.length === callsBefore + 1);
     assert.deepEqual(f.calls.at(-1), {
       tool: "resume",
@@ -515,6 +517,215 @@ test("executor approval-required with executionId creates a Telegram card and re
     );
     assert.match(JSON.stringify(pending), /exec_1cc92b17-test/);
     assert.match(JSON.stringify(pending), /requestId/);
+  } finally {
+    await f.close();
+  }
+});
+
+test("an approval the user gave in chat resumes past the pending call", async () => {
+  const f = await fixture();
+  try {
+    await f.send("/status");
+    const id = f.app.telegramChats.selection(f.owner)!;
+    const before = f.views.length;
+    f.setResult({
+      status: "approval-required",
+      requestId: "apr_e80c716c",
+      invocation: {
+        app: "app_6156b6c0",
+        tool: "agent.automation.runAsync",
+        kind: "mutation",
+        input: { goal: "ETAPA6" },
+      },
+      elicitation: {
+        mode: "form",
+        message: "Approve agent.automation.runAsync?",
+        requestedSchema: { type: "object", properties: {} },
+      },
+      expiresAt: Date.now() + 60000,
+    });
+    await f.app.mcpCalls.execute(id, 81, "executor", "execute", {
+      code: "mock v2 pause",
+    });
+    await until(() => f.views.length > before);
+    f.setResult({ status: "completed", execution: { ok: true, value: {} } });
+    // The user said "aprova" in the chat: the resume is the way out of the queue.
+    await f.app.mcpCalls.execute(id, 82, "executor", "resume", {
+      requestId: "apr_e80c716c",
+      response: { action: "accept" },
+    });
+    assert.ok(f.calls.some((call) => call.tool === "resume"));
+  } finally {
+    await f.close();
+  }
+});
+
+test("the real v2 pause (app_ id, kind and accounts) renders a short card", async () => {
+  const f = await fixture();
+  try {
+    await f.send("/status");
+    const id = f.app.telegramChats.selection(f.owner)!;
+    const before = f.views.length;
+    // Exactly what the provider sends: invocation has no `app`, only tool/kind/input.
+    f.setResult({
+      status: "approval-required",
+      requestId: "apr_99975402",
+      invocation: {
+        app: "app_6156b6c0-2303-4577-8615-c3266edb1c7f",
+        tool: "agent.automation.runAsync",
+        kind: "mutation",
+        input: { goal: "ETAPA4-2026-10-19" },
+        accounts: { tinyfish: "user@example.test" },
+      },
+      elicitation: {
+        mode: "form",
+        message:
+          'Approve agent.automation.runAsync?\n\nArguments:\n{\n  "accountId": "acc_test",\n  "input": { "body": { "output_schema": { "type": "object" } } }\n}',
+        requestedSchema: { type: "object", properties: {} },
+      },
+      expiresAt: Date.now() + 60000,
+    });
+    await f.app.mcpCalls.execute(id, 63, "executor", "execute", {
+      code: "mock real v2 pause",
+    });
+    await until(() => f.views.length > before);
+    const card = f.views.at(-1)!;
+    assert.match(card.text, /Aprovação MCP pendente/);
+    assert.match(card.text, /Approve agent\.automation\.runAsync\?/);
+    // The card asks the question; it does not dump the arguments as JSON.
+    assert.doesNotMatch(card.text, /Arguments|output_schema|accountId/);
+    // An empty form must still offer both decisions: a v2 mutation could only be
+    // denied, which made every mutation impossible to approve.
+    const labels = card.markup!.inline_keyboard.flat().map((b) => b.text);
+    assert.ok(labels.includes("Aprovar"), labels.join(","));
+    assert.ok(labels.includes("Recusar"), labels.join(","));
+  } finally {
+    await f.close();
+  }
+});
+
+test("v2 accept resumes by requestId, never by executionId", async () => {
+  const f = await fixture();
+  try {
+    await f.send("/status");
+    const id = f.app.telegramChats.selection(f.owner)!;
+    f.setResult({
+      status: "approval-required",
+      requestId: "apr_c4b477c6",
+      expiresAt: Date.now() + 60000,
+      invocation: {
+        app: "executor",
+        tool: "coreTools.connections.refresh",
+        input: { address: "tools.zoho_mcp.user.example" },
+      },
+      elicitation: {
+        mode: "form",
+        message: "Approve agent.automation.runAsync?",
+        requestedSchema: { type: "object", properties: {} },
+      },
+    });
+    await f.app.mcpCalls.execute(id, 61, "executor", "execute", {
+      code: "mock v2 pause",
+    });
+    await f.bot.flush();
+    const cardView = f.views.at(-1)!;
+    const callback = cardView
+      .markup!.inline_keyboard.flat()
+      .find((b) => b.text.includes("Aprovar"))!.callback_data!;
+    const data = JSON.parse(
+      f.app.store.get<{ value: string }>(
+        "SELECT value FROM meta WHERE key=?",
+        `telegram:button:${callback}`,
+      )!.value,
+    ) as TelegramButton;
+    // v2's success envelope: the payload lives in `execution.value`.
+    f.setResult({
+      status: "completed",
+      execution: { ok: true, value: { runId: "run-1" } },
+    });
+    await decideMcp(f.app, data, cardView.id);
+    const resume = f.calls.filter((call) => call.tool === "resume").at(-1)!;
+    const args = resume.args as Record<string, unknown>;
+    assert.equal(args.requestId, "apr_c4b477c6");
+    assert.equal(args.executionId, undefined);
+    assert.equal((args.response as { action: string }).action, "accept");
+  } finally {
+    await f.close();
+  }
+});
+
+test("an expired request tells the topic once and leaves nothing open", async () => {
+  const f = await fixture();
+  try {
+    await f.send("/status");
+    const id = f.app.telegramChats.selection(f.owner)!;
+    f.setResult({
+      status: "approval-required",
+      requestId: "apr_expired",
+      expiresAt: Date.now() - 1000,
+      invocation: { tool: "agent.automation.runAsync", input: {} },
+      elicitation: {
+        mode: "form",
+        message: "Approve agent.automation.runAsync?",
+        requestedSchema: { type: "object", properties: {} },
+      },
+    });
+    await f.app.mcpCalls.execute(id, 62, "executor", "execute", {
+      code: "mock expired pause",
+    });
+    await f.bot.flush();
+    await queueMcpApprovals(f.app);
+    await f.bot.flush();
+    const notice = f.views.find((view) =>
+      view.text.includes("Aprovação MCP expirada"),
+    )!;
+    assert.ok(notice, "o tópico precisa saber que expirou");
+    assert.match(notice.text, /agent\.automation\.runAsync/);
+    assert.equal(
+      f.app.store.all("SELECT 1 FROM mcp_interactions WHERE state='pending'")
+        .length,
+      0,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("a pause nested inside the execute envelope still becomes a card", async () => {
+  // Executor v2 answers `execute` with its own envelope and puts the paused tool's payload
+  // inside it; the card must not depend on the pause being at the top level.
+  const f = await fixture();
+  try {
+    await f.send("/status");
+    const id = f.app.telegramChats.selection(f.owner)!;
+    const before = f.views.length;
+    const pause = {
+      status: "approval-required",
+      requestId: "apr_c4b477c6",
+      expiresAt: Date.now() + 60000,
+      invocation: {
+        tool: "agent.automation.runAsync",
+        kind: "mutation",
+        input: {},
+      },
+      elicitation: {
+        mode: "form",
+        message: "Approve agent.automation.runAsync?",
+        requestedSchema: { type: "object", properties: {} },
+      },
+    };
+    f.setResult({
+      ok: true,
+      data: { content: [{ type: "text", text: JSON.stringify(pause) }] },
+    });
+    await f.app.mcpCalls.execute(id, 52, "executor", "execute", {
+      code: "mock v2 pause",
+    });
+    await until(() => f.views.length > before);
+    const card = f.views.at(-1)!;
+    assert.match(card.text, /Aprovação MCP pendente/);
+    assert.match(card.text, /agent\.automation\.runAsync/);
+    assert.match(card.text, /Approve agent\.automation\.runAsync\?/);
   } finally {
     await f.close();
   }
@@ -603,7 +814,7 @@ test("denial, remote expiration and /stop never approve", async () => {
     const id = f.app.telegramChats.selection(f.owner)!;
     await f.app.mcpCalls.execute(id, 1, "executor", "execute", {});
     await f.bot.flush();
-    await f.click(f.button("Negar"));
+    await f.click(f.button("Recusar"));
     await until(() => f.calls.length === 2);
     assert.equal(
       (f.calls[1].args.response as { action: string }).action,
@@ -662,8 +873,15 @@ test("partial review delivery and arbitrary resume cannot authorize execution", 
       },
     });
     await f.app.mcpCalls.execute(id, 1, "executor", "execute", {});
+    // While the card does not reach the chat, no resume can authorize it.
     f.fail(true);
     await f.bot.flush();
+    await assert.rejects(() =>
+      f.app.mcpCalls.execute(id, 3, "executor", "resume", {
+        requestId: "large",
+        response: { action: "accept" },
+      }),
+    );
     f.fail(false);
     await f.bot.flush();
     const delivered = f.views.length;
@@ -672,7 +890,7 @@ test("partial review delivery and arbitrary resume cannot authorize execution", 
     assert.equal(f.views.length, delivered);
     await assert.rejects(() =>
       f.app.mcpCalls.execute(id, 2, "executor", "resume", {
-        requestId: "large",
+        requestId: "not-open",
         response: { action: "accept" },
       }),
     );
@@ -1022,7 +1240,7 @@ test("concurrent approve and deny callbacks send exactly one response while engi
     await f.bot.flush();
     const card = f.views.at(-1)!;
     const yes = f.button("Aprovar", card),
-      no = f.button("Negar", card);
+      no = f.button("Recusar", card);
     await Promise.all([f.click(yes, card), f.click(no, card)]);
     await until(
       () =>
@@ -1182,7 +1400,7 @@ test("opaque sends keep only denial; an old persisted owner-bound approval fails
     await f.click(token, old);
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(f.calls.length, 1);
-    await f.click(f.button("Negar", replacement), replacement);
+    await f.click(f.button("Recusar", replacement), replacement);
     await until(() => f.calls.length === 2);
     assert.equal(
       (f.calls[1].args.response as { action: string }).action,
@@ -1318,7 +1536,7 @@ test("native wrapper prose cannot authorize; a direct plaintext mail settles its
         .some((b) => b.text.includes("Aprovar")),
       false,
     );
-    await f.click(f.button("Negar", refused), refused);
+    await f.click(f.button("Recusar", refused), refused);
     await opaque;
     assert.deepEqual(decisions, [{ action: "decline" }]);
     const direct = f.app.mcpCalls.execute(id, 2, "executor", "send_email", {
@@ -1638,7 +1856,7 @@ test("draft, opaque and escaped sends have no Approve; explicit mail still resum
     );
     assert.match(nativeCard.text, /draft-native/);
     assert.match(nativeCard.text, /não busca o rascunho/);
-    await f.click(f.button("Negar", nativeCard), nativeCard);
+    await f.click(f.button("Recusar", nativeCard), nativeCard);
     await native;
     assert.deepEqual(decisions, [{ action: "decline" }]);
   } finally {

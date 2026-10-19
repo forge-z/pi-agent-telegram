@@ -7,6 +7,11 @@ import {
   outboundMedia,
   type OutboundMedia,
 } from "./outbound.js";
+import {
+  deterministicFailure,
+  dispatchOutcome,
+  PendingJobs,
+} from "./pending-jobs.js";
 import { conversationDeliveries } from "./telegram-deliveries.js";
 import { TelegramChats, type TelegramOwner } from "./telegram-chats.js";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
@@ -183,6 +188,8 @@ export class Runtime {
   private closing = false;
   private conversationChanges = new Set<string>();
   private durableDatabase!: NodeSqliteDatabase;
+  /** Jobs that outlive the turn; the poller wakes a turn when one finishes. */
+  readonly pendingJobs: PendingJobs = new PendingJobs(this);
   private trashTimer?: ReturnType<typeof setInterval>;
   private trashSweep?: Promise<void>;
   private purges = new Set<Promise<unknown>>();
@@ -859,15 +866,78 @@ export class Runtime {
               executionMode: "sequential",
               outputLimits: { maxBytes: 65536, maxLines: 2000 },
               execute: async (args, api, callContext) => {
-                const result = await this.mcpCalls.execute(
-                  String(api.conversationId),
-                  Number(api.taskId),
-                  server.server,
-                  tool.name,
-                  args,
-                  callContext.abortSignal,
-                  this.scheduledTurn(String(api.conversationId)),
-                );
+                const conversationId = String(api.conversationId);
+                const goal =
+                  typeof (args as { goal?: unknown }).goal === "string"
+                    ? (args as { goal: string }).goal
+                    : undefined;
+                // Registered before the call, so a dispatch that dies without returning
+                // a run id is still reconciled by the poller.
+                // A delegated call (the Executor's `execute` running the integration)
+                // never passes through the direct hook; the arguments name the tool.
+                const job =
+                  this.pendingJobs.register(
+                    server.server,
+                    tool.name,
+                    conversationId,
+                    goal,
+                  ) || this.pendingJobs.registerDelegated(conversationId, args);
+                let result: Awaited<ReturnType<McpCalls["execute"]>>;
+                try {
+                  result = await this.mcpCalls.execute(
+                    conversationId,
+                    Number(api.taskId),
+                    server.server,
+                    tool.name,
+                    args,
+                    callContext.abortSignal,
+                    this.scheduledTurn(conversationId),
+                  );
+                } catch (error) {
+                  // The Executor's runtime can die on resume while the external call runs on.
+                  // That is indeterminate, not failed: the row is open and the poller delivers,
+                  // so the model must not retry (a retry costs a run).
+                  if (job)
+                    return {
+                      output: [
+                        { type: "text" as const, text: JOB_INDETERMINATE },
+                      ],
+                    };
+                  throw error;
+                }
+                if (job) {
+                  const dispatch = dispatchOutcome(result);
+                  if (dispatch.runId)
+                    this.pendingJobs.capture(
+                      server.server,
+                      tool.name,
+                      conversationId,
+                      dispatch.runId,
+                    );
+                  // The dispatch already carried the result: this turn delivers it, so
+                  // the row closes here instead of waking a second turn with the same run.
+                  if (dispatch.completed)
+                    this.pendingJobs.closeUnstarted(
+                      server.server,
+                      tool.name,
+                      conversationId,
+                    );
+                  if (result.isError) {
+                    // A rejected dispatch means no run exists: close the row and let the
+                    // model read the real error (a bad session id, for instance). Only a
+                    // failure that may have created the run becomes "job em andamento".
+                    if (deterministicFailure(result))
+                      this.pendingJobs.closeUnstarted(
+                        server.server,
+                        tool.name,
+                        conversationId,
+                      );
+                    else
+                      return {
+                        output: [{ type: "text" as const, text: JOB_RUNNING }],
+                      };
+                  }
+                }
                 const content = result.content.map((item) => {
                   // A file the tool produced goes to the chat instead of the prompt:
                   // the model reads one line, not 40 KB of base64. The Executor reports
@@ -1772,6 +1842,19 @@ export class Runtime {
                 conversationId,
                 requestId,
               );
+          } else if (source === "job") {
+            // Same route rules as the conversation: the answer lands where the job was
+            // dispatched from.
+            const route = telegramConversationRoute(this.store, conversationId);
+            if (route)
+              this.store.queueTelegram(
+                key,
+                route.chat,
+                text,
+                3500,
+                conversationId,
+                route.messageThreadId,
+              );
           } else if (chat && source === "telegram") {
             this.store.queueTelegram(
               key,
@@ -1788,7 +1871,7 @@ export class Runtime {
         if (
           settled.status === "done" &&
           settled.type === "input" &&
-          (chat || mirror || source === "task")
+          (chat || mirror || source === "task" || source === "job")
         ) {
           const entries = await conversation.entries(
             { minEntryId: settled.answer, maxEntryId: settled.answer },
@@ -1827,6 +1910,10 @@ export class Runtime {
             reply(`Não foi possível responder: ${category}`);
           this.flushTelegramPending?.();
         }
+        if (source === "job") this.pendingJobs.leaveJobTurn(conversationId);
+        // A dispatched result is delivered by this turn: close its row now that the
+        // reply is in the durable delivery list.
+        this.pendingJobs.settleTurn(conversationId);
         this.store.db.exec("SAVEPOINT request_settlement");
         try {
           if (source === "task") {
@@ -2280,3 +2367,11 @@ export class Runtime {
     await this.release();
   }
 }
+
+/** What the model reads instead of a failed dispatch that started a job anyway. */
+/** A dispatch that may have started: the result arrives from the poller, once. */
+const JOB_INDETERMINATE =
+  "A chamada foi iniciada, mas o provedor perdeu o retorno dela (erro interno do Executor). O job continua em andamento e o resultado chegará automaticamente neste tópico. Não repita o pedido nem dispare outro job.";
+
+const JOB_RUNNING =
+  "O job foi disparado e continua em andamento. O resultado chegará automaticamente neste tópico; não é preciso repetir o pedido.";
