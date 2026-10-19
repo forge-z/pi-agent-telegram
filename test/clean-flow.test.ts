@@ -2519,23 +2519,33 @@ test("an empty answer with no file still sends nothing", async () => {
   }
 });
 
-test("/reload starts a new conversation in the same chat and keeps the old one", async () => {
+test("/reload keeps the conversation and clears an uncertain MCP result", async () => {
   const f = await fixture();
   try {
     await f.send("primeira mensagem", 11, -100123, 42);
     const first = f.app.telegramChats.selection(f.owner)!;
     assert.ok(first);
+    // A lost return blocks actions until someone looks at it.
+    f.app.store.run(
+      `INSERT INTO mcp_calls(id,conversationId,server,tool,args,state,result,binding,updatedAt)
+       VALUES ('lost','REPLACED','executor','write','{}','uncertain','{"isError":true}','executor',0)`.replace(
+        "REPLACED",
+        first,
+      ),
+    );
     await f.send("/reload", 11, -100123, 42);
-    assert.match(f.views.at(-1)!.text, /Conversa reiniciada/);
-    // Nothing is selected until the next message, which opens a fresh conversation.
-    assert.equal(f.app.telegramChats.selection(f.owner), undefined);
+    assert.match(f.views.at(-1)!.text, /Conversa recarregada/);
+    // Same conversation: the history is not the problem.
+    assert.equal(f.app.telegramChats.selection(f.owner), first);
+    assert.equal(
+      f.app.store.get("SELECT 1 FROM mcp_calls WHERE state='uncertain'"),
+      undefined,
+    );
     await f.send("depois do reload", 11, -100123, 42);
-    const second = f.app.telegramChats.selection(f.owner)!;
-    assert.notEqual(second, first);
-    // The old conversation is still there: its history is not sent to the model, but
-    // it is not deleted either.
-    const old = await f.app.conversation(first);
-    const page = await old.entries({}, 50, undefined, context);
+    assert.equal(f.app.telegramChats.selection(f.owner), first);
+    const page = await (
+      await f.app.conversation(first)
+    ).entries({}, 50, undefined, context);
     assert.equal(page.items.length > 0, true);
   } finally {
     await f.close();

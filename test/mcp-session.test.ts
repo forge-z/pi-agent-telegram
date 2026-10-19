@@ -1101,3 +1101,62 @@ test("output validators are compiled once per schema and still enforced on later
     await mock.close();
   }
 });
+
+test("an uncertain result blocks actions but never reads", async () => {
+  const mock = await fixture(true);
+  const mcp = gateway(mock.url, true);
+  const dir = await mkdtemp(join(tmpdir(), "mcp-uncertain-"));
+  const store = new Store(dir);
+  const calls = new McpCalls(store, mcp);
+  const text = (result: unknown) => JSON.stringify(result ?? "").slice(0, 400);
+  try {
+    await mcp.discover("mock");
+    // A lost return leaves the row uncertain, exactly like a crashed dispatch.
+    store.run(
+      `INSERT INTO mcp_calls(id,conversationId,server,tool,args,state,result,binding,updatedAt)
+       VALUES ('lost','conversation','mock','execute','{}','uncertain','{"isError":true}','mock',0)`,
+    );
+    await assert.rejects(
+      calls.execute("conversation", 2, "mock", "execute", {}),
+      /resultado MCP incerto/i,
+    );
+    // A read never waits behind it: the message asks the agent to look.
+    const read = await calls
+      .execute("conversation", 3, "mock", "listRuns", {})
+      .then(
+        (result) => text(result),
+        (error: Error) => error.message,
+      );
+    assert.doesNotMatch(text(read), /resultado MCP incerto/i);
+    // That read was the verification: the flag is already gone.
+    assert.equal(calls.clearUncertain("conversation"), 0);
+    // A second lost return is cleared by the operator, who keeps the history.
+    store.run(
+      `INSERT INTO mcp_calls(id,conversationId,server,tool,args,state,result,binding,updatedAt)
+       VALUES ('lost2','conversation','mock','execute','{}','uncertain','{"isError":true}','mock',0)`,
+    );
+    assert.equal(calls.clearUncertain("conversation"), 1);
+    assert.equal(
+      store.get("SELECT 1 FROM mcp_calls WHERE state='uncertain'"),
+      undefined,
+    );
+    assert.equal(
+      store.all("SELECT 1 FROM mcp_calls WHERE state='uncertain'").length,
+      0,
+    );
+    // And the action may run again.
+    const again = await calls
+      .execute("conversation", 4, "mock", "execute", {})
+      .then(
+        (result) => text(result),
+        (error: Error) => error.message,
+      );
+    assert.doesNotMatch(text(again), /resultado MCP incerto/i);
+  } finally {
+    await calls.close();
+    await mcp.close();
+    store.close();
+    await mock.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

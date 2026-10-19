@@ -39,6 +39,15 @@ export interface McpInteraction {
 const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
 /** Executor tools that describe the executor instead of acting on anything. */
+/** A read never needs a decision and never changes state: reads stay open even when an
+ * earlier call's result is unknown, because checking that result means reading. */
+function isReadOnly(tool: string) {
+  return (
+    READ_ONLY.has(tool) ||
+    /^(get|list|read|search|find|query|describe|show|view|status)/i.test(tool)
+  );
+}
+
 const READ_ONLY = new Set([
   "search",
   "describe",
@@ -182,6 +191,27 @@ export class McpCalls {
       ),
     );
   }
+  /** The flag that blocks actions lives per conversation and needs no provider id. Clearing
+   * it keeps the history: only the pending decision goes away. */
+  clearUncertain(conversationId: string) {
+    const rows = this.store.all<{ server: string; tool: string }>(
+      "SELECT server,tool FROM mcp_calls WHERE conversationId=? AND state='uncertain'",
+      conversationId,
+    );
+    if (!rows.length) return 0;
+    this.store.run(
+      "UPDATE mcp_calls SET state='skipped',updatedAt=? WHERE conversationId=? AND state='uncertain'",
+      Date.now(),
+      conversationId,
+    );
+    const now = new Date().toISOString();
+    for (const row of rows)
+      console.log(
+        `Pi-Agent: resultado MCP incerto dispensado: ${row.server}/${row.tool} (${now}).`,
+      );
+    return rows.length;
+  }
+
   private async executeOnce(
     conversationId: string,
     taskId: number,
@@ -225,7 +255,9 @@ export class McpCalls {
       throw new McpNotSentError(
         "Responda à solicitação pendente do servidor MCP antes de continuar",
       );
+    // Reads stay open: checking an uncertain result is only possible by reading.
     if (
+      !isReadOnly(tool) &&
       this.store.get(
         "SELECT 1 FROM mcp_calls WHERE conversationId=? AND server=? AND state='uncertain'",
         conversationId,
@@ -419,6 +451,9 @@ export class McpCalls {
         this.store.db.exec("ROLLBACK");
         throw error;
       }
+      // A read that worked is the verification the block asked for.
+      if (isReadOnly(tool) && !result.isError)
+        this.clearUncertain(call.conversationId);
       return result;
     } catch (error) {
       // A scheduled occurrence publishes no approval card and wakes no waiter, so the

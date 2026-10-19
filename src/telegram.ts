@@ -1350,16 +1350,18 @@ export class Telegram {
           ].join("\n"),
         );
         queueMcpChecks(this.app, owner, id, updateId);
-      } else if (text === "/reload") {
-        // A conversation that cannot answer (a bad image in history, a broken
-        // compaction) must be recoverable without a new topic.
-        this.app.telegramChats.reload(owner);
+      } else if (text === "/reload" || text === "/destravar") {
+        // Reloading keeps the conversation: what blocks it is the pending decision,
+        // not the history.
+        const cleared = this.app.telegramChats.reload(owner);
         reply(
-          "Conversa reiniciada. A próxima mensagem abre uma conversa nova; o histórico anterior continua salvo, mas não é mais enviado ao modelo.",
+          cleared
+            ? `Conversa recarregada: ${cleared} resultado(s) MCP incerto(s) dispensado(s). O histórico continua.`
+            : "Conversa recarregada. Nenhum resultado MCP incerto pendente.",
         );
       } else if (text === "/help" || text === "/start")
         reply(
-          "/model — provedor e modelo\n/thinking — esforço\n/crons — criar e gerenciar agendamentos\n/stop — interromper este tópico\n/status — estado\n/reload — começar uma conversa nova\n/help — ajuda\nCada tópico nativo tem histórico próprio. Crie tópicos no Telegram. Escolhas de modelo persistem após reinício. Compactação automática usa o modelo e esforço ativos.",
+          "/model — provedor e modelo\n/thinking — esforço\n/crons — criar e gerenciar agendamentos\n/stop — interromper este tópico\n/status — estado\n/reload — recarregar esta conversa e dispensar resultado MCP incerto\n/destravar — o mesmo, quando a conversa está travada\n/help — ajuda\nCada tópico nativo tem histórico próprio. Crie tópicos no Telegram. Escolhas de modelo persistem após reinício. Compactação automática usa o modelo e esforço ativos.",
         );
       else if (
         text.startsWith("/") &&
