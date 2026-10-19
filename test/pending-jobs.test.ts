@@ -214,6 +214,7 @@ test("a failed run is a notice, never silence", async () => {
       run_id: "run-3",
       status: "FAILED",
       goal: "raspar",
+      error: "browser crashed at step 3",
       created_at: new Date().toISOString(),
     },
   ]);
@@ -221,7 +222,11 @@ test("a failed run is a notice, never silence", async () => {
     f.jobs.register(SERVER, "run_web_automation", "7", "raspar");
     await f.jobs.tick();
     assert.equal(f.submissions.length, 1);
+    // The notice says which job, which tool and what the provider reported.
     assert.match(f.submissions[0].text, /FAILED/);
+    assert.match(f.submissions[0].text, /run_web_automation/);
+    assert.match(f.submissions[0].text, /job /);
+    assert.match(f.submissions[0].text, /browser crashed at step 3/);
   } finally {
     await f.close();
   }

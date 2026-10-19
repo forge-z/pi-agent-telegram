@@ -72,6 +72,7 @@ import { McpCalls, type McpCall, type McpInteraction } from "./mcp-calls.js";
 import { Settings, SettingsError } from "./settings.js";
 import { Tasks, TaskError, type TaskOrigin } from "./tasks.js";
 import {
+  isNullAcknowledgement,
   isSilentResult,
   queueTaskTelegram,
   telegramConversationRoute,
@@ -1920,7 +1921,19 @@ export class Runtime {
           if (source === "task") {
             // An empty answer is a silent success: no message, logged as `silencioso`.
             // Invisible marks count as empty: they are not content either.
-            const silent = settled.status === "done" && isSilentResult(answer);
+            // Invisible marks count as empty; a sentence that only says "nothing to report"
+            // is the same emptiness in words.
+            const suppressed =
+              settled.status === "done" &&
+              !isSilentResult(answer) &&
+              isNullAcknowledgement(answer);
+            if (suppressed)
+              console.log(
+                `Pi-Agent: execução suprimida (suppressed:null-ack): ${answer}`,
+              );
+            const silent =
+              settled.status === "done" &&
+              (isSilentResult(answer) || suppressed);
             const failure =
               settled.status === "done" ? null : settleFailureReason(settled);
             const summary = failure

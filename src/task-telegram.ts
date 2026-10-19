@@ -137,6 +137,41 @@ export function taskTelegramAvailable(store: Store, conversationId: string) {
  * A scheduled run's message is its own content. Whitespace and the invisible marks a model
  * likes to emit (U+200B, U+FEFF, U+200C, U+200D) are not content, and a task title never is.
  */
+/** A sentence that only says "there is nothing", which is the same as saying nothing.
+ * Anchored on purpose: a real summary can mention "nada relevante" in the middle. */
+const NULL_ACK: RegExp[] = [
+  /^nada (relevante|novo|a relatar|a informar|a reportar|a avisar|exige acao|importante|urgente|critico)/,
+  /^sem (novidades|novidade|alteracoes|alteracao|movimento|pendencia|pendencias|nada)/,
+  /^(as |os )?(caixas|caixa|inbox|agenda|calendario|fila|filas) (estao |esta )?(limpas|limpa|livre|vazias|vazia)/,
+  /^(nenhuma|nenhum) (releases|release|mensagens|mensagem|novidades|novidade|atualizacoes|atualizacao|alteracoes|alteracao|itens|item)/,
+  /^tudo (em ordem|tranquilo|certo|ok)/,
+];
+/** Words that may follow the empty acknowledgement without making it content. */
+const NULL_ACK_TAIL =
+  /^( (nas?|nos?|em|de|da|do|das|dos|nesta|neste|hoje|agora|ultima|ultimas|ultimo|ultimos|duas|tres|quatro|cinco|[0-9]+h?|[a-z]+)){0,5}$/;
+
+/** Nothing above this many characters is ever a bare acknowledgement. */
+const NULL_ACK_LIMIT = 240;
+
+/**
+ * Whether a scheduled run's whole answer is a confirmation that there is nothing to report.
+ * Only the whole message counts: a summary that quotes the phrase keeps its message.
+ */
+export function isNullAcknowledgement(answer: string | null | undefined) {
+  const text = (answer ?? "")
+    .trim()
+    .replace(/[\s\u200b\ufeff\u200c\u200d]+/g, " ")
+    .replace(/[.!?;:\u2026\s]+$/, "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  if (!text || text.length > NULL_ACK_LIMIT) return false;
+  return NULL_ACK.some((pattern) => {
+    const match = pattern.exec(text);
+    return !!match && NULL_ACK_TAIL.test(text.slice(match[0].length));
+  });
+}
+
 export function isSilentResult(result: string | null | undefined) {
   return !(result ?? "").replace(/[\s\u200b\ufeff\u200c\u200d]/g, "");
 }

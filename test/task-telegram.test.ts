@@ -10,6 +10,7 @@ import {
   fauxAssistantMessage,
 } from "@earendil-works/pi-ai/providers/faux";
 import { Runtime } from "../src/runtime.js";
+import { isNullAcknowledgement } from "../src/task-telegram.js";
 import { Tasks } from "../src/tasks.js";
 import { Telegram } from "../src/telegram.js";
 import { Store, type Delivery } from "../src/store.js";
@@ -818,4 +819,61 @@ test("an invisible mark beside real text still delivers the text", async () => {
   } finally {
     await f.close();
   }
+});
+
+test("a scheduled run that only says there is nothing sends nothing", async () => {
+  const f = await fixture("Nada relevante nas duas caixas.");
+  try {
+    f.tasks.setDelivery(f.task.id, "web_telegram");
+    const run = await f.run();
+    await f.engine().flush();
+    assert.equal(f.sent.length, 0);
+    assert.equal(run.status, "silencioso");
+  } finally {
+    await f.close();
+  }
+});
+
+test("a real summary that mentions the phrase still reaches the chat", async () => {
+  const f = await fixture(
+    "Resumo das caixas:\n- 3 e-mails de clientes\n- nada relevante no corpo\n- release v1.2 saiu",
+  );
+  try {
+    f.tasks.setDelivery(f.task.id, "web_telegram");
+    await f.run();
+    await f.engine().flush();
+    assert.equal(f.sent.length, 1);
+    assert.match(f.sent[0]!.text, /release v1\.2/);
+  } finally {
+    await f.close();
+  }
+});
+
+test("only a bare acknowledgement counts as nothing to report", () => {
+  const silent = [
+    "Nada relevante nas duas caixas.",
+    "Nada relevante.",
+    "nada relevante",
+    "  Nada   relevante   nas   caixas  ",
+    "Nenhuma release nas últimas 24h.",
+    "Sem novidades.",
+    "Nada a relatar.",
+    "Caixas limpas.",
+    "Nada exige ação.",
+    "Nenhuma mensagem nova.",
+    "Agenda livre.",
+  ];
+  for (const answer of silent)
+    assert.equal(isNullAcknowledgement(answer), true, answer);
+  const delivered = [
+    "Resumo:\\n- 3 e-mails\\n- nada relevante no corpo\\n- release v1.2",
+    "Nada relevante nas caixas. Mas o release v1.2 saiu e precisa de atenção.",
+    `${"palavra ".repeat(40)}nada relevante`,
+    "",
+    "   ",
+    "Falha ao consultar o provedor: HTTP 500",
+    "Nada relevante nas caixas. Ação: revisar o release v1.2 antes de 18h.",
+  ];
+  for (const answer of delivered)
+    assert.equal(isNullAcknowledgement(answer), false, answer);
 });

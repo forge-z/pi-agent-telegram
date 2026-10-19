@@ -717,7 +717,7 @@ export class PendingJobs {
       // The window may not contain the run yet: silence, not "not confirmed".
       if (!timedOut) return;
       return this.deliver(row, {
-        notice: "Não consegui confirmar o job assíncrono no provedor.",
+        notice: `Não consegui confirmar no provedor o job ${this.label(row)}${row.run_id ? ` (execução ${row.run_id})` : ""}.`,
       });
     }
     // A finished job whose payload carries no result is gone, not failed: providers expire
@@ -728,8 +728,7 @@ export class PendingJobs {
         row.id,
       );
       return this.deliver(row, {
-        notice:
-          "O job terminou, mas o provedor não devolveu o resultado (expirado). Nada será repetido.",
+        notice: `O job ${this.label(row)} terminou, mas o provedor não devolveu o resultado (expirado). Nada será repetido.`,
       });
     }
     // Claim the id so a second registration cannot deliver the same run.
@@ -748,8 +747,9 @@ export class PendingJobs {
     if (run.state === "failed" || run.state === "cancelled")
       return this.deliver(row, {
         notice: [
-          `O job terminou como ${run.status || run.state}.`,
-          run.error ? `Erro: ${run.error}` : "",
+          `O job ${this.label(row)} terminou como ${run.status || run.state}.`,
+          run.run_id ? `Execução no provedor: ${run.run_id}.` : "",
+          run.error ? `Erro do provedor: ${run.error}` : "",
           run.num_of_steps ? `Passos executados: ${run.num_of_steps}.` : "",
         ]
           .filter(Boolean)
@@ -768,6 +768,11 @@ export class PendingJobs {
     return a === b || a.endsWith(b) || a.includes(b);
   }
 
+  /** A notice must say which job it is about: id, tool and provider. */
+  private label(row: PendingJob) {
+    return `job ${row.id} (${row.integration}/${row.tool})`;
+  }
+
   /** Warns once that a run is taking too long; the row stays open for the result. */
   private async warn(row: PendingJob, run: Run) {
     const changed = this.app.store.run(
@@ -777,7 +782,8 @@ export class PendingJobs {
     ).changes;
     if (!changed) return;
     await this.submit(row, [
-      "Um job assíncrono disparado neste tópico ainda não terminou.",
+      `O job assíncrono ${this.label(row)} ainda não terminou.`,
+      row.run_id ? `Execução no provedor: ${row.run_id}.` : "",
       row.goal ? `Objetivo: ${row.goal}` : "",
       `Status: ${run.status} depois de ${Math.round(this.timeoutMs() / 60_000)} minutos.`,
       "Avise o usuário em uma linha de que o job continua rodando; o resultado chegará quando terminar. Não dispare novos jobs.",
