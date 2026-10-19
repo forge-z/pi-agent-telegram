@@ -214,7 +214,9 @@ test("web plus Telegram sends one copy only after the explicit task selection", 
     );
     await f.engine().flush();
     assert.equal(f.sent.length, 1);
-    assert.match(f.sent[0]!.text, /Tarefa: Resumo/);
+    // The result is the message; a task title is never content.
+    assert.match(f.sent[0]!.text, /Resultado do cron/);
+    assert.doesNotMatch(f.sent[0]!.text, /Tarefa:/);
   } finally {
     await f.close();
   }
@@ -305,7 +307,8 @@ test("a task in the conversation selected through Telegram uses its current mapp
     await new Promise((resolve) => setTimeout(resolve, 20));
     await f.engine().flush();
     assert.equal(f.sent.length, 1);
-    assert.match(f.sent[0]!.text, /Tarefa atual/);
+    assert.match(f.sent[0]!.text, /Resultado do cron/);
+    assert.doesNotMatch(f.sent[0]!.text, /Tarefa atual/);
     assert.equal(
       f.app.store.get<{ conversationId: string }>(
         "SELECT conversationId FROM task_notifications",
@@ -778,6 +781,40 @@ test("a manual run respects delivery=none and posts nothing", async () => {
       f.app.store.get("SELECT 1 FROM task_notifications") ?? undefined,
       undefined,
     );
+  } finally {
+    await f.close();
+  }
+});
+
+test("a scheduled run that produced nothing sends nothing", async () => {
+  for (const answer of ["", "   \n\t ", "\u200b", "\ufeff\u200c\u200d\u200b"]) {
+    const f = await fixture(answer);
+    try {
+      f.tasks.setDelivery(f.task.id, "web_telegram");
+      const run = await f.run();
+      await f.engine().flush();
+      assert.equal(f.sent.length, 0, `nada enviado: ${JSON.stringify(answer)}`);
+      assert.equal(
+        f.app.store.all("SELECT 1 FROM deliveries").length,
+        0,
+        "nenhuma entrega registrada",
+      );
+      assert.equal(run.status, "silencioso", JSON.stringify(answer));
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+test("an invisible mark beside real text still delivers the text", async () => {
+  const f = await fixture("\u200b Resumo corporativo: 3 caixas sem novidade.");
+  try {
+    f.tasks.setDelivery(f.task.id, "web_telegram");
+    await f.run();
+    await f.engine().flush();
+    assert.equal(f.sent.length, 1);
+    assert.match(f.sent[0]!.text, /Resumo corporativo/);
+    assert.match(f.sent[0]!.text, /3 caixas sem novidade/);
   } finally {
     await f.close();
   }

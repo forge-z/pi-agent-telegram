@@ -133,6 +133,14 @@ export function taskTelegramAvailable(store: Store, conversationId: string) {
   return !!telegramConversationRoute(store, conversationId);
 }
 
+/**
+ * A scheduled run's message is its own content. Whitespace and the invisible marks a model
+ * likes to emit (U+200B, U+FEFF, U+200C, U+200D) are not content, and a task title never is.
+ */
+export function isSilentResult(result: string | null | undefined) {
+  return !(result ?? "").replace(/[\s\u200b\ufeff\u200c\u200d]/g, "");
+}
+
 /** Freeze a terminal occurrence's destination, including a skipped notification.
  * Replays must never send an old result to a newly linked conversation/chat. */
 export function queueTaskTelegram(
@@ -219,10 +227,20 @@ export function queueTaskTelegram(
           requestId,
         );
       if (route) {
+        // The result is the message. A scheduled run that produced nothing sends nothing;
+        // a task title is never message content.
+        if (isSilentResult(result)) {
+          store.run(
+            "UPDATE task_notifications SET state='silent' WHERE id=?",
+            id,
+          );
+          store.db.exec("RELEASE SAVEPOINT task_notification");
+          return;
+        }
         store.queueTelegram(
           id,
           route.chat,
-          `Tarefa: ${task.title}\n\n${result}`,
+          result,
           3500,
           conversationId,
           route.messageThreadId,

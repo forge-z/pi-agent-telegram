@@ -72,6 +72,7 @@ import { McpCalls, type McpCall, type McpInteraction } from "./mcp-calls.js";
 import { Settings, SettingsError } from "./settings.js";
 import { Tasks, TaskError, type TaskOrigin } from "./tasks.js";
 import {
+  isSilentResult,
   queueTaskTelegram,
   telegramConversationRoute,
   telegramRouteAuthorized,
@@ -1918,7 +1919,8 @@ export class Runtime {
         try {
           if (source === "task") {
             // An empty answer is a silent success: no message, logged as `silencioso`.
-            const silent = settled.status === "done" && !answer;
+            // Invisible marks count as empty: they are not content either.
+            const silent = settled.status === "done" && isSilentResult(answer);
             const failure =
               settled.status === "done" ? null : settleFailureReason(settled);
             const summary = failure
