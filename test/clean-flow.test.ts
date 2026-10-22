@@ -715,8 +715,8 @@ test("a pause nested inside the execute envelope still becomes a card", async ()
       },
     };
     f.setResult({
-      ok: true,
-      data: { content: [{ type: "text", text: JSON.stringify(pause) }] },
+      status: "completed",
+      execution: { ok: true, value: pause },
     });
     await f.app.mcpCalls.execute(id, 52, "executor", "execute", {
       code: "mock v2 pause",
@@ -2547,6 +2547,77 @@ test("/reload keeps the conversation and clears an uncertain MCP result", async 
       await f.app.conversation(first)
     ).entries({}, 50, undefined, context);
     assert.equal(page.items.length > 0, true);
+  } finally {
+    await f.close();
+  }
+});
+
+test("flush delivers assistant replies before uncertain MCP side effects run", async () => {
+  const f = await fixture();
+  try {
+    await f.send("/status");
+    const id = f.app.telegramChats.selection(f.owner)!;
+    f.app.store.queueTelegram(
+      `${id}:assistant:prio`,
+      f.owner.chat,
+      "Resposta prioritária.",
+      3500,
+      id,
+      f.owner.messageThreadId,
+    );
+    f.app.store.run(
+      `INSERT INTO mcp_calls(id,conversationId,server,tool,args,state,result,binding,updatedAt)
+       VALUES ('lost-prio','REPLACED','executor','execute','{}','uncertain','{"isError":true}','executor',0)`.replace(
+        "REPLACED",
+        id,
+      ),
+    );
+    await f.bot.flush();
+    const texts = f.views.map((v) => v.text);
+    assert.ok(
+      texts.some((t) => t.includes("Resposta prioritária")),
+      "a resposta já enfileirada deve ser entregue",
+    );
+    assert.ok(
+      texts.some((t) => t.includes("resultado MCP incerto")),
+      "o aviso incerto deve ser entregue no mesmo flush",
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("flush delivers a queued assistant reply when a persisted uncertain MCP notice is pending", async () => {
+  const f = await fixture();
+  try {
+    await f.send("/status");
+    const id = f.app.telegramChats.selection(f.owner)!;
+    f.app.store.run(
+      `INSERT INTO mcp_calls(id,conversationId,server,tool,args,state,result,binding,updatedAt)
+       VALUES ('lost','REPLACED','executor','execute','{}','uncertain','{"isError":true}','executor',0)`.replace(
+        "REPLACED",
+        id,
+      ),
+    );
+    f.app.store.queueTelegram(
+      `${id}:assistant:1`,
+      f.owner.chat,
+      "Resposta do assistente após incerto.",
+      3500,
+      id,
+      f.owner.messageThreadId,
+    );
+    const before = f.views.length;
+    await f.bot.flush();
+    const texts = f.views.slice(before).map((v) => v.text);
+    assert.ok(
+      texts.some((t) => t.includes("resultado MCP incerto")),
+      "deve enfileirar aviso de MCP incerto",
+    );
+    assert.ok(
+      texts.some((t) => t.includes("Resposta do assistente")),
+      "a resposta enfileirada deve ser entregue no mesmo flush",
+    );
   } finally {
     await f.close();
   }

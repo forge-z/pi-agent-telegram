@@ -10,7 +10,10 @@ import {
   fauxAssistantMessage,
 } from "@earendil-works/pi-ai/providers/faux";
 import { Runtime } from "../src/runtime.js";
-import { isNullAcknowledgement } from "../src/task-telegram.js";
+import {
+  isNullAcknowledgement,
+  taskOccurrenceDelivered,
+} from "../src/task-telegram.js";
 import { Tasks } from "../src/tasks.js";
 import { Telegram } from "../src/telegram.js";
 import { Store, type Delivery } from "../src/store.js";
@@ -87,6 +90,14 @@ async function fixture(answer = "**Resultado do cron**", linked = true) {
       true,
       overrides.botId === null ? undefined : (overrides.botId ?? 123456),
     );
+  let flushOnTaskSettlement = true;
+  const wireFlush = () => {
+    app.flushTelegramPending = async () => {
+      if (!flushOnTaskSettlement) return;
+      await engine().flush();
+    };
+  };
+  wireFlush();
   return {
     get app() {
       return app;
@@ -101,6 +112,10 @@ async function fixture(answer = "**Resultado do cron**", linked = true) {
     sent,
     config,
     engine,
+    /** Keep deliveries queued until an explicit `engine().flush()` (pending/revoke tests). */
+    set deferTaskFlush(value: boolean) {
+      flushOnTaskSettlement = !value;
+    },
     set uncertain(value: boolean) {
       uncertain = value;
     },
@@ -129,6 +144,7 @@ async function fixture(answer = "**Resultado do cron**", linked = true) {
       beforeOpen?.();
       app = await Runtime.open(options);
       tasks = new Tasks(app, () => now);
+      wireFlush();
     },
     async close() {
       await tasks.close();
@@ -389,8 +405,10 @@ test("a revoked mapping, grant, user or connection cancels a pending cron delive
   ]) {
     const f = await fixture();
     try {
+      f.deferTaskFlush = true;
       await f.run();
       assert.equal(f.app.store.all("SELECT * FROM deliveries").length, 1);
+      const sentBeforeRevoke = f.sent.length;
       if (revoke === "mapping") f.app.store.run("DELETE FROM telegram");
       if (revoke === "grant") f.app.store.run("DELETE FROM telegram_grants");
       if (revoke === "user") f.app.store.run("UPDATE telegram SET user='99'");
@@ -406,7 +424,7 @@ test("a revoked mapping, grant, user or connection cancels a pending cron delive
         );
       await f.reopen();
       await f.engine().flush();
-      assert.equal(f.sent.length, 0, revoke);
+      assert.equal(f.sent.length, sentBeforeRevoke, revoke);
       assert.equal(
         f.app.store.get<Delivery>("SELECT * FROM deliveries")?.state,
         "cancelled",
@@ -420,6 +438,7 @@ test("a revoked mapping, grant, user or connection cancels a pending cron delive
 test("an uncertain cron Telegram send is never retried or reformatted after restart", async () => {
   const f = await fixture();
   try {
+    f.deferTaskFlush = true;
     await f.run();
     f.uncertain = true;
     await f.engine().flush();
@@ -469,6 +488,7 @@ test("revocation cannot revive an old pending notification by reconnecting or re
   ]) {
     const f = await fixture();
     try {
+      f.deferTaskFlush = true;
       await f.run();
       if (revoke === "grant") {
         f.app.store.run("DELETE FROM telegram_grants");
@@ -534,6 +554,7 @@ test("task sender requires both allowlists and the validated bot identity immedi
   ]) {
     const f = await fixture();
     try {
+      f.deferTaskFlush = true;
       await f.run();
       await f.engine(overrides).flush();
       assert.equal(f.sent.length, 0);
@@ -574,6 +595,7 @@ test("a task retains its explicitly saved destination when Telegram selects anot
 test("each long-message part rechecks authorization and revocation cancels the remaining parts", async () => {
   const f = await fixture("Resultado longo. ".repeat(1000));
   try {
+    f.deferTaskFlush = true;
     await f.run();
     assert.ok(f.app.store.all("SELECT 1 FROM deliveries").length > 1);
     let sends = 0;
@@ -616,6 +638,7 @@ test("each long-message part rechecks authorization and revocation cancels the r
 test("terminal notification and request receipt roll back together; restart queues the persisted answer without a new model call", async () => {
   const f = await fixture();
   try {
+    f.deferTaskFlush = true;
     f.app.store.db.exec(
       "CREATE TRIGGER fail_task_status BEFORE UPDATE OF status ON requests WHEN NEW.source='task' BEGIN SELECT RAISE(ABORT,'synthetic storage failure'); END",
     );
@@ -635,7 +658,19 @@ test("terminal notification and request receipt roll back together; restart queu
     )!.submissionId;
     f.app.store.db.exec("DROP TRIGGER fail_task_status");
     await f.reopen();
-    await f.run();
+    f.deferTaskFlush = true;
+    f.time = epoch + 60000;
+    await f.tasks.tick();
+    await (await f.app.conversation(f.id)).waitForIdle(context);
+    for (let n = 0; n < 100; n++) {
+      if (!f.app.store.get("SELECT 1 FROM requests WHERE status='pending'"))
+        break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(
+      f.app.store.all("SELECT 1 FROM requests WHERE status='pending'").length,
+      0,
+    );
     await f.engine().flush();
     assert.equal(f.sent.length, 1);
     assert.equal(f.faux.state.callCount, 1);
@@ -876,4 +911,24 @@ test("only a bare acknowledgement counts as nothing to report", () => {
   ];
   for (const answer of delivered)
     assert.equal(isNullAcknowledgement(answer), false, answer);
+});
+
+test("task ok requires a durable delivery row, not a previous chat message id", async () => {
+  const f = await fixture();
+  try {
+    const run = await f.run();
+    assert.equal(run.status, "ok");
+    assert.match(run.summary ?? "", /Resultado do cron/);
+    assert.equal(
+      taskOccurrenceDelivered(f.app.store, f.id, run.requestId),
+      true,
+    );
+    assert.equal(
+      f.app.store.all("SELECT * FROM deliveries").length,
+      1,
+      "resumo veio da entrega desta execução, não de outro turno",
+    );
+  } finally {
+    await f.close();
+  }
 });

@@ -6,7 +6,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { McpGateway, McpNotSentError } from "../src/mcp.js";
-import { McpCalls } from "../src/mcp-calls.js";
+import { McpCalls, mcpCallIsReadOnly } from "../src/mcp-calls.js";
 import { Store } from "../src/store.js";
 import { Actions } from "../src/actions.js";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
@@ -1102,6 +1102,49 @@ test("output validators are compiled once per schema and still enforced on later
   }
 });
 
+test("mcpCallIsReadOnly treats Executor call and execute sandbox reads as read-only", () => {
+  assert.equal(mcpCallIsReadOnly("search"), true);
+  assert.equal(
+    mcpCallIsReadOnly("call", {
+      body: {
+        tool: "tools.github.repos.listForUser",
+        kind: "query",
+        input: {},
+      },
+    }),
+    true,
+  );
+  assert.equal(
+    mcpCallIsReadOnly("call", {
+      body: { tool: "tools.github.issues.create", input: {} },
+    }),
+    false,
+  );
+  assert.equal(
+    mcpCallIsReadOnly("execute", {
+      code: 'await tools.search({ query: "x" })',
+    }),
+    true,
+  );
+  assert.equal(
+    mcpCallIsReadOnly("execute", { code: "await tools.call({})" }),
+    false,
+  );
+  assert.equal(
+    mcpCallIsReadOnly("execute", {
+      code: "return JSON.stringify(await tools.instabox.machines.readFiles({}));",
+    }),
+    true,
+  );
+  assert.equal(
+    mcpCallIsReadOnly("execute", {
+      code: "return JSON.stringify(await tools.instabox.machines.exec({}));",
+    }),
+    false,
+  );
+  assert.equal(mcpCallIsReadOnly("execute", undefined), false);
+});
+
 test("an uncertain result blocks actions but never reads", async () => {
   const mock = await fixture(true);
   const mcp = gateway(mock.url, true);
@@ -1119,6 +1162,24 @@ test("an uncertain result blocks actions but never reads", async () => {
     await assert.rejects(
       calls.execute("conversation", 2, "mock", "execute", {}),
       /resultado MCP incerto/i,
+    );
+    // Executor verification often uses execute + sandbox pick(); that stays a read.
+    const sandboxRead = await calls
+      .execute("conversation", 31, "mock", "execute", {
+        code: [
+          'const pick = (p) => p.split(".").reduce((o, k) => o[k], tools);',
+          'return JSON.stringify(await pick("tools.mock.agent.runs.listRuns")({}));',
+        ].join("\n"),
+      })
+      .then(
+        (result) => text(result),
+        (error: Error) => error.message,
+      );
+    assert.doesNotMatch(text(sandboxRead), /resultado MCP incerto/i);
+    assert.equal(calls.clearUncertain("conversation"), 0);
+    store.run(
+      `INSERT INTO mcp_calls(id,conversationId,server,tool,args,state,result,binding,updatedAt)
+       VALUES ('lost3','conversation','mock','execute','{}','uncertain','{"isError":true}','mock',0)`,
     );
     // A read never waits behind it: the message asks the agent to look.
     const read = await calls
@@ -1152,6 +1213,44 @@ test("an uncertain result blocks actions but never reads", async () => {
         (error: Error) => error.message,
       );
     assert.doesNotMatch(text(again), /resultado MCP incerto/i);
+  } finally {
+    await calls.close();
+    await mcp.close();
+    store.close();
+    await mock.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a pending approval block names the requestId and still allows reads", async () => {
+  const mock = await fixture(true);
+  const mcp = gateway(mock.url, true);
+  const dir = await mkdtemp(join(tmpdir(), "mcp-pending-apr-"));
+  const store = new Store(dir);
+  const calls = new McpCalls(store, mcp);
+  try {
+    await mcp.discover("mock");
+    store.run(
+      `INSERT INTO mcp_interactions(id,callId,conversationId,server,kind,payload,state,response)
+       VALUES ('i1','c1','conversation','executor','resume',?,'pending',NULL)`,
+      JSON.stringify({ requestId: "apr_deadbeef" }),
+    );
+    const blocked = await calls
+      .execute("conversation", 1, "mock", "execute", {
+        code: "await tools.mutate()",
+      })
+      .then(
+        () => "",
+        (error: Error) => error.message,
+      );
+    assert.match(blocked, /apr_deadbeef/);
+    const read = await calls
+      .execute("conversation", 2, "mock", "search", { query: "x" })
+      .then(
+        () => "ok",
+        (error: Error) => error.message,
+      );
+    assert.equal(read, "ok");
   } finally {
     await calls.close();
     await mcp.close();

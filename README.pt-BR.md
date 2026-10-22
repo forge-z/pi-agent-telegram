@@ -95,47 +95,48 @@ Qualquer passo depois do primeiro pode ser pulado com Enter, e o `npm run setup`
 
 Steve Jobs fechou o evento do iPad em 2010 com "there's an app for that" ([CBS](https://www.cbsnews.com/news/steve-jobs-at-the-heavenly-gates-theres-an-app-for-that/)). A versão de hoje: antes de o assistente responder que não consegue, vale verificar se já existe uma API ou um servidor MCP que faz. Adicione no [Executor](https://executor.sh) e ele vira ferramenta, com cartão de aprovação antes de qualquer escrita.
 
-| Serviço                                | O que acrescenta                                                                                         |
-| -------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| [AgentMail](https://www.agentmail.to)  | uma caixa de entrada como ferramenta: recebe, responde, envia — 3 caixas e 3.000 e-mails/mês, sem cartão |
-| [TinyFish](https://www.tinyfish.ai)    | busca na web e leitura de página — grátis em todos os planos                                             |
-| [Fish Audio](https://fish.audio)       | síntese de voz que o assistente chama ([MCP](https://docs.fish.audio/overview/mcp)) — 8.000 créditos/mês |
-| [Firecrawl](https://www.firecrawl.dev) | varre um site inteiro e devolve texto limpo                                                              |
-| [Browser Use](https://browser-use.com) | um navegador de verdade para páginas que exigem clique, não só leitura                                   |
-| [Cal.com](https://cal.com)             | agenda: disponibilidade e marcações como ferramentas                                                     |
-| [GitHub](https://github.com)           | repositórios, issues e pull requests ([MCP oficial](https://github.com/github/github-mcp-server))        |
-| [Freestyle](https://www.freestyle.sh)  | sandbox descartável com Docker e GPU quando o trabalho precisa de máquina                                |
+| Serviço                                | O que acrescenta                                                                                                                                      |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [AgentMail](https://www.agentmail.to)  | uma caixa de entrada como ferramenta: recebe, responde, envia — 3 caixas e 3.000 e-mails/mês, sem cartão                                              |
+| [Browser Use](https://browser-use.com) | um navegador de verdade para páginas que exigem clique, não só leitura                                                                                |
+| [Cal.com](https://cal.com)             | agenda: disponibilidade e marcações como ferramentas                                                                                                  |
+| [Firecrawl](https://www.firecrawl.dev) | varre um site inteiro e devolve texto limpo                                                                                                           |
+| [Fish Audio](https://fish.audio)       | síntese de voz que o assistente chama ([MCP](https://docs.fish.audio/overview/mcp)) — 8.000 créditos/mês                                              |
+| [GitHub](https://github.com)           | repositórios, issues e pull requests ([MCP oficial](https://github.com/github/github-mcp-server))                                                     |
+| [Instabox](https://instabox.sh)        | um sandbox Linux como ferramenta: shell de verdade, navegador e disco persistente — roda código, gera e publica artefatos; 5 máquinas no plano grátis |
+| [TinyFish](https://www.tinyfish.ai)    | busca na web e leitura de página — grátis em todos os planos                                                                                          |
 
 Mais ou menos na ordem em que um assistente pessoal precisa: e-mail, web, voz, depois scraping, navegação, agenda, código e computação. Voz aqui é o **agente** produzindo áudio como resultado de ferramenta: o bot continua respondendo em texto, e bolha de voz no Telegram não está implementada.
 
 ## O que ele faz
 
 - **Texto** — o padrão; sem prefixo, sem cerimônia.
+- **Steer automático** — mensagens enviadas no meio de uma tarefa entram como steer no turno em andamento (após a rodada de ferramentas atual) sem abrir turno novo; /stop cancela.
 - **Imagem** — modelo que lê imagem recebe a imagem; modelo só-texto recebe uma descrição do `VISION_MODEL`.
 - **Recado de voz** — transcrito para o texto do turno; o áudio nunca entra no contexto nem no histórico.
 - **Anexos de saída** — o agente pode pedir o envio de um arquivo por URL pública (`send_attachment`), e arquivos que vêm dentro de um resultado de ferramenta também são entregues (áudio, imagem, documento), ele é entregue no chat: áudio como `sendAudio` (bolha de voz quando ogg/opus), imagem como `sendPhoto`, o resto como `sendDocument`. Se o conteúdo traz URL, o Telegram busca o arquivo; só há upload quando existem apenas bytes. Falha de upload não derruba o turno.
 - **Origem explícita** — a mensagem convertida chega como `[áudio transcrito · {"origin":"audio","model":"whisper-1"}]`, então o modelo não confunde transcrição com algo digitado. Falha de transcrição é admitida com o motivo, não descartada.
 - **Fuso do container** — `TZ` (ex.: `America/Sao_Paulo`) muda só o horário dos logs; agendamentos guardam o próprio timezone IANA e não se movem.
-- **Versão do Executor** — a suportada é a **v2 da nuvem** (`https://mcp.executor.sh/mcp`); cada integração é um app do Executor, e nenhuma variável de versão é necessária: o adaptador v1 auto-hospedado só existe para quem ainda lista tools em `ASYNC_JOB_TOOLS`, e está obsoleto (remoção 2026-12-31).
-- **Jobs assíncronos por manifesto** — cada job é descrito em `ASYNC_JOB_MANIFESTS` (disparo, como observar, vocabulário de status, caminhos de id/resultado). O núcleo só conhece estado, fila, dedupe e entrega, então integrar outro provedor é escrever manifesto, não patch. O caminho oficial do Executor v2 já vem pronto, sem configuração; `ASYNC_JOB_TOOLS` (v1) segue aceito e está **obsoleto** (remoção 2026-12-31). Referência completa em [docs/jobs.md](docs/jobs.md).
-  um tool que dispara um job longo (ex.: automação de navegador) registra a execução e o app acorda um turno novo neste tópico quando ela termina, com o resultado ou um aviso curto se falhar/estourar o tempo. Configure com `ASYNC_JOB_TOOLS` (paths separados por vírgula); a leitura usa `list_runs` do mesmo provedor.
+- **Versão do Executor** — a suportada é a **v2 da nuvem** (`https://mcp.executor.sh/mcp`); cada integração é um app do Executor. Jobs são manifestos (`ASYNC_JOB_MANIFESTS`) ou os embutidos do TinyFish e do Instabox. A conta da leitura vem da chamada. `ASYNC_JOB_TOOLS` e `EXECUTOR_ACCOUNT_ID` não são lidas.
+- **Jobs assíncronos por manifesto** — cada job é descrito em `ASYNC_JOB_MANIFESTS` (disparo, como observar, vocabulário de status, caminhos de id/resultado). O núcleo só conhece estado, fila, dedupe e entrega, então integrar outro provedor é escrever manifesto, não patch. Tarefas de código na sandbox Instabox (`instabox_code_task`) rodam em segundo plano e entregam o resultado (incluindo link de PR) via poller de status. O caminho oficial do Executor v2 já vem pronto, sem configuração. Referência completa em [docs/jobs.md](docs/jobs.md).
 - **Agendamento que responde "nada a relatar"** — quando a mensagem inteira é só uma confirmação de vazio ("nada relevante", "sem novidades", "caixas limpas", "nenhuma release"…), nada é entregue e o run fica `silencioso` (motivo `suppressed:null-ack` no log). Só casa a mensagem inteira, nunca um trecho, e mensagens acima de 240 caracteres nunca são suprimidas.
-- **Resultado MCP incerto** — quando o provedor perde o retorno de uma chamada, a conversa para de executar ações até alguém verificar. **Leituras continuam funcionando** (é assim que se verifica), uma leitura bem-sucedida já dispensa a pendência, e `/destravar` (ou `/reload`) limpa o flag **sem apagar o histórico** — o run fica registrado no log com a ferramenta e o horário.
+- **Resultado MCP incerto** — quando o provedor perde o retorno de uma chamada, a conversa para de executar ações até alguém verificar. **Leituras continuam funcionando** (incluindo `execute` só de consulta no Executor), uma leitura bem-sucedida já dispensa a pendência, o tópico recebe um aviso com botão de registro, e `/destravar` (ou `/reload`) limpa o flag **sem apagar o histórico**. Detalhes em [docs/mcp-uncertain.md](docs/mcp-uncertain.md).
 - **Execução silenciosa não gera mensagem** — se o turno de um agendamento (ou de um disparo manual) não sobra nada além de espaços ou caracteres invisíveis, **nada é enviado** e o run fica registrado como `silencioso`. Título de tarefa nunca vira mensagem; `delivery: none` continua sem envio de qualquer forma.
 - **Agendamentos** — crie um cron pelo chat; execuções agendadas nunca aprovam nada e nunca criam novos agendamentos. Qualquer agendamento pode ser disparado na hora — **Rodar agora** no `/crons`, ou `tasks_run_now` para o modelo — pelo mesmo pipeline e com a mesma entrega, sem mexer no próximo horário.
 - **Aprovações** — toda ferramenta com efeito vira um cartão com Aprovar, Negar e Editar; o resultado é registrado antes de ser entregue.
 
 ## Comandos
 
-| Comando     | O que faz                                                               |
-| ----------- | ----------------------------------------------------------------------- |
-| `/status`   | os três modelos em uso, esforço, MCPs e versão                          |
-| `/reload`   | começar uma conversa nova neste chat; o histórico antigo continua salvo |
-| `/model`    | provedor e modelo desta conversa                                        |
-| `/thinking` | esforço desta conversa                                                  |
-| `/crons`    | criar e gerenciar agendamentos                                          |
-| `/stop`     | interromper o que está rodando neste tópico                             |
-| `/help`     | a mesma lista, no chat                                                  |
+| Comando      | O que faz                                                                      |
+| ------------ | ------------------------------------------------------------------------------ |
+| `/status`    | os três modelos em uso, esforço, MCPs e versão                                 |
+| `/reload`    | recarregar esta conversa e dispensar resultado MCP incerto (histórico mantido) |
+| `/destravar` | o mesmo que `/reload` quando a conversa está travada por MCP incerto           |
+| `/model`     | provedor e modelo desta conversa                                               |
+| `/thinking`  | esforço desta conversa                                                         |
+| `/crons`     | criar e gerenciar agendamentos                                                 |
+| `/stop`      | interromper o que está rodando neste tópico                                    |
+| `/help`      | a mesma lista, no chat                                                         |
 
 ## Limites que vale saber
 

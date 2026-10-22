@@ -7,11 +7,12 @@ import {
   outboundMedia,
   type OutboundMedia,
 } from "./outbound.js";
+import { deterministicFailure, PendingJobs } from "./pending-jobs.js";
+import { deadlineFailure } from "./mcp-calls.js";
 import {
-  deterministicFailure,
-  dispatchOutcome,
-  PendingJobs,
-} from "./pending-jobs.js";
+  createInstaboxCodeTaskTool,
+  JOB_INDETERMINATE,
+} from "./instabox-tasks.js";
 import { conversationDeliveries } from "./telegram-deliveries.js";
 import { TelegramChats, type TelegramOwner } from "./telegram-chats.js";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
@@ -75,6 +76,7 @@ import {
   isNullAcknowledgement,
   isSilentResult,
   queueTaskTelegram,
+  taskOccurrenceDelivered,
   telegramConversationRoute,
   telegramRouteAuthorized,
   type TelegramRoute,
@@ -137,6 +139,7 @@ interface RuntimeOptions {
   provider?: string;
   webOrigin?: string;
   now?: () => number;
+  env?: Record<string, string | undefined>;
 }
 export class ConversationError extends Error {
   constructor(
@@ -191,12 +194,54 @@ export class Runtime {
   private conversationChanges = new Set<string>();
   private durableDatabase!: NodeSqliteDatabase;
   /** Jobs that outlive the turn; the poller wakes a turn when one finishes. */
-  readonly pendingJobs: PendingJobs = new PendingJobs(this);
+  readonly pendingJobs: PendingJobs;
   private trashTimer?: ReturnType<typeof setInterval>;
   private trashSweep?: Promise<void>;
   private purges = new Set<Promise<unknown>>();
   private guardedTools = new WeakSet<object>();
+  private activeToolStarts = new Map<string, number>();
+  private activeTurnStarts = new Map<string, number>();
+  private busyNotifiedTools = new Set<string>();
+
+  isTurnBusyWithTool(conversationId: string): boolean {
+    const started = this.activeToolStarts.get(conversationId);
+    if (started && Date.now() - started >= 10_000) return true;
+    const running = this.mcpCalls
+      ?.list(conversationId)
+      .find((c) => c.state === "running");
+    if (running && Date.now() - running.updatedAt >= 10_000) return true;
+    return false;
+  }
+
+  isTurnBusy(conversationId: string): boolean {
+    if (this.isTurnBusyWithTool(conversationId)) return true;
+    if (this.activeToolStarts.has(conversationId)) return true;
+    if (this.activeTurnStarts.has(conversationId)) return true;
+    const running = this.mcpCalls
+      ?.list(conversationId)
+      .find((c) => c.state === "running");
+    if (running) return true;
+    for (const key of this.monitors.keys()) {
+      if (key.startsWith(`${conversationId}:`)) return true;
+    }
+    return false;
+  }
+
+  markTurnBusyNotified(conversationId: string): boolean {
+    const started = this.activeToolStarts.get(conversationId);
+    const running = this.mcpCalls
+      ?.list(conversationId)
+      .find((c) => c.state === "running");
+    const turnStart = this.activeTurnStarts.get(conversationId);
+    const timestamp =
+      started ?? (running ? running.updatedAt : undefined) ?? turnStart ?? 1;
+    const key = `${conversationId}:${timestamp}`;
+    if (this.busyNotifiedTools.has(key)) return false;
+    this.busyNotifiedTools.add(key);
+    return true;
+  }
   private constructor(readonly options: RuntimeOptions) {
+    this.pendingJobs = new PendingJobs(this, options.env ?? process.env);
     this.store = new Store(options.dir);
     this.actions = new Actions(this.store, options.gateway);
     this.models =
@@ -263,8 +308,21 @@ export class Runtime {
     options.initialize?.(this.store);
     this.commands = new Commands(this);
     if (options.gateway instanceof McpGateway) {
-      this.mcpCalls = new McpCalls(this.store, options.gateway, () =>
-        this.flushTelegramPending?.(),
+      this.mcpCalls = new McpCalls(
+        this.store,
+        options.gateway,
+        () => this.flushTelegramPending?.(),
+        (notice) => {
+          void this.submit(
+            notice.conversationId,
+            `mcp-deadline:${notice.callId}`,
+            [
+              notice.text,
+              "Avise o usuário em uma linha com essa causa. A trava foi liberada; uma nova chamada pode ser feita. Não diga que o status é desconhecido.",
+            ].join("\n"),
+            "job",
+          ).catch(() => {});
+        },
       );
     }
   }
@@ -681,6 +739,13 @@ export class Runtime {
                 ],
               }),
             }),
+            ...(() => {
+              const instaboxTool = createInstaboxCodeTaskTool(
+                app!,
+                options.env ?? process.env,
+              );
+              return instaboxTool ? [instaboxTool] : [];
+            })(),
           ].filter(
             (tool) =>
               !options.telegramOnly ||
@@ -701,6 +766,7 @@ export class Runtime {
           registry,
           settings: {
             toolExecution: "sequential",
+            steeringMode: "all",
             followUpMode: "one-at-a-time",
             retry: { maxRetries: 2 },
           },
@@ -869,21 +935,16 @@ export class Runtime {
               outputLimits: { maxBytes: 65536, maxLines: 2000 },
               execute: async (args, api, callContext) => {
                 const conversationId = String(api.conversationId);
-                const goal =
-                  typeof (args as { goal?: unknown }).goal === "string"
-                    ? (args as { goal: string }).goal
-                    : undefined;
                 // Registered before the call, so a dispatch that dies without returning
                 // a run id is still reconciled by the poller.
                 // A delegated call (the Executor's `execute` running the integration)
                 // never passes through the direct hook; the arguments name the tool.
-                const job =
-                  this.pendingJobs.register(
-                    server.server,
-                    tool.name,
-                    conversationId,
-                    goal,
-                  ) || this.pendingJobs.registerDelegated(conversationId, args);
+                const job = this.pendingJobs.beginDispatch(
+                  conversationId,
+                  server.server,
+                  tool.name,
+                  args,
+                );
                 let result: Awaited<ReturnType<McpCalls["execute"]>>;
                 try {
                   result = await this.mcpCalls.execute(
@@ -896,10 +957,11 @@ export class Runtime {
                     this.scheduledTurn(conversationId),
                   );
                 } catch (error) {
-                  // The Executor's runtime can die on resume while the external call runs on.
-                  // That is indeterminate, not failed: the row is open and the poller delivers,
-                  // so the model must not retry (a retry costs a run).
-                  if (job)
+                  // A deadline or a failed resume already released the lock and
+                  // told the topic. Hiding that behind "perdeu o retorno" is
+                  // what left the user stuck. Only a loss after the call may
+                  // have started stays indeterminate for the poller.
+                  if (job && !deadlineFailure(error))
                     return {
                       output: [
                         { type: "text" as const, text: JOB_INDETERMINATE },
@@ -907,23 +969,22 @@ export class Runtime {
                     };
                   throw error;
                 }
+                try {
+                  this.pendingJobs.finishDispatch(
+                    conversationId,
+                    server.server,
+                    tool.name,
+                    args,
+                    result,
+                  );
+                } catch (error) {
+                  // The provider already answered. A bookkeeping failure must
+                  // not replace that payload.
+                  console.error(
+                    `jobs_poller: falha ao registrar não substitui o retorno da tool (${error instanceof Error ? error.message : error})`,
+                  );
+                }
                 if (job) {
-                  const dispatch = dispatchOutcome(result);
-                  if (dispatch.runId)
-                    this.pendingJobs.capture(
-                      server.server,
-                      tool.name,
-                      conversationId,
-                      dispatch.runId,
-                    );
-                  // The dispatch already carried the result: this turn delivers it, so
-                  // the row closes here instead of waking a second turn with the same run.
-                  if (dispatch.completed)
-                    this.pendingJobs.closeUnstarted(
-                      server.server,
-                      tool.name,
-                      conversationId,
-                    );
                   if (result.isError) {
                     // A rejected dispatch means no run exists: close the row and let the
                     // model read the real error (a bad session id, for instance). Only a
@@ -996,8 +1057,26 @@ export class Runtime {
         changed = true;
         const guarded = {
           ...tool,
-          execute: (...args: Parameters<typeof tool.execute>) => {
-            return tool.execute(...args);
+          execute: async (...args: Parameters<typeof tool.execute>) => {
+            const api = args[1] as ToolExecutionApi | undefined;
+            const conversationId =
+              api?.conversationId !== undefined
+                ? String(api.conversationId)
+                : undefined;
+            const startTime = Date.now();
+            if (conversationId) {
+              this.activeToolStarts.set(conversationId, startTime);
+            }
+            try {
+              return await tool.execute(...args);
+            } finally {
+              if (
+                conversationId &&
+                this.activeToolStarts.get(conversationId) === startTime
+              ) {
+                this.activeToolStarts.delete(conversationId);
+              }
+            }
           },
         };
         this.guardedTools.add(guarded);
@@ -1602,9 +1681,9 @@ export class Runtime {
     access: CommandAccess,
     images?: ImageContent[],
   ) {
-    const escaped = text.trimStart().startsWith("//")
-      ? text.replace("/", "")
-      : text;
+    const wasEscaped = text.trimStart().startsWith("//");
+    const isCommand = !wasEscaped && text.trimStart().startsWith("/");
+    const escaped = wasEscaped ? text.replace("/", "") : text;
     return {
       kind: "message" as const,
       ...(await this.submit(
@@ -1615,6 +1694,7 @@ export class Runtime {
         access.source === "telegram" ? access.chat : null,
         () => this.commands.authorize(conversationId, access),
         images,
+        !isCommand,
       )),
     };
   }
@@ -1626,6 +1706,7 @@ export class Runtime {
     chat: string | null = null,
     authorize?: () => void,
     images?: ImageContent[],
+    steer?: boolean,
   ) {
     return this.withProviderAdmission(() =>
       this.submitOnce(
@@ -1636,6 +1717,7 @@ export class Runtime {
         chat,
         authorize,
         images,
+        steer,
       ),
     );
   }
@@ -1659,6 +1741,7 @@ export class Runtime {
     chat: string | null = null,
     authorize?: () => void,
     images?: ImageContent[],
+    steer?: boolean,
   ) {
     if (source === "web") this.assertWebWritable(conversationId);
     if (this.closing) throw new Error("Serviço encerrando");
@@ -1756,10 +1839,22 @@ export class Runtime {
     const content: UserInput = images?.length
       ? [{ type: "text", text }, ...images]
       : text;
+    const isCommand =
+      text.trimStart().startsWith("/") && !text.trimStart().startsWith("//");
+    const shouldSteer =
+      steer ??
+      (!isCommand &&
+        source !== "job" &&
+        source !== "system" &&
+        source !== "task");
+    const whenBusy = shouldSteer ? "steer" : "followUp";
     const submission = await conversation.submit(
-      { type: "input", content, requestId, whenBusy: "followUp" },
+      { type: "input", content, requestId, whenBusy },
       context,
     );
+    if (!this.activeTurnStarts.has(conversationId)) {
+      this.activeTurnStarts.set(conversationId, this.now());
+    }
     if (source !== "system")
       this.store.run(
         "UPDATE conversations SET title=? WHERE id=? AND title IN ('Nova conversa','Conversa recuperada') AND id NOT IN (SELECT conversationId FROM conversation_titles)",
@@ -1799,6 +1894,85 @@ export class Runtime {
     );
     this.flushTelegramPending?.();
     return true;
+  }
+  private assistantTextFromEntry(
+    entry: { model?: readonly unknown[] } | undefined,
+  ) {
+    const message = entry?.model?.[0] as
+      | { role?: string; content?: Array<{ type?: string; text?: string }> }
+      | undefined;
+    const raw =
+      message?.role === "assistant"
+        ? (message.content ?? [])
+            .filter((c) => c.type === "text")
+            .map((c) => c.text ?? "")
+            .join("\n")
+        : "";
+    return raw.replace(SILENT_ANSWER, "").trim();
+  }
+  /** Task runs must not read another turn's assistant entry from a shared conversation. */
+  private async taskTurnAnswer(
+    conversation: Awaited<ReturnType<Runtime["conversation"]>>,
+    conversationId: string,
+    requestId: string,
+    settled: Awaited<ReturnType<Submission["wait"]>>,
+  ) {
+    const receipt = await this.harness.commit(
+      (tx) =>
+        tx.submissionByRequest(
+          Number(conversationId) as ConversationId,
+          requestId,
+        ),
+      context,
+    );
+    const floor =
+      receipt &&
+      (receipt.status === "placed" || receipt.status === "done") &&
+      receipt.type === "input"
+        ? receipt.entry
+        : undefined;
+    const answerId =
+      receipt?.status === "done" && receipt.type === "input"
+        ? receipt.answer
+        : settled.status === "done" && settled.type === "input"
+          ? settled.answer
+          : undefined;
+    if (answerId === undefined) return "";
+    if (floor !== undefined && answerId >= floor) {
+      const entries = await conversation.entries(
+        { minEntryId: answerId as EntryId, maxEntryId: answerId as EntryId },
+        1,
+        undefined,
+        context,
+      );
+      const direct = this.assistantTextFromEntry(
+        entries.items.find((e) => e.id === answerId),
+      );
+      if (direct || answerId === floor) return direct;
+    }
+    if (floor === undefined) {
+      const entries = await conversation.entries(
+        { minEntryId: answerId as EntryId, maxEntryId: answerId as EntryId },
+        1,
+        undefined,
+        context,
+      );
+      return this.assistantTextFromEntry(
+        entries.items.find((e) => e.id === answerId),
+      );
+    }
+    const window = await conversation.entries(
+      { minEntryId: floor as EntryId, maxEntryId: answerId as EntryId },
+      50,
+      undefined,
+      context,
+    );
+    let answer = "";
+    for (const entry of window.items) {
+      const text = this.assistantTextFromEntry(entry);
+      if (text) answer = text;
+    }
+    return answer;
   }
   private monitorSubmission(
     conversation: Awaited<ReturnType<Runtime["conversation"]>>,
@@ -1875,27 +2049,53 @@ export class Runtime {
           settled.type === "input" &&
           (chat || mirror || source === "task" || source === "job")
         ) {
-          const entries = await conversation.entries(
-            { minEntryId: settled.answer, maxEntryId: settled.answer },
-            1,
-            undefined,
-            context,
-          );
-          const entry = entries.items.find((e) => e.id === settled.answer);
-          const message = entry?.model?.[0];
-          const raw =
-            message?.role === "assistant"
-              ? message.content
-                  .filter((c) => c.type === "text")
-                  .map((c) => c.text)
-                  .join("\n")
-              : "";
-          // The sentinel never reaches a chat, and an answer that is only the
-          // sentinel means "say nothing at all".
-          answer = raw.replace(SILENT_ANSWER, "").trim();
+          answer =
+            source === "task"
+              ? await this.taskTurnAnswer(
+                  conversation,
+                  conversationId,
+                  requestId,
+                  settled,
+                )
+              : this.assistantTextFromEntry(
+                  (
+                    await conversation.entries(
+                      {
+                        minEntryId: settled.answer,
+                        maxEntryId: settled.answer,
+                      },
+                      1,
+                      undefined,
+                      context,
+                    )
+                  ).items.find((e) => e.id === settled.answer),
+                );
           // Drain on every turn, so a task run never leaks its files into the next
           // chat reply of the same conversation.
-          if (answer) reply(answer);
+          if (answer && source !== "task") {
+            const deliveredKey = `telegram:delivered:${conversationId}:${settled.answer}`;
+            const alreadyDelivered = this.store.get<{ value: string }>(
+              "SELECT value FROM meta WHERE key=?",
+              deliveredKey,
+            );
+            if (!alreadyDelivered) {
+              this.store.run(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
+                deliveredKey,
+                JSON.stringify({ requestId, at: Date.now() }),
+              );
+              reply(answer);
+            }
+          } else if (
+            source === "telegram" &&
+            (chat || mirror) &&
+            this.mcpCalls
+              ?.list(conversationId)
+              .some((call) => call.state === "uncertain")
+          )
+            reply(
+              "Não consegui concluir a resposta enquanto houver um resultado MCP incerto nesta conversa. Verifique no serviço externo, use /status para registrar a verificação ou /destravar para dispensar.",
+            );
           this.flushTelegramPending?.();
         }
         // A turn that ended without an answer — a failed compaction, a provider
@@ -1945,15 +2145,33 @@ export class Runtime {
               : answer;
             if (!silent)
               queueTaskTelegram(this.store, conversationId, requestId, notice);
+            for (let pass = 0; pass < 2; pass += 1) {
+              const flushed = this.flushTelegramPending?.();
+              if (flushed) await flushed;
+            }
+            const delivery = this.store.get<{ delivery: string | null }>(
+              "SELECT delivery FROM task_runs WHERE requestId=? AND COALESCE(conversationId,(SELECT conversationId FROM tasks WHERE id=task_runs.taskId))=?",
+              requestId,
+              conversationId,
+            )?.delivery;
+            let status: "ok" | "erro" | "silencioso";
+            if (settled.status !== "done") status = "erro";
+            else if (silent || isSilentResult(answer)) status = "silencioso";
+            else if (delivery === "none")
+              status = answer.trim() ? "ok" : "silencioso";
+            else if (
+              taskOccurrenceDelivered(this.store, conversationId, requestId)
+            )
+              status = "ok";
+            else status = "erro";
             this.tasks.finishRun(conversationId, requestId, {
-              status:
-                settled.status === "done"
-                  ? silent
-                    ? "silencioso"
-                    : "ok"
-                  : "erro",
+              status,
               summary,
-              error: failure,
+              error:
+                failure ??
+                (status === "erro" && settled.status === "done"
+                  ? "A resposta da tarefa não foi entregue ao destino."
+                  : null),
               external: this.runExternalTools(conversationId, requestId),
             });
           }
@@ -1974,7 +2192,19 @@ export class Runtime {
           // The request stays pending; restart recovery reattaches this monitor.
           if (!this.closing) logFailure("Falha ao concluir solicitação", error);
         })
-        .finally(() => this.monitors.delete(key));
+        .finally(() => {
+          this.monitors.delete(key);
+          const stillMonitoring = [...this.monitors.keys()].some(
+            (k) => k !== key && k.startsWith(`${conversationId}:`),
+          );
+          if (!stillMonitoring) {
+            this.activeTurnStarts.delete(conversationId);
+            for (const k of this.busyNotifiedTools) {
+              if (k.startsWith(`${conversationId}:`))
+                this.busyNotifiedTools.delete(k);
+            }
+          }
+        });
       this.monitors.set(key, monitor);
     }
   }
@@ -2383,10 +2613,6 @@ export class Runtime {
   }
 }
 
-/** What the model reads instead of a failed dispatch that started a job anyway. */
-/** A dispatch that may have started: the result arrives from the poller, once. */
-const JOB_INDETERMINATE =
-  "A chamada foi iniciada, mas o provedor perdeu o retorno dela (erro interno do Executor). O job continua em andamento e o resultado chegará automaticamente neste tópico. Não repita o pedido nem dispare outro job.";
-
+/** The dispatch may have started a job; the poller delivers, so the model must not retry. */
 const JOB_RUNNING =
   "O job foi disparado e continua em andamento. O resultado chegará automaticamente neste tópico; não é preciso repetir o pedido.";

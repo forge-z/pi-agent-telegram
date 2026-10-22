@@ -176,6 +176,37 @@ export function isSilentResult(result: string | null | undefined) {
   return !(result ?? "").replace(/[\s\u200b\ufeff\u200c\u200d]/g, "");
 }
 
+/** True when a terminal occurrence's user-visible result reached Telegram (or was intentionally skipped). */
+export function taskOccurrenceDelivered(
+  store: Store,
+  conversationId: string,
+  requestId: string,
+): boolean {
+  const notification = store.get<{ state: string }>(
+    "SELECT state FROM task_notifications WHERE conversationId=? AND requestId=?",
+    conversationId,
+    requestId,
+  );
+  if (
+    notification?.state === "silent" ||
+    notification?.state === "web_only" ||
+    notification?.state === "skipped"
+  )
+    return true;
+  for (const base of [
+    `${conversationId}:${requestId}:task-notification`,
+    `${conversationId}:${requestId}`,
+  ]) {
+    const row = store.get<{ state: string }>(
+      "SELECT state FROM deliveries WHERE id>=? AND id<? ORDER BY rowid DESC LIMIT 1",
+      `${base}:`,
+      `${base};`,
+    );
+    if (row?.state === "sent") return true;
+  }
+  return false;
+}
+
 /** Freeze a terminal occurrence's destination, including a skipped notification.
  * Replays must never send an old result to a newly linked conversation/chat. */
 export function queueTaskTelegram(

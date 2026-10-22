@@ -698,6 +698,97 @@ export function queueMcpApprovals(app: Runtime) {
     card(app, row);
   }
 }
+
+function telegramOwnerForConversation(app: Runtime, conversationId: string) {
+  let route = telegramConversationRoute(app.store, conversationId);
+  if (!route) {
+    const dedicated = app.store.get<{ chat: string; user: string }>(
+      "SELECT chat,user FROM telegram_conversations WHERE conversationId=?",
+      conversationId,
+    );
+    const identity = dedicated && telegramIdentity(app.store, dedicated);
+    if (
+      !dedicated ||
+      !identity ||
+      !app.store.get(
+        "SELECT 1 FROM telegram_grants WHERE chat=? AND user=? AND conversationId=?",
+        dedicated.chat,
+        dedicated.user,
+        conversationId,
+      )
+    )
+      return undefined;
+    route = {
+      chat: dedicated.chat,
+      user: dedicated.user,
+      botId: String(identity.botId),
+      conversationId,
+      messageThreadId: app.store.telegramThread(conversationId) ?? null,
+    };
+  }
+  return {
+    owner: {
+      chat: route.chat,
+      user: route.user,
+      ...(route.messageThreadId == null
+        ? {}
+        : { messageThreadId: route.messageThreadId }),
+    },
+    originThreadId: route.messageThreadId,
+  };
+}
+
+/** Tell the topic once when a call lands uncertain, so /status is not the only path. */
+export function queueMcpUncertainNotices(app: Runtime) {
+  if (!app.mcpCalls) return;
+  for (const call of app.store.all<McpCall>(
+    "SELECT * FROM mcp_calls WHERE state='uncertain'",
+  )) {
+    if (
+      app.mcpCalls
+        .interactions(call.conversationId)
+        .some((i) => i.callId === call.id && i.state === "pending")
+    )
+      continue;
+    const deliveryId = `telegram:mcp-check-menu:auto:${call.id}`;
+    if (
+      app.store.get(
+        "SELECT 1 FROM deliveries WHERE id=? OR id GLOB ?",
+        deliveryId,
+        `${deliveryId}:*`,
+      )
+    )
+      continue;
+    const resolved = telegramOwnerForConversation(app, call.conversationId);
+    if (!resolved) continue;
+    const { owner, originThreadId } = resolved;
+    const token = button(app, {
+      kind: "mcp-check",
+      owner,
+      originThreadId,
+      conversationId: call.conversationId,
+      callId: call.id,
+      callHash: hash(JSON.stringify(call)),
+      verification: "review",
+      authorizationVersion: app.store.authorizationVersion(
+        owner,
+        call.conversationId,
+      ),
+    });
+    queueControl(
+      app,
+      deliveryId,
+      owner,
+      call.conversationId,
+      `${call.server} / ${call.tool}: resultado MCP incerto. Verifique no serviço externo. Toque em Registrar verificação externa abaixo, ou envie /destravar para dispensar sem apagar o histórico.`,
+      {
+        inline_keyboard: [
+          [{ text: "Registrar verificação externa…", callback_data: token }],
+        ],
+      },
+    );
+  }
+}
 export async function decideMcp(
   app: Runtime,
   data: TelegramButton,

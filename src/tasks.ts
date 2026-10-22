@@ -9,7 +9,7 @@ import {
   type TelegramRoute,
 } from "./task-telegram.js";
 import { logFailure } from "./log.js";
-import { MAX_TEXT, REQUEST_ID } from "./limits.js";
+import { MAX_TEXT, REQUEST_ID, truncateTaskSummary } from "./limits.js";
 
 type TaskDelivery = "legacy" | "web" | "web_telegram" | "none";
 /**
@@ -21,6 +21,9 @@ const RUN_SELECT = `SELECT *, CASE scheduled WHEN 1 THEN 'scheduled' ELSE 'manua
 /** The execution log keeps seven days, the window an operator actually reads. */
 const RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const RUN_SWEEP_MS = 60 * 60 * 1000;
+/** How often stale in-flight runs are checked for timeout. */
+const RUN_WATCH_MS = 30 * 1000;
+const DEFAULT_RUN_TIMEOUT_MIN = 30;
 
 export class TaskError extends Error {
   constructor(message: string) {
@@ -216,6 +219,7 @@ export class Tasks {
               status: "TEXT",
               summary: "TEXT",
               external: "TEXT",
+              timeoutNotified: "INTEGER NOT NULL DEFAULT 0",
             }
           : destinationColumns;
       for (const [name, type] of Object.entries(additions))
@@ -892,18 +896,35 @@ export class Tasks {
       external: string | null;
     },
   ) {
+    const state = outcome.status === "erro" ? "failed" : "done";
     this.runtime.store.run(
-      "UPDATE task_runs SET finishedAt=?,status=?,summary=?,error=COALESCE(?,error),external=? WHERE requestId=? AND COALESCE(conversationId,(SELECT conversationId FROM tasks WHERE id=task_runs.taskId))=?",
+      "UPDATE task_runs SET finishedAt=?,state=?,status=?,summary=?,error=COALESCE(?,error),external=? WHERE requestId=? AND COALESCE(conversationId,(SELECT conversationId FROM tasks WHERE id=task_runs.taskId))=?",
       this.clock(),
+      state,
       outcome.status,
-      outcome.summary.slice(0, 400),
+      truncateTaskSummary(outcome.summary, 1000),
       outcome.error ?? null,
       outcome.external,
       requestId,
       conversationId,
     );
+    for (const row of this.runtime.store.all<{ id: string }>(
+      "SELECT id FROM task_runs WHERE requestId=? AND COALESCE(conversationId,(SELECT conversationId FROM tasks WHERE id=task_runs.taskId))=?",
+      requestId,
+      conversationId,
+    ))
+      this.admitted.delete(row.id);
   }
   private sweptAt = 0;
+  private watchedAt = 0;
+  private runTimeoutMs() {
+    const minutes = Number(process.env.TASK_RUN_TIMEOUT_MIN);
+    return (
+      (Number.isFinite(minutes) && minutes > 0
+        ? minutes
+        : DEFAULT_RUN_TIMEOUT_MIN) * 60_000
+    );
+  }
   private sweepRuns() {
     const now = this.clock();
     if (now - this.sweptAt < RUN_SWEEP_MS) return;
@@ -916,6 +937,45 @@ export class Tasks {
     store.run(
       "DELETE FROM task_run_keys WHERE runId NOT IN (SELECT id FROM task_runs)",
     );
+  }
+  /** Closes runs that started but never settled; alerts the destination once. */
+  private watchStaleRuns() {
+    const now = this.clock();
+    if (now - this.watchedAt < RUN_WATCH_MS) return;
+    this.watchedAt = now;
+    const store = this.runtime.store;
+    const timeout = this.runTimeoutMs();
+    for (const run of store.all<PendingRun & { timeoutNotified: number }>(
+      `SELECT r.*,t.prompt FROM task_runs r JOIN tasks t ON t.id=r.taskId
+       WHERE r.state='pending' AND r.startedAt IS NOT NULL AND r.finishedAt IS NULL
+         AND r.startedAt<?`,
+      now - timeout,
+    )) {
+      const summary = `Execução expirou após ${Math.round(timeout / 60_000)} minutos sem conclusão.`;
+      store.run(
+        "UPDATE task_runs SET state='failed',finishedAt=?,status='erro',summary=?,error=COALESCE(error,?) WHERE id=?",
+        now,
+        summary.slice(0, 400),
+        summary,
+        run.id,
+      );
+      store.run(
+        "UPDATE requests SET status='stale' WHERE conversationId=? AND requestId=? AND status='pending'",
+        run.conversationId,
+        run.requestId,
+      );
+      store.run("UPDATE tasks SET lastError=? WHERE id=?", summary, run.taskId);
+      this.admitted.delete(run.id);
+      if (!run.timeoutNotified) {
+        store.run("UPDATE task_runs SET timeoutNotified=1 WHERE id=?", run.id);
+        queueTaskTelegram(
+          store,
+          run.conversationId,
+          run.requestId,
+          `A tarefa agendada não terminou a tempo (${summary}). Consulte /crons ou o painel web.`,
+        );
+      }
+    }
   }
   /** True while a run of this conversation is executing: a run must not start another. */
   inFlight(conversationId: string) {
@@ -960,6 +1020,7 @@ export class Tasks {
       ))
         this.claim(task.id, now, true);
       await this.dispatch();
+      this.watchStaleRuns();
       this.sweepRuns();
       this.refresh();
     }).finally(() => {
@@ -1093,16 +1154,26 @@ export class Tasks {
         run.requestId,
       );
       if (!request || request.status === "pending") continue;
-      const error =
-        request.status === "done"
-          ? null
-          : `Solicitação terminou com status: ${request.status}`;
+      if (run.finishedAt !== null) {
+        this.admitted.delete(run.id);
+        continue;
+      }
+      // A successful turn is settled by monitorSubmission (summary, delivery, status).
+      if (request.status === "done") {
+        store.run(
+          "UPDATE task_runs SET state='done',finishedAt=?,status=COALESCE(status,'silencioso'),summary=COALESCE(summary,'') WHERE id=?",
+          Date.now(),
+          run.id,
+        );
+        this.admitted.delete(run.id);
+        continue;
+      }
+      const error = `Solicitação terminou com status: ${request.status}`;
       store.run(
-        "UPDATE task_runs SET state=?,error=COALESCE(error,?),finishedAt=COALESCE(finishedAt,?),status=COALESCE(status,?) WHERE id=?",
-        error ? "failed" : "done",
+        "UPDATE task_runs SET state='failed',error=COALESCE(error,?),finishedAt=?,status=COALESCE(status,'erro'),summary=COALESCE(summary,?) WHERE id=?",
         error,
         Date.now(),
-        error ? "erro" : "ok",
+        `A tarefa não foi concluída: ${error}`,
         run.id,
       );
       store.run(
@@ -1119,6 +1190,14 @@ export class Tasks {
       "SELECT r.*,t.prompt FROM task_runs r JOIN tasks t ON t.id=r.taskId WHERE r.state='pending' ORDER BY r.rowid",
     )) {
       if (this.admitted.has(run.id)) continue;
+      if (
+        this.inFlight(run.conversationId) &&
+        !store.get(
+          "SELECT 1 FROM task_runs WHERE id=? AND startedAt IS NOT NULL",
+          run.id,
+        )
+      )
+        continue;
       // A login may start between two awaited admissions. Keep unsent runs
       // pending with the same requestId so a later tick can admit them once.
       if (store.credentialMutation) return;
@@ -1134,7 +1213,7 @@ export class Tasks {
         this.admitted.add(run.id);
         store.run(
           "UPDATE task_runs SET startedAt=? WHERE id=? AND startedAt IS NULL",
-          Date.now(),
+          this.clock(),
           run.id,
         );
       } catch (cause) {
