@@ -18,7 +18,10 @@ jobs:
       - run: npm run build
       - name: Offline mocked tests (no bot, API key, email or paid tools)
         run: npm test
-      - name: Validate Compose (no runtime credentials required)
+      - name: Validate Compose (with synthetic required variables)
+        env:
+          TELEGRAM_BOT_TOKEN: 123456:synthetic_token
+          TELEGRAM_ALLOWED_USERS: "123456789"
         run: docker compose config --quiet
       - name: Build container and inspect offline runtime
         run: |

@@ -10,10 +10,12 @@ import {
   McpError,
   McpNotSentError,
   McpUrlElicitationRequiredError,
+  mcpCallTimeoutMs,
   validateMcpUrlElicitation,
   PolicyError,
 } from "./mcp.js";
 import type { Store } from "./store.js";
+import { executorBodies, executorPauseKind } from "./executor-result.js";
 
 export interface McpCall {
   id: string;
@@ -38,16 +40,6 @@ export interface McpInteraction {
 }
 const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
-/** Executor tools that describe the executor instead of acting on anything. */
-/** A read never needs a decision and never changes state: reads stay open even when an
- * earlier call's result is unknown, because checking that result means reading. */
-function isReadOnly(tool: string) {
-  return (
-    READ_ONLY.has(tool) ||
-    /^(get|list|read|search|find|query|describe|show|view|status)/i.test(tool)
-  );
-}
-
 const READ_ONLY = new Set([
   "search",
   "describe",
@@ -55,7 +47,105 @@ const READ_ONLY = new Set([
   "list-artifacts",
   "show-artifact",
   "resume",
+  "call",
 ]);
+
+function readOnlyName(name: string) {
+  return (
+    READ_ONLY.has(name) ||
+    /^(get|list|read|search|find|query|describe|show|view|status)/i.test(name)
+  );
+}
+
+function readOnlyToolPath(path: string) {
+  const normalized = path.trim();
+  if (!normalized) return false;
+  const leaf = normalized.split(".").pop() ?? normalized;
+  return readOnlyName(leaf);
+}
+
+function callTargetPath(args: Record<string, unknown>) {
+  if (typeof args.address === "string" && args.address.trim())
+    return args.address.trim();
+  if (typeof args.path === "string" && args.path.trim())
+    return args.path.trim();
+  const input = args.input;
+  if (object(input)) {
+    if (typeof input.address === "string" && input.address.trim())
+      return input.address.trim();
+    if (typeof input.tool === "string" && input.tool.trim())
+      return input.tool.trim();
+  }
+  const body = args.body;
+  if (object(body)) {
+    if (typeof body.tool === "string" && body.tool.trim())
+      return body.tool.trim();
+    if (body.kind === "query") return "__query__";
+  }
+  if (typeof body === "string" && body.trim().startsWith("tools."))
+    return body.trim();
+  return undefined;
+}
+
+/** Executor `execute` programs that only consult state, including poller sandbox calls. */
+function executeCodeLooksReadOnly(code: string) {
+  const trimmed = code.trim();
+  if (!trimmed) return false;
+  const pickPaths = [
+    ...trimmed.matchAll(/pick\(\s*(["'`])([^"'`]+)\1\s*\)/g),
+  ].map((match) => match[2]);
+  if (pickPaths.length > 0) {
+    if (pickPaths.some((path) => !readOnlyToolPath(path))) return false;
+    const withoutPick = trimmed.replace(/pick\(\s*(["'`])[^"'`]+\1\s*\)/g, "");
+    if (/\btools\.(?!search\b|describe\b)/.test(withoutPick)) return false;
+    return true;
+  }
+  // Direct calls (`tools.instabox.machines.readFiles`) are what the poller sends.
+  // `tools.call` / `tools.execute` stay writes even though their leaf looks readable.
+  const directPaths = [
+    ...trimmed.matchAll(/\btools(?:\.[A-Za-z_$][\w$]*)+/g),
+  ].map((match) => match[0]);
+  if (directPaths.length > 0) {
+    if (
+      directPaths.some(
+        (path) => path === "tools.call" || path === "tools.execute",
+      )
+    )
+      return false;
+    return directPaths.every((path) => readOnlyToolPath(path));
+  }
+  if (/\btools\.(call|execute)\b/.test(trimmed)) return false;
+  if (!/\btools\.(search|describe)\b/.test(trimmed)) return false;
+  if (
+    /\b(run_web_automation|runAsync|create|update|delete|send|write|post|put|patch|deploy|resume)\b/i.test(
+      trimmed,
+    )
+  )
+    return false;
+  return true;
+}
+
+/** A read never needs a decision and never changes state: reads stay open even when an
+ * earlier call's result is unknown, because checking that result means reading. */
+export function mcpCallIsReadOnly(
+  tool: string,
+  args?: Record<string, unknown>,
+) {
+  const safeArgs =
+    args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  if (readOnlyName(tool)) {
+    if (tool === "call") {
+      const target = callTargetPath(safeArgs);
+      if (target === "__query__") return true;
+      if (target) return readOnlyToolPath(target);
+      return false;
+    }
+    return true;
+  }
+  if (tool === "execute" && typeof safeArgs.code === "string")
+    return executeCodeLooksReadOnly(safeArgs.code);
+  return false;
+}
 
 /** Executor hosted resume often uses executionId + action instead of requestId + response. */
 export function executorUsesExecutionIdResume(
@@ -101,6 +191,35 @@ function buildExecutorResumeArgs(
 // model not to summarize the step it skipped.
 const APPROVAL_SKIPPED =
   "Passo pulado: execução agendada não pode aguardar aprovação humana. Nenhuma ação externa foi executada nem retomada. Não resuma este passo; siga com o restante ou encerre.";
+function toCallToolResult(result: unknown): CallToolResult {
+  const body =
+    result && typeof result === "object" && !Array.isArray(result)
+      ? (result as Record<string, unknown>)
+      : undefined;
+  if (body && Array.isArray(body.content)) return result as CallToolResult;
+  return {
+    content: [
+      {
+        type: "text",
+        text:
+          typeof result === "string" ? result : JSON.stringify(result ?? {}),
+      },
+    ],
+    ...(body ? { structuredContent: body } : {}),
+  };
+}
+export interface McpReleaseNotice {
+  conversationId: string;
+  callId: string;
+  text: string;
+}
+
+export function deadlineFailure(error: unknown) {
+  if (error instanceof Error && error.name === "AbortError") return true;
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /estourou o prazo|Request timed out|timed out|aborted/i.test(message);
+}
+
 function notifyPending(onPending?: () => void) {
   if (!onPending) return;
   // Defer so Telegram flush does not run reentrantly inside MCP I/O or SQLite work.
@@ -123,6 +242,7 @@ export class McpCalls {
     private store: Store,
     private gateway: McpGateway,
     private onPending?: () => void,
+    private onReleased?: (notice: McpReleaseNotice) => void,
   ) {
     store.db
       .exec(`CREATE TABLE IF NOT EXISTS mcp_calls(id TEXT PRIMARY KEY, conversationId TEXT NOT NULL, server TEXT NOT NULL, tool TEXT NOT NULL, args TEXT NOT NULL, state TEXT NOT NULL, result TEXT, binding TEXT NOT NULL, updatedAt INTEGER NOT NULL);
@@ -132,6 +252,59 @@ export class McpCalls {
       UPDATE mcp_interactions SET state='expired' WHERE state='pending' AND kind!='resume'
         AND NOT (kind='url' AND json_valid(payload) AND json_extract(payload,'$.source')='url_required_error');
       UPDATE mcp_calls SET state='uncertain' WHERE state='running';`);
+  }
+  /**
+   * Records a pause that a direct `execute` already received, so the approval
+   * card and `resume` can finish it. The command has not run yet.
+   */
+  noteExecutorPause(
+    conversationId: string,
+    server: string,
+    tool: string,
+    args: Record<string, unknown>,
+    result: unknown,
+  ): string | undefined {
+    const callResult = toCallToolResult(result);
+    const paused = this.pause(callResult);
+    const requestId =
+      paused && typeof paused.requestId === "string"
+        ? paused.requestId.trim()
+        : "";
+    if (!paused || !requestId) return undefined;
+    let binding = "";
+    try {
+      binding = this.binding(server);
+    } catch {
+      return requestId;
+    }
+    const callId = createHash("sha256")
+      .update(`executor-pause:${conversationId}:${requestId}`)
+      .digest("hex")
+      .slice(0, 24);
+    if (this.store.get("SELECT 1 FROM mcp_calls WHERE id=?", callId))
+      return requestId;
+    this.store.run(
+      "INSERT INTO mcp_calls VALUES (?,?,?,?,?,'paused',?,?,?)",
+      callId,
+      conversationId,
+      server,
+      tool,
+      JSON.stringify(args),
+      JSON.stringify(callResult),
+      binding,
+      Date.now(),
+    );
+    this.store.run(
+      "INSERT INTO mcp_interactions VALUES (?,?,?,?,?,?,'pending',NULL)",
+      randomUUID(),
+      callId,
+      conversationId,
+      server,
+      "resume",
+      JSON.stringify(paused),
+    );
+    notifyPending(this.onPending);
+    return requestId;
   }
   list(conversationId: string) {
     return this.store.all<McpCall>(
@@ -153,6 +326,33 @@ export class McpCalls {
       "SELECT 1 FROM mcp_interactions WHERE conversationId=? AND state='pending'",
       conversationId,
     );
+  }
+  private pendingApprovalRequestId(conversationId: string) {
+    const row = this.store.get<{ payload: string }>(
+      "SELECT payload FROM mcp_interactions WHERE conversationId=? AND state='pending' ORDER BY rowid DESC LIMIT 1",
+      conversationId,
+    );
+    if (!row) return undefined;
+    try {
+      const payload = JSON.parse(row.payload) as Record<string, unknown>;
+      const direct =
+        typeof payload.requestId === "string" ? payload.requestId.trim() : "";
+      if (direct) return direct;
+      const elicitation = payload.elicitation;
+      if (elicitation && typeof elicitation === "object") {
+        const nested = (elicitation as { requestId?: unknown }).requestId;
+        if (typeof nested === "string" && nested.trim()) return nested.trim();
+      }
+    } catch {
+      /* malformed card payload */
+    }
+    return undefined;
+  }
+  private pendingApprovalMessage(conversationId: string) {
+    const requestId = this.pendingApprovalRequestId(conversationId);
+    return requestId
+      ? `Responda à solicitação pendente do servidor MCP (${requestId}) antes de continuar`
+      : "Responda à solicitação pendente do servidor MCP antes de continuar";
   }
   private serialize<T>(conversationId: string, operation: () => Promise<T>) {
     const pending = (this.tails.get(conversationId) ?? Promise.resolve())
@@ -233,6 +433,7 @@ export class McpCalls {
       "SELECT * FROM mcp_calls WHERE id=?",
       id,
     );
+    this.releaseOverdue(conversationId);
     if (existing) {
       if (
         existing.server !== server ||
@@ -251,13 +452,11 @@ export class McpCalls {
     }
     // A pending decision blocks actions, not diagnosis: the Executor's read tools
     // still answer, so a stuck approval can be looked at instead of guessed about.
-    if (this.pending(conversationId) && !READ_ONLY.has(tool))
-      throw new McpNotSentError(
-        "Responda à solicitação pendente do servidor MCP antes de continuar",
-      );
+    if (this.pending(conversationId) && !mcpCallIsReadOnly(tool, args))
+      throw new McpNotSentError(this.pendingApprovalMessage(conversationId));
     // Reads stay open: checking an uncertain result is only possible by reading.
     if (
-      !isReadOnly(tool) &&
+      !mcpCallIsReadOnly(tool, args) &&
       this.store.get(
         "SELECT 1 FROM mcp_calls WHERE conversationId=? AND server=? AND state='uncertain'",
         conversationId,
@@ -317,6 +516,86 @@ export class McpCalls {
     );
     return this.run(id, tool, args, signal, scheduled);
   }
+  /**
+   * A call that outlived its deadline, or a pause whose resume expired, must
+   * not keep the conversation locked. The in-flight promise may still be wedged.
+   */
+  private releaseOverdue(conversationId: string) {
+    const deadline = mcpCallTimeoutMs();
+    const now = Date.now();
+    const stuck = this.store.all<McpCall>(
+      "SELECT * FROM mcp_calls WHERE conversationId=? AND state='running' AND updatedAt<=?",
+      conversationId,
+      now - deadline,
+    );
+    for (const call of stuck) {
+      this.callControllers.get(call.id)?.abort();
+      this.forceRelease(
+        call,
+        `A chamada ${call.server}/${call.tool} passou de ${Math.round(deadline / 1000)}s sem retorno. A trava foi liberada; não confirmei se o serviço a recebeu.`,
+      );
+      void this.gateway.releaseSession(call.server);
+    }
+    const paused = this.store.all<McpCall>(
+      "SELECT * FROM mcp_calls WHERE conversationId=? AND state='paused'",
+      conversationId,
+    );
+    for (const call of paused) {
+      const interaction = this.store.get<McpInteraction>(
+        "SELECT * FROM mcp_interactions WHERE callId=? AND kind='resume' AND state='pending' ORDER BY rowid DESC LIMIT 1",
+        call.id,
+      );
+      if (!interaction) {
+        this.forceRelease(
+          call,
+          `A chamada ${call.server}/${call.tool} ficou pausada sem retomada pendente. A trava foi liberada.`,
+        );
+        continue;
+      }
+      let expiresAt = 0;
+      try {
+        expiresAt = Number(
+          (JSON.parse(interaction.payload) as { expiresAt?: unknown })
+            .expiresAt,
+        );
+      } catch {
+        expiresAt = 0;
+      }
+      if (!Number.isFinite(expiresAt) || expiresAt > now) continue;
+      this.store.run(
+        "UPDATE mcp_interactions SET state='expired' WHERE id=? AND state='pending'",
+        interaction.id,
+      );
+      this.forceRelease(
+        call,
+        `A retomada de ${call.server}/${call.tool} expirou. A trava foi liberada; nenhuma chamada nova ficou presa.`,
+      );
+    }
+  }
+
+  private forceRelease(
+    call: McpCall,
+    text: string,
+    from: Array<"running" | "paused"> = ["running", "paused"],
+  ) {
+    const states = from.map((state) => `'${state}'`).join(",");
+    const changed = this.store.run(
+      `UPDATE mcp_calls SET state='failed',result=?,updatedAt=? WHERE id=? AND state IN (${states})`,
+      JSON.stringify({
+        isError: true,
+        content: [{ type: "text", text }],
+      }),
+      Date.now(),
+      call.id,
+    ).changes;
+    if (!changed) return;
+    this.onReleased?.({
+      conversationId: call.conversationId,
+      callId: call.id,
+      text,
+    });
+  }
+
   private run(
     id: string,
     tool: string,
@@ -346,18 +625,14 @@ export class McpCalls {
     const combined = signal
       ? AbortSignal.any([controller.signal, signal])
       : controller.signal;
+    const deadlineMs = mcpCallTimeoutMs();
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       if (this.closed)
         throw new McpNotSentError(
           "Aplicação encerrando; nenhuma chamada MCP foi enviada",
         );
-      try {
-      } catch {
-        throw new McpNotSentError(
-          "CUA pausado para intervenção humana. Nenhuma chamada MCP foi enviada.",
-        );
-      }
-      const result = await this.gateway.callDirect(call.server, tool, args, {
+      const attempt = this.gateway.callDirect(call.server, tool, args, {
         signal: combined,
         binding: call.binding,
         onElicitation: (params, elicitationSignal) =>
@@ -369,6 +644,21 @@ export class McpCalls {
               : combined,
           ),
       });
+      void attempt.catch(() => {});
+      const result = await Promise.race([
+        attempt,
+        new Promise<CallToolResult>((_, reject) => {
+          deadlineTimer = setTimeout(() => {
+            controller.abort();
+            void this.gateway.releaseSession(call.server);
+            reject(
+              new McpError(
+                `A chamada ${tool} estourou o prazo de ${Math.round(deadlineMs / 1000)}s e foi encerrada. A trava foi liberada.`,
+              ),
+            );
+          }, deadlineMs);
+        }),
+      ]);
       const status = this.outcomeStatus(result);
       const browserMode = !!status && Object.hasOwn(status, "approvalUrl");
       if (browserMode) {
@@ -452,7 +742,7 @@ export class McpCalls {
         throw error;
       }
       // A read that worked is the verification the block asked for.
-      if (isReadOnly(tool) && !result.isError)
+      if (mcpCallIsReadOnly(tool, args) && !result.isError)
         this.clearUncertain(call.conversationId);
       return result;
     } catch (error) {
@@ -460,6 +750,10 @@ export class McpCalls {
       // turn ends by itself with the skip instruction instead of a pending request.
       const scheduledSkip =
         scheduled && error instanceof McpUrlElicitationRequiredError;
+      const raw = error instanceof Error ? error.message : String(error ?? "");
+      const timedOut = deadlineFailure(error);
+      const gaveUpEarly =
+        timedOut || (tool === "resume" && !(error instanceof McpNotSentError));
       const result: CallToolResult = {
         isError: true,
         content: [
@@ -467,9 +761,11 @@ export class McpCalls {
             type: "text",
             text: scheduledSkip
               ? APPROVAL_SKIPPED
-              : error instanceof PolicyError || error instanceof McpError
-                ? error.message
-                : "Resultado MCP incerto. Verifique o serviço antes de tentar outra execução.",
+              : timedOut && !/estourou o prazo/.test(raw)
+                ? `A chamada ${tool} estourou o prazo de ${Math.round(mcpCallTimeoutMs() / 1000)}s (${raw}). A trava foi liberada.`
+                : error instanceof PolicyError || error instanceof McpError
+                  ? error.message
+                  : "Resultado MCP incerto. Verifique o serviço antes de tentar outra execução.",
           },
         ],
       };
@@ -488,16 +784,29 @@ export class McpCalls {
             );
           notifyPending(this.onPending);
         }
+        const gaveUp = gaveUpEarly;
+        const terminal = gaveUp ? "failed" : undefined;
         this.store.run(
           "UPDATE mcp_calls SET state=?,result=?,updatedAt=? WHERE id=?",
-          error instanceof PolicyError || error instanceof McpNotSentError
-            ? "failed"
-            : "uncertain",
+          terminal ??
+            (error instanceof PolicyError || error instanceof McpNotSentError
+              ? "failed"
+              : "uncertain"),
           JSON.stringify(result),
           Date.now(),
           id,
         );
         this.store.db.exec("COMMIT");
+        if (gaveUp) {
+          const text =
+            result.content.find((item) => item.type === "text")?.text ??
+            "A chamada MCP falhou e a trava foi liberada.";
+          this.onReleased?.({
+            conversationId: call.conversationId,
+            callId: id,
+            text,
+          });
+        }
       } catch (storageError) {
         this.store.db.exec("ROLLBACK");
         // A failed card publication must still block replay of the dispatched call.
@@ -520,6 +829,14 @@ export class McpCalls {
       if (scheduledSkip) return result;
       throw error;
     } finally {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      // If the call never left `running` (the await wedged, or the ledger write
+      // failed), the conversation must not stay locked.
+      this.forceRelease(
+        call,
+        `A chamada ${call.server}/${call.tool} não terminou dentro do prazo. A trava foi liberada.`,
+        ["running"],
+      );
       // SDK may finish a tools/call while a withdrawn elicitation handler is still pending.
       // Settle every local waiter before closing SQLite or accepting another invocation.
       controller.abort();
@@ -531,76 +848,15 @@ export class McpCalls {
       );
     }
   }
-  /**
-   * Every object a result carries, outermost first. A pause is not always at the top:
-   * `execute` answers inside its own envelope (`{ok, data:{content:[{text}]}}`) and a
-   * paused tool's payload travels in there, so the search has to descend.
-   */
+  /** Every object a result carries, outermost first. Shared with the job poller. */
   private pauseCandidates(result: CallToolResult): Record<string, unknown>[] {
-    const candidates: Record<string, unknown>[] = [];
-    const walk = (value: unknown, depth: number) => {
-      if (depth > 6 || value === undefined || value === null) return;
-      if (typeof value === "string") {
-        const trimmed = value.trim();
-        if (trimmed[0] !== "{" && trimmed[0] !== "[") return;
-        try {
-          walk(JSON.parse(trimmed), depth + 1);
-        } catch {
-          /* ordinary text */
-        }
-        return;
-      }
-      if (Array.isArray(value)) {
-        for (const item of value) walk(item, depth + 1);
-        return;
-      }
-      if (!object(value)) return;
-      candidates.push(value);
-      for (const key of [
-        "content",
-        "data",
-        "execution",
-        "value",
-        "result",
-        "output",
-        // The paused payload usually arrives as JSON text, not as a field.
-        "text",
-      ])
-        walk(value[key], depth + 1);
-    };
-    walk(result.structuredContent, 0);
-    for (const item of result.content) walk(item, 0);
-    return candidates;
-  }
-  private executorPauseKind(value: Record<string, unknown>) {
-    if (Object.hasOwn(value, "approvalUrl")) return undefined;
-    const status = String(value.status ?? "")
-      .trim()
-      .toLowerCase()
-      .replace(/-/g, "_");
-    if (status === "approval_required" || status === "paused")
-      return "approval-required";
-    if (status === "input_required") return "input-required";
-    if (
-      status === "waiting_for_interaction" ||
-      status === "awaiting_approval" ||
-      status === "awaiting_input"
-    )
-      return "approval-required";
-    if (value.paused === true) return "approval-required";
-    if (
-      typeof value.executionId === "string" &&
-      value.executionId.trim() &&
-      (object(value.invocation) ||
-        typeof value.tool === "string" ||
-        object(value.execution) ||
-        (object(value.elicitation) && value.elicitation.mode === "form"))
-    )
-      return "approval-required";
-    return undefined;
+    return [
+      ...executorBodies(result.structuredContent),
+      ...result.content.flatMap((item) => executorBodies(item)),
+    ];
   }
   private looksLikeExecutorPause(value: Record<string, unknown>) {
-    return !!this.executorPauseKind(value);
+    return !!executorPauseKind(value);
   }
   /** Normalize MODEL-mode Executor pauses, including executionId aliases and partial payloads. */
   private normalizeExecutorPause(
@@ -608,7 +864,7 @@ export class McpCalls {
   ): Record<string, unknown> | undefined {
     let value = raw;
     if (object(value.execution)) value = { ...value.execution, ...value };
-    const status = this.executorPauseKind(value);
+    const status = executorPauseKind(value);
     if (!status || Object.hasOwn(value, "approvalUrl")) return;
     const requestId =
       typeof value.requestId === "string" && value.requestId.trim()

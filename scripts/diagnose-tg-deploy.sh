@@ -71,7 +71,7 @@ fi
 
 section "Dicas rápidas"
 cat <<'EOF'
-- TELEGRAM_ALLOWED_CHATS é obrigatório (IDs numéricos; supergrupo = negativo, ex. -100…).
+- TELEGRAM_ALLOWED_CHATS é opcional (omita em DM; supergrupo = negativo, ex. -100…).
 - TELEGRAM_ALLOWED_USERS = user ID de quem controla o bot (@userinfobot no privado).
 - Chat privado: CHATS pode ser o mesmo ID positivo do seu usuário.
 - LLM_BASE_URL + LLM_API_KEY registram um provedor OpenAI-compatible (id llm).

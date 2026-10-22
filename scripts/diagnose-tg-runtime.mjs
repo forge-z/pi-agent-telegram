@@ -10,7 +10,6 @@ import {
   discoverLlmModels,
   environmentModels,
   LLM_PROVIDER_ID,
-  llmBaseUrl,
   operatorSecret,
   readConfig,
   resolveMcpServersJson,
@@ -20,9 +19,8 @@ import {
 import { readAppInfo } from "../dist/src/app-info.js";
 import { spawnSync } from "node:child_process";
 
-const required = [
-  "TELEGRAM_BOT_TOKEN",
-  "TELEGRAM_ALLOWED_USERS",
+const mandatory = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USERS"];
+const optional = [
   "LLM_BASE_URL",
   "LLM_API_KEY",
   "EXECUTOR_MCP_URL",
@@ -83,7 +81,10 @@ if (!id.commit)
   );
 
 section("Variáveis de ambiente (presença)");
-for (const name of required) console.log(`${name}=${envStatus(name)}`);
+for (const name of mandatory)
+  console.log(`${name}=${envStatus(name)} (obrigatória)`);
+for (const name of optional)
+  console.log(`${name}=${envStatus(name)} (opcional)`);
 console.log(
   `TELEGRAM_ALLOWED_CHATS=${envStatus("TELEGRAM_ALLOWED_CHATS")} (opcional; padrão = ALLOWED_USERS)`,
 );
@@ -142,7 +143,15 @@ try {
 if (process.argv.includes("--probe")) {
   section("Probe ao vivo do endpoint LLM (--probe; nada de chave na saída)");
   try {
-    const baseUrl = llmBaseUrl();
+    const raw = process.env.LLM_BASE_URL?.trim();
+    if (!raw)
+      throw new Error("Configure LLM_BASE_URL (endpoint OpenAI-compatible).");
+    let baseUrl;
+    try {
+      baseUrl = new URL(raw).href.replace(/\/$/, "");
+    } catch {
+      throw new Error("Endpoint LLM_BASE_URL inválido");
+    }
     const key = operatorSecret(process.env, "LLM_API_KEY");
     if (!key) throw new Error("Configure LLM_API_KEY ou LLM_API_KEY_FILE.");
     const discovered = await discoverLlmModels(baseUrl, key);

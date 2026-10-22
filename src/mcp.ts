@@ -58,6 +58,13 @@ export class McpError extends Error {}
 class McpSessionError extends McpError {}
 // Created only before dispatch; transport errors from callTool are never assigned this type.
 export class McpNotSentError extends McpError {}
+
+export function mcpCallTimeoutMs(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const value = Number(env.MCP_CALL_TIMEOUT_MS);
+  return Number.isFinite(value) && value > 0 ? value : 60000;
+}
 export function validateMcpUrlElicitation(
   value: unknown,
 ): ElicitRequestURLParams {
@@ -294,6 +301,127 @@ function configuredToken(config: McpConfig) {
     throw new PolicyError("Arquivo de token MCP indisponível");
   }
 }
+interface LockWaiter {
+  mode: "shared" | "exclusive";
+  grant: () => void;
+  reject: (err: unknown) => void;
+  signal?: AbortSignal;
+  cancelled: boolean;
+}
+
+class ServerRwLock {
+  readers = 0;
+  writer = false;
+  queue: LockWaiter[] = [];
+
+  acquire(
+    mode: "shared" | "exclusive",
+    signal?: AbortSignal,
+  ): Promise<() => void> {
+    if (signal?.aborted) {
+      return Promise.reject(
+        new McpNotSentError("Chamada MCP cancelada antes do envio."),
+      );
+    }
+
+    if (mode === "shared") {
+      const hasWaitingWriter = this.queue.some(
+        (w) => w.mode === "exclusive" && !w.cancelled,
+      );
+      if (!this.writer && !hasWaitingWriter) {
+        this.readers++;
+        let released = false;
+        return Promise.resolve(() => {
+          if (released) return;
+          released = true;
+          this.readers--;
+          this.drain();
+        });
+      }
+    } else {
+      if (this.readers === 0 && !this.writer && this.queue.length === 0) {
+        this.writer = true;
+        let released = false;
+        return Promise.resolve(() => {
+          if (released) return;
+          released = true;
+          this.writer = false;
+          this.drain();
+        });
+      }
+    }
+
+    return new Promise<() => void>((resolve, reject) => {
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        if (mode === "shared") {
+          this.readers--;
+        } else {
+          this.writer = false;
+        }
+        this.drain();
+      };
+
+      const waiter: LockWaiter = {
+        mode,
+        grant: () => resolve(release),
+        reject,
+        signal,
+        cancelled: false,
+      };
+
+      if (signal) {
+        const onAbort = () => {
+          signal.removeEventListener("abort", onAbort);
+          if (waiter.cancelled) return;
+          waiter.cancelled = true;
+          const idx = this.queue.indexOf(waiter);
+          if (idx >= 0) this.queue.splice(idx, 1);
+          this.drain();
+          reject(new McpNotSentError("Chamada MCP cancelada antes do envio."));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      this.queue.push(waiter);
+    });
+  }
+
+  drain() {
+    while (this.queue.length > 0) {
+      const first = this.queue[0];
+      if (first.cancelled) {
+        this.queue.shift();
+        continue;
+      }
+
+      if (first.mode === "exclusive") {
+        if (this.readers === 0 && !this.writer) {
+          this.queue.shift();
+          this.writer = true;
+          first.grant();
+        }
+        break;
+      }
+
+      if (first.mode === "shared") {
+        if (!this.writer) {
+          while (this.queue.length > 0 && this.queue[0].mode === "shared") {
+            const next = this.queue.shift()!;
+            if (!next.cancelled) {
+              this.readers++;
+              next.grant();
+            }
+          }
+        }
+        break;
+      }
+    }
+  }
+}
+
 export class McpGateway implements ToolGateway {
   private clients = new Map<string, Promise<Client>>();
   private bindings = new WeakMap<Client, string>();
@@ -311,8 +439,8 @@ export class McpGateway implements ToolGateway {
   >();
   private schemas = new CachedSchemaValidator();
   private operations = 0;
-  private tails = new Map<string, Promise<unknown>>();
-  private active = new Map<string, McpCallOptions>();
+  private locks = new Map<string, ServerRwLock>();
+  private active = new Map<string, Set<McpCallOptions>>();
   private dispatchGuard?: (server: string) => void;
   constructor(readonly config: McpConfig[]) {
     if (!Array.isArray(config))
@@ -347,7 +475,9 @@ export class McpGateway implements ToolGateway {
   }
   hasActiveOrigin(origin: string) {
     return [...this.active.keys()].some(
-      (server) => this.serverOrigin(server) === origin,
+      (server) =>
+        this.serverOrigin(server) === origin &&
+        (this.active.get(server)?.size ?? 0) > 0,
     );
   }
   credentialBinding(server: string) {
@@ -359,7 +489,7 @@ export class McpGateway implements ToolGateway {
       .digest("hex");
   }
   async connectionBinding(server: string) {
-    return this.enqueue(server, async () =>
+    return this.withLock(server, "exclusive", async () =>
       this.bindings.get(await this.client(server))!,
     );
   }
@@ -396,6 +526,15 @@ export class McpGateway implements ToolGateway {
     this.assertAllowed(server, tool, kind);
     return this.invoke(server, tool, args, { signal }, kind === "read");
   }
+  /** Drops a wedged session so the next call can open another one. */
+  async releaseSession(server: string) {
+    const pending = this.clients.get(server);
+    if (this.clients.get(server) === pending) this.clients.delete(server);
+    const client = pending ? await pending.catch(() => undefined) : undefined;
+    if (!client) return;
+    this.expired.add(client);
+    await client.close().catch(() => {});
+  }
   async callDirect(
     server: string,
     tool: string,
@@ -405,53 +544,35 @@ export class McpGateway implements ToolGateway {
     this.assertDirect(server, tool);
     return this.invoke(server, tool, args, options);
   }
-  // Discovery and tool calls share a queue so a session replacement cannot close
-  // a client while another operation or elicitation still uses it.
-  private async enqueue<T>(
+  private getLock(server: string): ServerRwLock {
+    let lock = this.locks.get(server);
+    if (!lock) {
+      lock = new ServerRwLock();
+      this.locks.set(server, lock);
+    }
+    return lock;
+  }
+  private async withLock<T>(
     server: string,
+    mode: "shared" | "exclusive",
     run: () => Promise<T>,
     signal?: AbortSignal,
   ): Promise<T> {
     this.operations++;
-    let started = false;
-    let stopWaiting = () => {};
-    const operation = (this.tails.get(server) ?? Promise.resolve())
-      .catch(() => {})
-      .then(() => {
-        started = true;
-        stopWaiting();
-        if (signal?.aborted)
-          throw new McpNotSentError("Chamada MCP cancelada antes do envio.");
-        return run();
-      });
-    this.tails.set(server, operation);
-    const completion = operation.finally(() => {
-      this.operations--;
-      if (this.tails.get(server) === operation) this.tails.delete(server);
-    });
-    if (!signal) return completion;
-    return new Promise<T>((resolve, reject) => {
-      const cancelWaiting = () => {
-        if (started) return;
-        stopWaiting();
-        // Release the caller immediately, but leave the cancelled item in the
-        // server queue. It must never bypass or interrupt the active operation.
-        reject(new McpNotSentError("Chamada MCP cancelada antes do envio."));
-      };
-      stopWaiting = () => signal.removeEventListener("abort", cancelWaiting);
-      signal.addEventListener("abort", cancelWaiting, { once: true });
-      void completion.then(
-        (value) => {
-          stopWaiting();
-          resolve(value);
-        },
-        (error) => {
-          stopWaiting();
-          reject(error);
-        },
-      );
-      if (signal.aborted) cancelWaiting();
-    });
+    let release: (() => void) | undefined;
+    try {
+      release = await this.getLock(server).acquire(mode, signal);
+      if (signal?.aborted) {
+        throw new McpNotSentError("Chamada MCP cancelada antes do envio.");
+      }
+      return await run();
+    } finally {
+      try {
+        release?.();
+      } finally {
+        this.operations--;
+      }
+    }
   }
   private async discard(server: string, client: Client) {
     const pending = this.clients.get(server);
@@ -509,8 +630,33 @@ export class McpGateway implements ToolGateway {
     );
     return [...tools.values()];
   }
-  private async liveClient(server: string, signal?: AbortSignal) {
+  private async ensureLiveClient(
+    server: string,
+    signal?: AbortSignal,
+  ): Promise<Client> {
+    const existing = this.clients.get(server);
+    const cached = existing ? await existing.catch(() => undefined) : undefined;
+    const hasMetadata = cached ? this.metadata.has(cached) : false;
+    const isExpired = cached ? this.expired.has(cached) : false;
+    const isBusy = (this.active.get(server)?.size ?? 0) > 0;
+
+    if (cached && hasMetadata && !isExpired && isBusy) {
+      return cached;
+    }
+
+    return this.withLock(
+      server,
+      "exclusive",
+      async () => {
+        return this.liveClientUnderLock(server, signal);
+      },
+      signal,
+    );
+  }
+  private async liveClientUnderLock(server: string, signal?: AbortSignal) {
     for (let attempt = 0; ; attempt++) {
+      if (signal?.aborted)
+        throw new McpNotSentError("Chamada MCP cancelada antes do envio.");
       const client = await this.client(server);
       try {
         // Probe before sending any tool. Discovery is safe to retry when an
@@ -548,86 +694,94 @@ export class McpGateway implements ToolGateway {
     options: McpCallOptions = {},
     retryRead = false,
   ) {
-    return this.enqueue(
-      server,
-      async () => {
-        for (let attempt = 0; ; attempt++) {
-          this.dispatchGuard?.(server);
-          if (options.signal?.aborted)
-            throw new McpNotSentError("Chamada MCP cancelada antes do envio.");
-          let client: Client;
-          try {
-            client = await this.liveClient(server, options.signal);
-          } catch (error) {
-            const safe =
-              error instanceof McpError || error instanceof PolicyError
-                ? error
-                : safeError(error);
-            throw new McpNotSentError(
-              `${safe.message} Nenhuma chamada de ferramenta foi enviada.`,
-            );
-          }
-          if (options.binding && this.bindings.get(client) !== options.binding)
-            throw new PolicyError(
-              "Credenciais da conexão MCP mudaram; a chamada não será enviada",
-            );
-          if (options.signal?.aborted)
-            throw new McpNotSentError("Chamada MCP cancelada antes do envio.");
-          const metadata = this.metadata.get(client)?.get(tool);
-          if (metadata?.taskRequired)
-            throw new McpNotSentError(
-              "Ferramenta MCP exige execução baseada em tarefas, não suportada nesta conexão. Nenhuma chamada de ferramenta foi enviada.",
-            );
-          this.dispatchGuard?.(server);
-          this.active.set(server, options);
-          try {
-            // A session can still end after the probe. Once callTool starts,
-            // any failure remains uncertain and effects must never be replayed.
-            const result = await client.callTool(
+    for (let attempt = 0; ; attempt++) {
+      this.dispatchGuard?.(server);
+      if (options.signal?.aborted)
+        throw new McpNotSentError("Chamada MCP cancelada antes do envio.");
+      let client: Client;
+      try {
+        client = await this.ensureLiveClient(server, options.signal);
+      } catch (error) {
+        const safe =
+          error instanceof McpError || error instanceof PolicyError
+            ? error
+            : safeError(error);
+        throw new McpNotSentError(
+          `${safe.message} Nenhuma chamada de ferramenta foi enviada.`,
+        );
+      }
+      if (options.binding && this.bindings.get(client) !== options.binding)
+        throw new PolicyError(
+          "Credenciais da conexão MCP mudaram; a chamada não será enviada",
+        );
+      if (options.signal?.aborted)
+        throw new McpNotSentError("Chamada MCP cancelada antes do envio.");
+      const metadata = this.metadata.get(client)?.get(tool);
+      if (metadata?.taskRequired)
+        throw new McpNotSentError(
+          "Ferramenta MCP exige execução baseada em tarefas, não suportada nesta conexão. Nenhuma chamada de ferramenta foi enviada.",
+        );
+      this.dispatchGuard?.(server);
+      let set = this.active.get(server);
+      if (!set) {
+        set = new Set();
+        this.active.set(server, set);
+      }
+      set.add(options);
+      try {
+        // A session can still end after the probe. Once callTool starts,
+        // any failure remains uncertain and effects must never be replayed.
+        const result = await this.withLock(
+          server,
+          "shared",
+          async () => {
+            return await client.callTool(
               { name: tool, arguments: args },
               undefined,
-              { timeout: 300000, signal: options.signal },
+              { timeout: mcpCallTimeoutMs(), signal: options.signal },
             );
-            const parsed = CallToolResultSchema.parse(
-              "toolResult" in result ? result.toolResult : result,
-            );
-            if (
-              metadata?.validateOutput &&
-              ((!parsed.structuredContent && !parsed.isError) ||
-                (parsed.structuredContent &&
-                  !metadata.validateOutput(parsed.structuredContent).valid))
-            )
-              throw new McpError(
-                "Resposta MCP incompatível com o schema de saída da ferramenta. O resultado da chamada pode ser incerto.",
-              );
-            return parsed;
-          } catch (error) {
-            // URL completion never authorizes replay, including locally classified reads.
-            if (
-              error &&
-              typeof error === "object" &&
-              "code" in error &&
-              error.code === -32042
-            )
-              throw safeError(error);
-            if (this.expired.has(client)) {
-              await this.discard(server, client);
-              // Direct tools can execute arbitrary effects, including tools with
-              // readOnlyHint. Only an explicit local read policy permits replay.
-              if (retryRead && attempt === 0 && !options.signal?.aborted)
-                continue;
-              throw new McpSessionError(
-                "A sessão MCP expirou ou foi encerrada (HTTP 404). A chamada não foi reenviada; verifique o resultado no serviço. A próxima operação abrirá uma nova sessão.",
-              );
-            }
-            throw error instanceof McpError ? error : safeError(error);
-          } finally {
-            this.active.delete(server);
-          }
+          },
+          options.signal,
+        );
+        const parsed = CallToolResultSchema.parse(
+          "toolResult" in result ? result.toolResult : result,
+        );
+        if (
+          metadata?.validateOutput &&
+          ((!parsed.structuredContent && !parsed.isError) ||
+            (parsed.structuredContent &&
+              !metadata.validateOutput(parsed.structuredContent).valid))
+        )
+          throw new McpError(
+            "Resposta MCP incompatível com o schema de saída da ferramenta. O resultado da chamada pode ser incerto.",
+          );
+        return parsed;
+      } catch (error) {
+        // URL completion never authorizes replay, including locally classified reads.
+        if (
+          error &&
+          typeof error === "object" &&
+          "code" in error &&
+          error.code === -32042
+        )
+          throw safeError(error);
+        if (this.expired.has(client)) {
+          await this.withLock(server, "exclusive", async () => {
+            await this.discard(server, client);
+          });
+          // Direct tools can execute arbitrary effects, including tools with
+          // readOnlyHint. Only an explicit local read policy permits replay.
+          if (retryRead && attempt === 0 && !options.signal?.aborted) continue;
+          throw new McpSessionError(
+            "A sessão MCP expirou ou foi encerrada (HTTP 404). A chamada não foi reenviada; verifique o resultado no serviço. A próxima operação abrirá uma nova sessão.",
+          );
         }
-      },
-      options.signal,
-    );
+        throw error instanceof McpError ? error : safeError(error);
+      } finally {
+        set.delete(options);
+        if (set.size === 0) this.active.delete(server);
+      }
+    }
   }
   private async client(server: string) {
     const config = this.config.find((c) => c.name === server);
@@ -670,12 +824,17 @@ export class McpGateway implements ToolGateway {
           );
           client.setRequestHandler(
             ElicitRequestSchema,
-            async (request, extra) =>
-              this.active
-                .get(server)
-                ?.onElicitation?.(request.params, extra.signal) ?? {
-                action: "cancel",
-              },
+            async (request, extra) => {
+              const activeSet = this.active.get(server);
+              if (activeSet) {
+                for (const opt of activeSet) {
+                  if (opt.onElicitation) {
+                    return opt.onElicitation(request.params, extra.signal);
+                  }
+                }
+              }
+              return { action: "cancel" };
+            },
           );
           return client;
         };
@@ -687,10 +846,13 @@ export class McpGateway implements ToolGateway {
           const establishedSsePost =
             legacyTransport && connected && init?.method === "POST";
           const controller = new AbortController();
-          // Tool calls (and their elicitation replies) use the same five-minute
-          // budget as callTool. Discovery and connection setup stay bounded at 30s.
+          // Tool calls (and their elicitation replies) use the configured
+          // MCP_CALL_TIMEOUT_MS budget (default 60s). Discovery and connection setup stay bounded at 30s.
+          const callTimeout = mcpCallTimeoutMs();
           const timeout =
-            this.active.has(server) && init?.method === "POST" ? 300000 : 30000;
+            (this.active.get(server)?.size ?? 0) > 0 && init?.method === "POST"
+              ? callTimeout
+              : 30000;
           const timer = setTimeout(() => controller.abort(), timeout);
           try {
             const response = await fetch(input, {
@@ -819,7 +981,7 @@ export class McpGateway implements ToolGateway {
     );
   }
   async discover(server: string): Promise<Tool[]> {
-    return this.enqueue(server, async () => {
+    return this.withLock(server, "exclusive", async () => {
       for (let attempt = 0; ; attempt++) {
         const client = await this.client(server);
         try {

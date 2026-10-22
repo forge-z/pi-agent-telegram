@@ -60,6 +60,18 @@ export function configureTelegram(
     );
   });
 }
+function updateLaneKey(update: TelegramUpdate): string {
+  if (update.callback_query) {
+    // Callbacks bypass chat/transcription lanes so approval buttons are never stuck behind audio
+    return `cb:${update.update_id}`;
+  }
+  const message = update.message;
+  if (!message?.chat) return `update:${update.update_id}`;
+  const chat = String(message.chat.id);
+  const thread = message.message_thread_id;
+  return thread ? `${chat}:${thread}` : chat;
+}
+
 export class TelegramPolling {
   private controller = new AbortController();
   private work?: Promise<void>;
@@ -67,6 +79,11 @@ export class TelegramPolling {
   private flushWork?: Promise<void>;
   private lastPoll = 0;
   private failed = false;
+  private lanes = new Map<string, Promise<void>>();
+  private inFlightUpdates = new Set<number>();
+  private completedUpdates = new Set<number>();
+  private unacknowledged = new Set<number>();
+  private persistedOffset?: number;
   readonly engine: Telegram;
   constructor(
     private app: Runtime,
@@ -171,9 +188,16 @@ export class TelegramPolling {
             Date.now() - this.lastPoll < 90_000
           ) {
             const path = join(this.app.options.dir, "health.json");
-            writeFileSync(`${path}.tmp`, JSON.stringify({ at: Date.now() }), {
-              mode: 0o600,
-            });
+            writeFileSync(
+              `${path}.tmp`,
+              JSON.stringify({
+                at: Date.now(),
+                jobs_poller: this.app.pendingJobs.health(),
+              }),
+              {
+                mode: 0o600,
+              },
+            );
             renameSync(`${path}.tmp`, path);
           }
         })
@@ -216,6 +240,26 @@ export class TelegramPolling {
       }
     }
   }
+  private advanceOffset(key: string) {
+    if (this.unacknowledged.size === 0) return;
+    const sorted = Array.from(this.unacknowledged).sort((a, b) => a - b);
+    for (const id of sorted) {
+      if (!this.completedUpdates.has(id)) {
+        // Lowest unacknowledged update is still in flight; cannot advance past it
+        break;
+      }
+      this.completedUpdates.delete(id);
+      this.unacknowledged.delete(id);
+      const nextOffset = id + 1;
+      this.persistedOffset = nextOffset;
+      this.app.store.run(
+        "INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        key,
+        String(nextOffset),
+      );
+    }
+  }
+
   private async run() {
     const signal = this.controller.signal;
     const webhook = (await this.api.call("getWebhookInfo", {}, signal)) as {
@@ -239,10 +283,14 @@ export class TelegramPolling {
           "SELECT value FROM meta WHERE key=?",
           key,
         );
+        const currentSaved = saved ? Number(saved.value) : undefined;
+        if (this.persistedOffset === undefined && currentSaved !== undefined) {
+          this.persistedOffset = currentSaved;
+        }
         const updates = await this.api.call(
           "getUpdates",
           {
-            offset: saved ? Number(saved.value) : undefined,
+            offset: this.persistedOffset ?? currentSaved,
             timeout: 25,
             limit: 100,
             allowed_updates: ["message", "callback_query"],
@@ -251,65 +299,88 @@ export class TelegramPolling {
         );
         if (!Array.isArray(updates)) throw new Error("Updates inválidos");
         this.lastPoll = Date.now();
+        let newUpdatesCount = 0;
         for (const value of updates as TelegramUpdate[]) {
           if (!Number.isSafeInteger(value.update_id) || value.update_id < 0)
             throw new Error("Update inválido");
-          try {
-            await this.engine.receive(value, signal);
-          } catch (error) {
-            if (!(
-              error instanceof TelegramInputError ||
-              error instanceof CommandError ||
-              error instanceof SettingsError ||
-              (error instanceof ConversationError &&
-                !(error instanceof ConversationBusyError))
-            ))
-              throw error;
-            const message = value.message;
-            if (
-              this.app.options.telegramOnly &&
-              message?.from &&
-              message.chat &&
-              typeof error.message === "string" &&
-              error.message
-            ) {
-              const user = String(message.from.id);
-              const chat = String(message.chat.id);
-              if (
-                this.config.users.includes(user) &&
-                this.config.chats.includes(chat)
-              ) {
-                try {
-                  await this.api.call(
-                    "sendMessage",
-                    {
-                      chat_id: chat,
-                      text: error.message,
-                      ...(Number.isSafeInteger(message.message_thread_id) &&
-                      message.message_thread_id! > 0
-                        ? { message_thread_id: message.message_thread_id }
-                        : {}),
-                    },
-                    signal,
-                  );
-                } catch {
-                  /* Best-effort; the update stays terminal. */
-                }
-              }
-            }
-            // Identity conflict is terminal for this update; never retry its effects.
-            console.error(
-              "Update Telegram rejeitado por conflito de identidade.",
-            );
+          if (
+            this.inFlightUpdates.has(value.update_id) ||
+            this.completedUpdates.has(value.update_id) ||
+            (this.persistedOffset !== undefined &&
+              value.update_id < this.persistedOffset)
+          ) {
+            continue;
           }
-          this.app.store.run(
-            "INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            key,
-            String(value.update_id + 1),
-          );
+          newUpdatesCount++;
+          this.unacknowledged.add(value.update_id);
+          this.inFlightUpdates.add(value.update_id);
+          const lane = updateLaneKey(value);
+          const prev = this.lanes.get(lane) ?? Promise.resolve();
+          const task = prev
+            .catch(() => {})
+            .then(async () => {
+              try {
+                await this.engine.receive(value, signal);
+              } catch (error) {
+                if (!(
+                  error instanceof TelegramInputError ||
+                  error instanceof CommandError ||
+                  error instanceof SettingsError ||
+                  (error instanceof ConversationError &&
+                    !(error instanceof ConversationBusyError))
+                ))
+                  throw error;
+                const message = value.message;
+                if (
+                  this.app.options.telegramOnly &&
+                  message?.from &&
+                  message.chat &&
+                  typeof error.message === "string" &&
+                  error.message
+                ) {
+                  const user = String(message.from.id);
+                  const chat = String(message.chat.id);
+                  if (
+                    this.config.users.includes(user) &&
+                    this.config.chats.includes(chat)
+                  ) {
+                    try {
+                      await this.api.call(
+                        "sendMessage",
+                        {
+                          chat_id: chat,
+                          text: error.message,
+                          ...(Number.isSafeInteger(message.message_thread_id) &&
+                          message.message_thread_id! > 0
+                            ? { message_thread_id: message.message_thread_id }
+                            : {}),
+                        },
+                        signal,
+                      );
+                    } catch {
+                      /* Best-effort; the update stays terminal. */
+                    }
+                  }
+                }
+                // Identity conflict is terminal for this update; never retry its effects.
+                console.error(
+                  "Update Telegram rejeitado por conflito de identidade.",
+                );
+              } finally {
+                this.inFlightUpdates.delete(value.update_id);
+                this.completedUpdates.add(value.update_id);
+                this.advanceOffset(key);
+              }
+            });
+          this.lanes.set(lane, task);
+          task.finally(() => {
+            if (this.lanes.get(lane) === task) {
+              this.lanes.delete(lane);
+            }
+          });
         }
         failures = 0;
-        if (!updates.length) await delay(100, undefined, { signal });
+        if (newUpdatesCount === 0) await delay(100, undefined, { signal });
       } catch (error) {
         if (signal.aborted) return;
         if (
@@ -333,6 +404,7 @@ export class TelegramPolling {
     if (this.timer) clearInterval(this.timer);
     const draining = this.engine.drain();
     await this.work;
+    await Promise.allSettled(Array.from(this.lanes.values()));
     await this.flushWork;
     await draining;
   }

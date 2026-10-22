@@ -9,22 +9,13 @@ services:
         required: false
     environment:
       # NODE_ENV and DATA_DIR are fixed in the image (Dockerfile ENV).
-      # Required. Everything else comes from `npm run setup`, stored in the volume.
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      TELEGRAM_ALLOWED_USERS: ${TELEGRAM_ALLOWED_USERS:-}
-      # Container clock for log timestamps. Schedules carry their own IANA timezone.
-      TZ: ${TZ:-}
-      # Executor: one authenticated endpoint for every MCP server. https://executor.sh
-      EXECUTOR_MCP_URL: ${EXECUTOR_MCP_URL:-}
-      EXECUTOR_TOKEN: ${EXECUTOR_TOKEN:-}
-      # Jobs: nothing to fill. The v2 manifest is built in; these only tune or date back to v1.
-      # ASYNC_JOB_TIMEOUT_MIN (30) and ASYNC_JOB_POLL_SECONDS (25) are optional.
-      # ASYNC_JOB_TOOLS is the deprecated v1 path list, removed 2026-12-31.
-      ASYNC_JOB_TOOLS: ${ASYNC_JOB_TOOLS:-}
-      ASYNC_JOB_TIMEOUT_MIN: ${ASYNC_JOB_TIMEOUT_MIN:-}
-      ASYNC_JOB_POLL_SECONDS: ${ASYNC_JOB_POLL_SECONDS:-}
-      # Any other variable reaches the container through env_file below (.env), so the
-      # declarations do not grow here. See .env.example for the full list.
+      # Required: without these the bot refuses to start. ${VAR:?} ensures Coolify
+      # highlights them in the panel and blocks deployment until values are set.
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?}
+      TELEGRAM_ALLOWED_USERS: ${TELEGRAM_ALLOWED_USERS:?}
+      # All optional variables (LLM_*, EXECUTOR_*, TZ, ASYNC_JOB_*, etc.) reach
+      # the container through env_file above (.env). In Coolify, add them
+      # manually in the Environment Variables tab. See .env.example for details.
 
     volumes:
       - pi_agent_tg_data:/app/data

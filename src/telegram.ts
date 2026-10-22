@@ -1,5 +1,6 @@
 import {
   queueMcpApprovals,
+  queueMcpUncertainNotices,
   decideMcp,
   queueMcpChecks,
   verifyMcp,
@@ -1345,6 +1346,8 @@ export class Telegram {
             "MCPs:",
             mcps,
             "",
+            this.app.pendingJobs.healthLine(),
+            "",
             `Versão: ${info.version ?? "dev"} (${info.commit ?? "sem SHA"})`,
             "Compactação automática: modelo e esforço ativos desta conversa.",
           ].join("\n"),
@@ -1375,6 +1378,21 @@ export class Telegram {
         if (notice) {
           this.app.settings.markModelNoticeShown(id);
           reply(notice);
+        }
+        const isCommand = text.startsWith("/") && !text.startsWith("//");
+        if (
+          !isCommand &&
+          this.app.isTurnBusy(id) &&
+          this.app.markTurnBusyNotified(id)
+        ) {
+          queueControl(
+            this.app,
+            `telegram:busy:${updateId}`,
+            owner,
+            id,
+            "Recebi, vou considerar no que estou fazendo. /stop cancela.",
+          );
+          void this.flush();
         }
         const picture = image ? await this.pictureTurn(image, text) : undefined;
         const spoken = voice ? await this.transcribeVoice(voice) : undefined;
@@ -1602,8 +1620,24 @@ export class Telegram {
   }
   private async sendPending() {
     this.typing.check();
-    queueMcpApprovals(this.app);
+    try {
+      queueMcpApprovals(this.app);
+    } catch (error) {
+      logFailure("Falha ao enfileirar aprovações MCP", error);
+    }
+    try {
+      queueMcpUncertainNotices(this.app);
+    } catch (error) {
+      logFailure("Falha ao enfileirar avisos de MCP incerto", error);
+    }
     if (Date.now() < this.sendAfter) return;
+    try {
+      await this.deliverPending();
+    } catch (error) {
+      logFailure("Falha ao entregar mensagens Telegram pendentes", error);
+    }
+  }
+  private async deliverPending() {
     for (const delivery of this.app.store.all<Delivery>(
       "SELECT * FROM deliveries WHERE state='pending' ORDER BY rowid",
     )) {

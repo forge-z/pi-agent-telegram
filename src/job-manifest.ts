@@ -1,3 +1,5 @@
+import { asRecord } from "./executor-result.js";
+
 /**
  * Declarative job manifests: everything provider-specific about an async job, in config.
  * The core only knows state, queue, dedupe and delivery, so a new integration is a manifest,
@@ -8,9 +10,9 @@ export type JobState =
   "pending" | "running" | "done" | "failed" | "cancelled" | "unknown";
 
 /** Where the id comes from: at dispatch, later, or nowhere (blocking call). */
-export type DispatchMode = "immediate" | "deferred" | "opaque";
+type DispatchMode = "immediate" | "deferred" | "opaque";
 /** How the job is watched: a status call, an pushed event, or a search. */
-export type ObserveMode = "poll" | "webhook" | "reconcile";
+type ObserveMode = "poll" | "webhook" | "reconcile";
 
 export interface JobManifest {
   /** Tool path that starts the job, e.g. `tools.tinyfish.agent.automation.runAsync`. */
@@ -42,13 +44,11 @@ export interface JobManifest {
     match?: "goalSuffix" | "goalExact";
     windowMinutes?: number;
   };
-  /** Template for the delivery dedupe key; `${row}` and `${id}` are substituted. */
-  dedupe?: string;
+  /** Concrete account baked into this manifest. The invocation's accountId wins. */
+  accountId?: string;
   poll?: { intervalSeconds?: number; backoff?: number[]; maxAttempts?: number };
   /** A job absent for this long is `unknown`, and silence is the correct answer. */
   graceMinutes?: number;
-  /** Internal: synthesized from ASYNC_JOB_TOOLS, handled by the battle-tested path. */
-  synthetic?: boolean;
 }
 
 /** The provider vocabulary most job APIs use, so a minimal manifest still works. */
@@ -142,13 +142,15 @@ export function jobState(manifest: JobManifest, value: unknown): JobState {
 }
 
 /** Substitutes `${id}`, `${goal}` and `${row}` in a template value. */
-export function applyTemplate(
+function applyTemplate(
   value: unknown,
   vars: Record<string, string | number | undefined>,
 ): unknown {
   if (typeof value === "string")
     return value.replace(/\$\{(\w+)\}/g, (whole, name: string) =>
-      vars[name] === undefined ? whole : String(vars[name]),
+      vars[name] === undefined || vars[name] === ""
+        ? whole
+        : String(vars[name]),
     );
   if (Array.isArray(value))
     return value.map((item) => applyTemplate(item, vars));
@@ -162,41 +164,83 @@ export function applyTemplate(
   return value;
 }
 
-/** The dedupe key of a delivery: stable for the same job, whatever re-sent it. */
-export function dedupeKey(
-  manifest: JobManifest,
-  row: number,
-  id: string | null,
-): string {
-  return applyTemplate(manifest.dedupe ?? "job:${row}:${id}", {
-    row,
-    id: id ?? "unknown",
-  }) as string;
-}
+export type ReadInput =
+  | {
+      ok: true;
+      input: { accountId: string; input: Record<string, unknown> };
+    }
+  | { ok: false; error: string };
 
 /**
- * The built-in job manifest for the official Executor v2 path. It is only usable when an
- * account id is configured, because every v2 job call is scoped to one account.
+ * Every v2 tool takes `{ accountId, input }`. Manifests may already say that,
+ * or only the inner `input` (`{ path }`, `{ query }`, `{ id, path }`).
+ * A missing account or a non-object `input` is a validation error, not a retry.
  */
+export function buildReadInput(
+  args: unknown,
+  vars: Record<string, string | number | undefined>,
+): ReadInput {
+  const rendered = applyTemplate(args ?? {}, vars);
+  const body = asRecord(rendered);
+  if (!body)
+    return {
+      ok: false,
+      error: "input: Expected object {accountId, input}",
+    };
+  let accountId =
+    typeof body.accountId === "string" ? body.accountId.trim() : "";
+  let input = asRecord(body.input);
+  if (!input) {
+    const inner = { ...body };
+    delete inner.accountId;
+    if (inner.path || inner.query || inner.id) input = inner;
+  }
+  if (!accountId) accountId = String(vars.accountId ?? "").trim();
+  if ("input" in body && !asRecord(body.input))
+    return {
+      ok: false,
+      error: "input: Expected object {accountId, input}",
+    };
+  if (!accountId || accountId.includes("${"))
+    return {
+      ok: false,
+      error: "accountId ausente na leitura",
+    };
+  if (!input)
+    return {
+      ok: false,
+      error: "input: Expected object {accountId, input}",
+    };
+  return { ok: true, input: { accountId, input } };
+}
+
+export const INSTABOX_CODE_TASK_TOOL = "internal.instabox.codeTask";
+
 export const BUILTIN: JobManifest[] = [
   {
     tool: "tools.tinyfish.agent.automation.runAsync",
-    dispatch: { mode: "immediate", idPath: "value.run_id" },
+    dispatch: { mode: "immediate", idPath: "run_id" },
     observe: {
       mode: "poll",
       tool: "tools.tinyfish.agent.runs.getRunById",
-      args: { input: { path: { id: "${id}" } } },
+      args: {
+        accountId: "${accountId}",
+        input: { path: { id: "${job_id}" } },
+      },
       statePath: "status",
       resultPath: "result",
       errorPath: "error",
     },
-    // The dispatch result does not survive an approval round-trip, so the job is found by
-    // the goal we sent: the provider stores it as a suffix of its own rewritten goal.
     reconcile: {
       tool: "tools.tinyfish.agent.runs.listRuns",
       args: {
+        accountId: "${accountId}",
         input: {
-          query: { goal: "${goal}", limit: 20, sort_direction: "desc" },
+          query: {
+            goal: "${goal}",
+            limit: 20,
+            sort_direction: "desc",
+          },
         },
       },
       match: "goalSuffix",
@@ -204,7 +248,6 @@ export const BUILTIN: JobManifest[] = [
     },
     poll: { intervalSeconds: 25, backoff: [25, 60, 150], maxAttempts: 3 },
     graceMinutes: 5,
-    dedupe: "job:${row}:${id}",
   },
 ];
 
@@ -212,13 +255,7 @@ function object(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-/** Warned once per process, not once per read. */
-let legacyWarned = false;
-
-/**
- * Parses `ASYNC_JOB_MANIFESTS` (a JSON array) and, for deployments that predate manifests,
- * synthesize an equivalent one per `ASYNC_JOB_TOOLS` path so nothing breaks.
- */
+/** Parses `ASYNC_JOB_MANIFESTS` (a JSON array) and adds the in-code app manifests. */
 export function loadManifests(
   env: Record<string, string | undefined> = process.env,
 ): JobManifest[] {
@@ -246,59 +283,39 @@ export function loadManifests(
         });
       }
   }
-  // v2 binds the account in the tool's own signature, so the built-in manifest needs no
-  // account id from the environment; EXECUTOR_ACCOUNT_ID only overrides it.
-  const account = (env.EXECUTOR_ACCOUNT_ID ?? "").trim();
-  // The built-in v2 manifest is harmless where v2 is not there: its tool never appears in
-  // a call, so no row is ever opened. That is why no version flag is needed.
   for (const manifest of BUILTIN) {
     if (manifests.some((entry) => entry.tool === manifest.tool)) continue;
-    manifests.push(
-      account
-        ? {
-            ...manifest,
-            observe: {
-              ...manifest.observe,
-              args: { ...manifest.observe.args, accountId: account },
-            },
-          }
-        : manifest,
-    );
+    manifests.push(manifest);
   }
 
-  const legacy = (env.ASYNC_JOB_TOOLS ?? "")
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-  if (legacy.length && !legacyWarned) {
-    legacyWarned = true;
-    // Deprecated: a path list can only describe the v1 shape of a job.
-    console.warn(
-      "Jobs assíncronos: ASYNC_JOB_TOOLS está obsoleto; descreva o job em ASYNC_JOB_MANIFESTS (remoção prevista para 2026-12-31).",
-    );
-  }
-  for (const path of legacy) {
-    if (manifests.some((manifest) => manifest.tool === path)) continue;
+  const instaboxMachineId = (env.INSTABOX_MACHINE_ID ?? "").trim();
+  if (
+    instaboxMachineId &&
+    !manifests.some((entry) => entry.tool === INSTABOX_CODE_TASK_TOOL)
+  ) {
+    const instaboxAccountId = (env.INSTABOX_ACCOUNT_ID ?? "").trim();
     manifests.push({
-      tool: path,
-      synthetic: true,
+      tool: INSTABOX_CODE_TASK_TOOL,
       dispatch: { mode: "immediate" },
-      // v1 shaped: the sibling `list_runs` reads runs, and a run that is absent is matched
-      // by goal once it appears.
       observe: {
-        mode: "reconcile",
-        tool: `${path.slice(0, path.lastIndexOf("."))}.list_runs`,
+        mode: "poll",
+        tool: "tools.instabox.machines.readFiles",
         args: {
-          created_after: "${since}",
-          created_before: "${now}",
-          sort_direction: "asc",
-          limit: 20,
+          accountId: instaboxAccountId || "${accountId}",
+          input: {
+            id: instaboxMachineId,
+            path: "/data/home/jobs/${id}/status.json",
+          },
         },
-        match: { goal: "${goal}" },
+        statePath: "state",
+        resultPath: "result",
+        errorPath: "error",
       },
-      poll: { intervalSeconds: undefined },
+      poll: { intervalSeconds: 20, backoff: [20, 30, 60], maxAttempts: 3 },
+      graceMinutes: 3,
     });
   }
+
   return manifests;
 }
 

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "entry": [
+    "src/healthcheck.ts",
+    "src/app-info.ts",
+    "src/providers.ts",
+    "src/settings.ts"
+  ],
+  "project": ["src/**/*.ts", "test/**/*.ts", "scripts/**/*.mjs"]
+}

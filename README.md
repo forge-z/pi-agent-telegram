@@ -12,7 +12,7 @@ The repository and container keep the `pi-agent-tg` name so existing volumes and
 
 **Executor** is the single tool endpoint. It turns any OpenAPI, MCP or GraphQL service into a tool behind one API key, so a mail account, a calendar, a repository or a sandbox appears to the assistant without this app holding those credentials. Every effectful call pauses for an approval card, and the ledger keeps what was decided.
 
-The supported Executor is **v2, the cloud build** (`https://mcp.executor.sh/mcp`). Pi-Agent targets it, and integrations are Executor apps. No version variable is needed: the v1 self-hosted adapter only exists for deployments that still list tools in `ASYNC_JOB_TOOLS`, and it is deprecated (removal 2026-12-31).
+The supported Executor is **v2, the cloud build** (`https://mcp.executor.sh/mcp`). Pi-Agent targets it, and integrations are Executor apps. Jobs are manifests (`ASYNC_JOB_MANIFESTS`) or the built-in TinyFish and Instabox ones. The read account comes from the dispatch. `ASYNC_JOB_TOOLS` and `EXECUTOR_ACCOUNT_ID` are not read.
 
 ## Create the Telegram bot
 
@@ -97,41 +97,43 @@ Audio is configured separately because a chat endpoint does not transcribe: Open
 
 Steve Jobs closed the 2010 iPad event with "there's an app for that" ([CBS](https://www.cbsnews.com/news/steve-jobs-at-the-heavenly-gates-theres-an-app-for-that/)). The modern version: before the assistant answers that it cannot do something, check whether an API or an MCP server already does it. Add it in [Executor](https://executor.sh) and it becomes a tool, with an approval card before anything is written.
 
-| Service                                | What it adds                                                                                                |
-| -------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| [AgentMail](https://www.agentmail.to)  | an inbox as a tool: receive, reply, send — 3 inboxes and 3,000 emails/month, no card                        |
-| [TinyFish](https://www.tinyfish.ai)    | web search and page fetch — free on every plan                                                              |
-| [Fish Audio](https://fish.audio)       | speech synthesis the assistant can call ([MCP](https://docs.fish.audio/overview/mcp)) — 8,000 credits/month |
-| [Firecrawl](https://www.firecrawl.dev) | crawl a whole site and extract it as clean text                                                             |
-| [Browser Use](https://browser-use.com) | a real browser for pages that need clicking, not just reading                                               |
-| [Cal.com](https://cal.com)             | scheduling: availability and bookings as tools                                                              |
-| [GitHub](https://github.com)           | repositories, issues and pull requests ([official MCP](https://github.com/github/github-mcp-server))        |
-| [Freestyle](https://www.freestyle.sh)  | a disposable sandbox with Docker and GPU when a job needs a machine                                         |
+| Service                                | What it adds                                                                                                                            |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| [AgentMail](https://www.agentmail.to)  | an inbox as a tool: receive, reply, send — 3 inboxes and 3,000 emails/month, no card                                                    |
+| [Browser Use](https://browser-use.com) | a real browser for pages that need clicking, not just reading                                                                           |
+| [Cal.com](https://cal.com)             | scheduling: availability and bookings as tools                                                                                          |
+| [Firecrawl](https://www.firecrawl.dev) | crawl a whole site and extract it as clean text                                                                                         |
+| [Fish Audio](https://fish.audio)       | speech synthesis the assistant can call ([MCP](https://docs.fish.audio/overview/mcp)) — 8,000 credits/month                             |
+| [GitHub](https://github.com)           | repositories, issues and pull requests ([official MCP](https://github.com/github/github-mcp-server))                                    |
+| [Instabox](https://instabox.sh)        | a Linux sandbox as a tool: real shell, browser and persistent disk — run code, build and publish artifacts; 5 machines on the free plan |
+| [TinyFish](https://www.tinyfish.ai)    | web search and page fetch — free on every plan                                                                                          |
 
 Roughly in the order a personal assistant needs them: mail, web, voice, then scraping, browsing, calendar, code and compute. Voice here means the _agent_ producing audio as a tool result: the bot still answers in text, and a Telegram voice bubble is not implemented.
 
 ## What it does
 
 - **Text** — the default; no prefix, no ceremony.
+- **Automatic steer** — messages sent while a turn is in progress are injected as steer (after the current tool round) without opening a new turn; /stop cancels.
 - **Images** — a model that reads them receives the picture itself; a text-only model gets a description from `VISION_MODEL`.
 - **Voice notes** — transcribed into the turn text; the audio never enters the model context or the history.
 - **Origin is explicit** — a converted message arrives as `[áudio transcrito · {"origin":"audio","model":"whisper-1"}]`, so the model never confuses a transcription with something you typed. A failed transcription is admitted with the reason instead of disappearing.
 - **Schedules** — create a cron in the chat; scheduled runs never approve anything and never create new schedules. Any schedule can also be fired on demand — **Rodar agora** in `/crons`, or `tasks_run_now` for the model — through the same pipeline and the same delivery, without moving the next run.
-- **Async jobs by manifest** — each job declares how it is dispatched, watched and read; the core only knows state, queue, dedupe and delivery. The official Executor path is built in and needs no configuration. `ASYNC_JOB_TOOLS` (v1) still works and is deprecated (removal 2026-12-31). Reference: [docs/jobs.md](docs/jobs.md).
+- **Async jobs by manifest** — each job declares how it is dispatched, watched and read; the core only knows state, queue, dedupe and delivery. The official Executor path is built in and needs no configuration. Sandbox code tasks on Instabox (`instabox_code_task`) run agents in the background and report via status polling. Reference: [docs/jobs.md](docs/jobs.md).
 - **Container clock** — `TZ` (e.g. `America/Sao_Paulo`) moves log timestamps only; schedules keep their own IANA timezone and never shift.
 - **Approvals** — every effectful tool call becomes a card with Approve, Deny and Edit; the result is recorded before it is delivered.
 
 ## Commands
 
-| Command     | What it does                                                       |
-| ----------- | ------------------------------------------------------------------ |
-| `/status`   | the three models in use, effort, MCP servers and version           |
-| `/reload`   | start a new conversation in this chat; the old history stays saved |
-| `/model`    | provider and model for this conversation                           |
-| `/thinking` | effort for this conversation                                       |
-| `/crons`    | create and manage schedules                                        |
-| `/stop`     | cancel what is running in this topic                               |
-| `/help`     | the same list, in the chat                                         |
+| Command      | What it does                                                          |
+| ------------ | --------------------------------------------------------------------- |
+| `/status`    | the three models in use, effort, MCP servers and version              |
+| `/reload`    | reload this conversation and clear uncertain MCP flags (history kept) |
+| `/destravar` | same as `/reload` when the conversation is stuck on uncertain MCP     |
+| `/model`     | provider and model for this conversation                              |
+| `/thinking`  | effort for this conversation                                          |
+| `/crons`     | create and manage schedules                                           |
+| `/stop`      | cancel what is running in this topic                                  |
+| `/help`      | the same list, in the chat                                            |
 
 ## Limits worth knowing
 

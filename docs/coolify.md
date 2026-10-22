@@ -5,7 +5,7 @@ runtime, nunca argumento de build.
 
 ## Pré-requisitos
 
-- Repositório `https://github.com/forge-z/pi-agent-tg`, branch `main`.
+- Repositório `https://github.com/forge-z/pi-agent-telegram`, branch `main`.
 - Docker Engine + Compose v2.24+ (amd64 ou arm64).
 - Um bot Telegram dedicado, sem webhook ativo e sem segundo consumidor de polling.
 
@@ -41,7 +41,7 @@ Faça isso uma vez, fora do Coolify, para não descobrir erro de configuração 
 
 ## 1. Criar o recurso
 
-- **New Resource → Docker Compose**, apontando para `forge-z/pi-agent-tg` na branch `main`.
+- **New Resource → Docker Compose**, apontando para `forge-z/pi-agent-telegram` na branch `main`.
 - **Docker Compose Location**: `docker-compose.yml` (raiz do repositório).
 - O serviço se chama `pi-agent-tg`.
 - **Não** configure domínio, porta ou proxy reverso. O processo usa long polling e o
@@ -49,43 +49,68 @@ Faça isso uma vez, fora do Coolify, para não descobrir erro de configuração 
 
 ## 2. Variáveis de runtime
 
-Obrigatórias para o container subir saudável:
+### Obrigatórias (declaradas em `docker-compose.yml`)
 
-- `TELEGRAM_BOT_TOKEN` — token do bot, apenas no servidor.
-- `TELEGRAM_ALLOWED_USERS` — user IDs numéricos que controlam o bot.
-- `LLM_BASE_URL` — endpoint OpenAI-compatible do provedor.
-- `LLM_API_KEY` — chave crua desse endpoint (a aplicação não usa prefixo `Bearer`).
-- `EXECUTOR_MCP_URL` + `EXECUTOR_TOKEN` — em par. Sem o token, o MCP não é registrado
-  (o bot sobe, mas as ferramentas MCP ficam indisponíveis).
+Apenas duas variáveis são estritamente obrigatórias para o container subir saudável:
 
-Opcionais: `TELEGRAM_ALLOWED_CHATS` (grupos/supergrupos, IDs negativos), `LLM_MODELS`,
-`MCP_SERVERS_JSON`, `MCP_CONFIG_FILE` e as variantes `NAME_FILE`.
+- `TELEGRAM_BOT_TOKEN` — token do bot Telegram (gerado via @BotFather).
+- `TELEGRAM_ALLOWED_USERS` — user IDs numéricos de quem tem permissão para usar o bot.
+
+No `docker-compose.yml`, ambas usam a sintaxe `${VAR:?}`. De acordo com a documentação oficial do Coolify (seção _Docker Compose → Environment Variables_):
+
+- O Coolify lê o Compose e cria automaticamente no painel (aba **Environment Variables**) cada variável declarada com `${VAR}`.
+- O sufixo `:?` marca a variável como obrigatória: o Coolify a destaca na interface caso esteja vazia e bloqueia o deploy até que receba um valor válido.
+
+### Opcionais (adicionadas manualmente no painel do Coolify)
+
+Todas as demais variáveis são opcionais e **não** estão declaradas no bloco `environment:` do Compose:
+
+- `LLM_BASE_URL` e `LLM_API_KEY`: opcionais se você configurar o provedor pelo terminal via `npm run setup` (a escolha fica gravada no banco SQLite do volume persistente). Definir aqui atua como override declarativo.
+- `EXECUTOR_MCP_URL` e `EXECUTOR_TOKEN`: opcionais (em par). Sem elas, o bot sobe normalmente, apenas sem ferramentas externas MCP.
+- `TELEGRAM_ALLOWED_CHATS`: opcional (IDs negativos de grupos/supergrupos; por padrão copia `TELEGRAM_ALLOWED_USERS` para DMs).
+- `TZ`: opcional (fuso do relógio do container para logs, ex.: `America/Sao_Paulo`; omitido usa UTC). Agendamentos gravam seu próprio timezone IANA.
+- `LLM_MODELS`, `LLM_INPUT`, `VISION_*`, `AUDIO_*`, `ASYNC_JOB_*`, `INSTABOX_*`: opcionais para recursos específicos. A referência completa com exemplos está em [.env.example](.env.example).
 
 A única forma de o assistente alcançar algo fora da conversa é MCP: ele não tem shell,
 arquivo, patch nem browser, e não enxerga o host, o volume ou o código-fonte.
 [Executor](https://executor.sh) é a forma preferida de expor todos os MCPs num único
 endpoint autenticado — um `EXECUTOR_MCP_URL` + `EXECUTOR_TOKEN` já cobre toda a
 superfície de ferramentas. `NODE_ENV`, `DATA_DIR` e o SHA do commit não são
-configuração: dois são fixados pela imagem e o SHA é injetado pela plataforma.
+configuração: dois são fixados pela imagem (`Dockerfile`) e o SHA é injetado pela plataforma.
 
 Não existem mais variáveis de modelo: `MODEL_PROVIDER` e `MODEL_ID` saíram, e as chaves
 por provedor (`OPENAI_*`, `ANTHROPIC_*`, `DEEPSEEK_*`, `AI_PROVIDERS_JSON`) foram
 substituídas pelo par `LLM_*`.
 
-### `environment:` do compose e o `env_file`
+### Como as opcionais chegam ao container (`env_file`)
 
-O `docker-compose.yml` repassa explicitamente ao container apenas
-`TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `SOURCE_COMMIT`, `LLM_BASE_URL`,
-`LLM_API_KEY`, `LLM_MODELS`, `LLM_INPUT`, `VISION_MODE`, `VISION_MODEL`,
-`VISION_BASE_URL`, `VISION_API_KEY`, `AUDIO_MODEL`, `AUDIO_API`, `AUDIO_BASE_URL`,
-`AUDIO_API_KEY`, `AUDIO_LANGUAGE`, `EXECUTOR_TOKEN` e `EXECUTOR_MCP_URL` (além de
-`NODE_ENV` e `DATA_DIR`, fixados no arquivo). Em branco significam "não configurado":
-o bot sobe sem visão e sem áudio e responde explicando o que falta.
+No Coolify, **qualquer variável declarada no `docker-compose.yml` fica travada no painel e não pode ser apagada pela interface** (gerando o erro _"Please remove it from the Docker Compose file first"_).
 
-As demais variáveis chegam ao processo pelo `env_file: .env`, opcional e relativo ao
-diretório do compose. O Coolify normalmente materializa as variáveis do painel nesse
-`.env`; confirme no servidor com `cat .env` dentro do diretório de deploy. Se o arquivo
-não existir, acrescente as variáveis extras ao bloco `environment:`.
+Para resolver isso e manter o painel limpo:
+
+1. O `docker-compose.yml` mantém apenas as obrigatórias sob `environment:`.
+2. O Compose inclui:
+   ```yaml
+   env_file:
+     - path: .env
+       required: false
+   ```
+3. O Coolify gera automaticamente um arquivo `.env` no diretório de deploy contendo todas as variáveis configuradas na aba **Environment Variables** (inclusive as criadas manualmente).
+4. O Compose repassa esse `.env` ao container via `env_file`. Portanto, para usar qualquer opcional (como `TZ`, `EXECUTOR_MCP_URL` ou `LLM_BASE_URL`), basta criá-la manualmente na aba **Environment Variables** do Coolify — ela será gravada no `.env` e carregada pelo container sem precisar estar declarada no Compose.
+
+### Passo de limpeza pós-migração
+
+Se o seu deploy no Coolify foi criado antes desta alteração, o painel manteve cadastradas variáveis que antes constavam no Compose (`ASYNC_JOB_TOOLS`, `EXECUTOR_MCP_URL`, `EXECUTOR_TOKEN`, `TZ`, `ASYNC_JOB_TIMEOUT_MIN`, `ASYNC_JOB_POLL_SECONDS`).
+
+Depois de atualizar o repositório e fazer o deploy desta versão:
+
+- O Coolify destrava a remoção dessas variáveis no painel porque elas não constam mais no `docker-compose.yml`.
+- **Apague no painel** as variáveis que o bot não lê mais: `ASYNC_JOB_TOOLS` e `EXECUTOR_ACCOUNT_ID`. A conta da leitura vem da chamada que criou o job. Não há migração manual; a coluna `pending_jobs.account_id` é criada no boot.
+- Variáveis opcionais que você realmente usa (ex.: `EXECUTOR_TOKEN`, `EXECUTOR_MCP_URL`, `TZ`) podem permanecer no painel: elas continuarão chegando ao container normalmente via `.env`.
+
+### Variáveis fixas da imagem
+
+`NODE_ENV=production` e `DATA_DIR=/app/data` são fixadas na imagem pelo `Dockerfile` (instrução `ENV`). Não precisam e não devem ser configuradas no painel. O `SOURCE_COMMIT` é injetado pelo próprio Coolify em runtime.
 
 ### Catálogo de modelos e reasoning
 

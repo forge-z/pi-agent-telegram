@@ -17,6 +17,7 @@ import {
 } from "../src/runtime.js";
 import { Store } from "../src/store.js";
 import { TaskError, Tasks } from "../src/tasks.js";
+import { Telegram } from "../src/telegram.js";
 import {
   queueTaskTelegram,
   taskTelegramAuthorized,
@@ -508,7 +509,7 @@ test("a scheduled run posts nothing when the answer is only the silence sentinel
   const tasks = new Tasks(app, () => epoch);
   try {
     const conversationId = await app.create();
-    authorizeTaskConversation(app.store, conversationId, 11);
+    authorizeTaskConversation(app.store, conversationId, 11, app);
     const task = await tasks.create({
       ...cron,
       conversationId,
@@ -555,7 +556,7 @@ test("delivery none stops posting and the execution log stays queryable", async 
   const tasks = new Tasks(app, () => epoch);
   try {
     const conversationId = await app.create();
-    authorizeTaskConversation(app.store, conversationId, 11);
+    authorizeTaskConversation(app.store, conversationId, 11, app);
     const task = await tasks.create({
       ...cron,
       conversationId,
@@ -630,7 +631,7 @@ test("three consecutive scheduled occurrences in one conversation all answer, wi
   const tasks = new Tasks(app, () => now);
   try {
     const conversationId = await app.create();
-    authorizeTaskConversation(app.store, conversationId, 11);
+    authorizeTaskConversation(app.store, conversationId, 11, app);
     const task = await tasks.create({
       ...cron,
       prompt: "Responda apenas: ping",
@@ -727,7 +728,7 @@ test("a turn that ends without an answer tells the chat why instead of staying s
   const app = await Runtime.open({ dir, models, gateway });
   try {
     const conversationId = await app.create();
-    authorizeTaskConversation(app.store, conversationId, 11);
+    authorizeTaskConversation(app.store, conversationId, 11, app);
     await app.admit(conversationId, "telegram:1", "oi", {
       source: "telegram",
       chat: "42",
@@ -1165,6 +1166,7 @@ function authorizeTaskConversation(
   store: Store,
   conversationId: string,
   thread = 11,
+  app?: Runtime,
 ) {
   store.run(
     "INSERT OR REPLACE INTO credentials VALUES ('telegram:bot',?)",
@@ -1199,6 +1201,23 @@ function authorizeTaskConversation(
       conversationId,
     }),
   );
+  if (app) {
+    const transport = {
+      send: async () => ({ message_id: 1 }),
+    };
+    const telegram = new Telegram(
+      app,
+      transport,
+      ["42"],
+      ["42"],
+      "test_pi_bot",
+      true,
+      123,
+    );
+    app.flushTelegramPending = async () => {
+      await telegram.flush();
+    };
+  }
 }
 
 test("trusted Telegram origin defaults to a frozen mirror route and rejects a different conversation", async () => {
@@ -2183,6 +2202,56 @@ test("inFlight tells a run apart from an idle conversation", async () => {
     f.finish();
     await f.tasks.tick();
     assert.equal(f.tasks.inFlight(task.conversationId), false);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a stale in-flight run times out once and alerts the destination", async () => {
+  const f = await fixture();
+  const prev = process.env.TASK_RUN_TIMEOUT_MIN;
+  process.env.TASK_RUN_TIMEOUT_MIN = "0.001";
+  try {
+    const task = await f.tasks.create(cron);
+    await f.tasks.runNow(task.id);
+    f.time = epoch + 120_000;
+    await f.tasks.tick();
+    const run = f.tasks.runs(task.id)[0];
+    assert.equal(run.state, "failed");
+    assert.equal(run.status, "erro");
+    assert.match(run.summary!, /expirou/i);
+    assert.equal(
+      f.store.all("SELECT * FROM task_notifications").length,
+      1,
+      "alerta único",
+    );
+    f.time = epoch + 240_000;
+    await f.tasks.tick();
+    assert.equal(
+      f.store.all("SELECT * FROM task_notifications").length,
+      1,
+      "sem alerta duplicado",
+    );
+  } finally {
+    if (prev === undefined) delete process.env.TASK_RUN_TIMEOUT_MIN;
+    else process.env.TASK_RUN_TIMEOUT_MIN = prev;
+    await f.close();
+  }
+});
+
+test("only one scheduled run dispatches per conversation at a time", async () => {
+  const f = await fixture();
+  try {
+    const conversationId = await f.runtime.create();
+    const a = await f.tasks.create({ ...cron, conversationId, title: "A" });
+    const b = await f.tasks.create({ ...cron, conversationId, title: "B" });
+    await f.tasks.runNow(a.id);
+    assert.equal(f.submits, 1);
+    await f.tasks.runNow(b.id);
+    assert.equal(f.submits, 1, "não empilha dois dispatches na mesma conversa");
+    f.finish();
+    await f.tasks.tick();
+    assert.equal(f.submits, 2, "o segundo agenda após o primeiro terminar");
   } finally {
     await f.close();
   }
