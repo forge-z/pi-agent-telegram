@@ -16,10 +16,18 @@ import {
   type TelegramReplyMarkup,
 } from "./telegram-controls.js";
 import {
+  formatReplyInput,
+  outboundAuthor,
+  rememberTelegramMessage,
+  sentMessageId,
+  telegramAuthor,
+} from "./telegram-reply.js";
+import {
   TelegramTyping,
   type TelegramTypingOptions,
 } from "./telegram-typing.js";
 import { logFailure } from "./log.js";
+import { MAX_TEXT } from "./limits.js";
 import {
   ConversationBusyError,
   ConversationError,
@@ -68,7 +76,13 @@ export interface TelegramUpdate {
     message_id: number;
     date?: number;
     message_thread_id?: number;
-    reply_to_message?: { message_id: number; from?: { id: number } };
+    reply_to_message?: {
+      message_id: number;
+      text?: string;
+      caption?: string;
+      from?: { id: number; is_bot?: boolean };
+    };
+    quote?: { text?: string };
     is_topic_message?: boolean;
     forum_topic_created?: { name: string; is_name_implicit?: boolean };
     forum_topic_edited?: { name?: string };
@@ -234,6 +248,8 @@ export interface TelegramTransport {
       messageThreadId?: number;
       replyMarkup?: TelegramReplyMarkup;
       forceReply?: boolean;
+      /** Reply to this message_id. The chat and topic stay the caller's. */
+      replyTo?: number;
     },
   ): Promise<unknown>;
 }
@@ -318,6 +334,7 @@ export class TelegramHttp implements TelegramTransport {
       messageThreadId?: number;
       replyMarkup?: TelegramReplyMarkup;
       forceReply?: boolean;
+      replyTo?: number;
     },
   ) {
     const response = await fetch(
@@ -338,6 +355,14 @@ export class TelegramHttp implements TelegramTransport {
           ...(options?.messageThreadId === undefined
             ? {}
             : { message_thread_id: options.messageThreadId }),
+          ...(options?.replyTo
+            ? {
+                reply_parameters: {
+                  message_id: options.replyTo,
+                  allow_sending_without_reply: true,
+                },
+              }
+            : {}),
         }),
         signal: AbortSignal.timeout(15000),
       },
@@ -1245,6 +1270,7 @@ export class Telegram {
       update.update_id,
       image,
       voice,
+      update.message,
     );
     this.app.store.run(
       "INSERT OR IGNORE INTO meta VALUES (?,?)",
@@ -1259,6 +1285,7 @@ export class Telegram {
     updateId: number,
     image?: ImageRef,
     voice?: VoiceRef,
+    incoming?: TelegramUpdate["message"],
   ) {
     let id: string;
     try {
@@ -1353,6 +1380,13 @@ export class Telegram {
           ].join("\n"),
         );
         queueMcpChecks(this.app, owner, id, updateId);
+      } else if (text === "/retomar") {
+        const resumed = await this.app.resumeParked(id);
+        reply(
+          resumed.length
+            ? `Retomei ${resumed.map((task) => `${task.kind} #${task.id}`).join(", ")}.`
+            : "Nenhuma tarefa estacionada nesta conversa.",
+        );
       } else if (text === "/reload" || text === "/destravar") {
         // Reloading keeps the conversation: what blocks it is the pending decision,
         // not the history.
@@ -1364,7 +1398,7 @@ export class Telegram {
         );
       } else if (text === "/help" || text === "/start")
         reply(
-          "/model — provedor e modelo\n/thinking — esforço\n/crons — criar e gerenciar agendamentos\n/stop — interromper este tópico\n/status — estado\n/reload — recarregar esta conversa e dispensar resultado MCP incerto\n/destravar — o mesmo, quando a conversa está travada\n/help — ajuda\nCada tópico nativo tem histórico próprio. Crie tópicos no Telegram. Escolhas de modelo persistem após reinício. Compactação automática usa o modelo e esforço ativos.",
+          "/model — provedor e modelo\n/thinking — esforço\n/crons — criar e gerenciar agendamentos\n/stop — interromper este tópico\n/status — estado\n/reload — recarregar esta conversa e dispensar resultado MCP incerto\n/destravar — o mesmo, quando a conversa está travada\n/retomar — executar de novo uma tarefa estacionada por quedas seguidas\n/help — ajuda\nCada tópico nativo tem histórico próprio. Crie tópicos no Telegram. Escolhas de modelo persistem após reinício. Compactação automática usa o modelo e esforço ativos.",
         );
       else if (
         text.startsWith("/") &&
@@ -1396,11 +1430,44 @@ export class Telegram {
         }
         const picture = image ? await this.pictureTurn(image, text) : undefined;
         const spoken = voice ? await this.transcribeVoice(voice) : undefined;
+        const body = spoken?.text ?? picture?.text ?? text;
+        if (incoming && Number.isSafeInteger(incoming.message_id)) {
+          rememberTelegramMessage(
+            this.app.store,
+            owner.chat,
+            incoming.message_id,
+            "usuário",
+            incoming.text ?? incoming.caption ?? body,
+          );
+          const replied = incoming.reply_to_message;
+          if (replied && Number.isSafeInteger(replied.message_id))
+            rememberTelegramMessage(
+              this.app.store,
+              owner.chat,
+              replied.message_id,
+              telegramAuthor(replied.from, this.botId),
+              replied.text ?? replied.caption ?? "",
+            );
+        }
+        const commandTurn = text.startsWith("/") && !text.startsWith("//");
+        const prefix =
+          commandTurn || !incoming
+            ? ""
+            : formatReplyInput(
+                this.app.store,
+                owner.chat,
+                incoming,
+                this.botId,
+              );
+        const admitted =
+          prefix && prefix.length + body.length <= MAX_TEXT
+            ? `${prefix}${body}`
+            : body;
         // Typed text keeps no prefix; a specialist's output carries its origin.
         await this.app.admit(
           id,
           `telegram:${updateId}`,
-          spoken?.text ?? picture?.text ?? text,
+          admitted,
           { source: "telegram", ...owner },
           picture?.images,
         );
@@ -1766,34 +1833,64 @@ export class Telegram {
           `telegram:force-reply:${delivery.id}`,
         );
         let result: unknown;
+        const sendOptions = {
+          ...(replyMarkup ? { replyMarkup } : {}),
+          ...(forceReply ? { forceReply } : {}),
+          ...(delivery.parseMode === "HTML"
+            ? { parseMode: "HTML" as const }
+            : {}),
+          ...(delivery.messageThreadId == null
+            ? {}
+            : { messageThreadId: delivery.messageThreadId }),
+          ...(delivery.replyTo == null ? {} : { replyTo: delivery.replyTo }),
+        };
+        const hasOptions = Object.keys(sendOptions).length > 0;
         // A reply may carry only a file; empty text is not sent at all.
-        if (delivery.text)
-          result = await this.transport.send(
-            delivery.chat,
-            this.app.options.redact?.(delivery.text) ?? delivery.text,
-            delivery.messageThreadId == null &&
-              delivery.parseMode !== "HTML" &&
-              !replyMarkup &&
-              !forceReply
-              ? undefined
-              : {
-                  ...(replyMarkup ? { replyMarkup } : {}),
-                  ...(forceReply ? { forceReply } : {}),
-                  ...(delivery.parseMode === "HTML"
-                    ? { parseMode: "HTML" as const }
-                    : {}),
-                  ...(delivery.messageThreadId == null
-                    ? {}
-                    : { messageThreadId: delivery.messageThreadId }),
-                },
-          );
+        if (delivery.text) {
+          const payload =
+            this.app.options.redact?.(delivery.text) ?? delivery.text;
+          try {
+            result = await this.transport.send(
+              delivery.chat,
+              payload,
+              hasOptions ? sendOptions : undefined,
+            );
+          } catch (error) {
+            // A deleted or missing reply target must not drop the message.
+            // The chat and topic stay the ones already on the delivery.
+            if (
+              sendOptions.replyTo &&
+              error instanceof TelegramSendRefused &&
+              error.code !== 429
+            ) {
+              console.log(
+                `Pi-Agent: replyTo=${sendOptions.replyTo} recusado pelo Telegram; enviando sem reply.`,
+              );
+              const rest = { ...sendOptions };
+              delete rest.replyTo;
+              result = await this.transport.send(
+                delivery.chat,
+                payload,
+                Object.keys(rest).length ? rest : undefined,
+              );
+            } else throw error;
+          }
+        }
         // The text is already delivered: a failed upload is recorded, never fatal.
         const media = await this.sendMedia(delivery);
+        const stored = media ? { sent: result, media } : result;
+        const messageId = sentMessageId(stored);
+        if (messageId)
+          rememberTelegramMessage(
+            this.app.store,
+            delivery.chat,
+            messageId,
+            outboundAuthor(this.app.store, delivery.id),
+            delivery.text,
+          );
         this.app.store.run(
           "UPDATE deliveries SET state='sent',result=? WHERE id=?",
-          media
-            ? JSON.stringify({ sent: result, media })
-            : JSON.stringify(result),
+          JSON.stringify(stored),
           delivery.id,
         );
       } catch (error) {

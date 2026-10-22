@@ -8,14 +8,15 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import {
   fauxProvider,
   fauxAssistantMessage,
+  fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux";
 import { Runtime } from "../src/runtime.js";
 import {
-  isNullAcknowledgement,
+  isBlankMessage,
   taskOccurrenceDelivered,
 } from "../src/task-telegram.js";
 import { Tasks } from "../src/tasks.js";
-import { Telegram } from "../src/telegram.js";
+import { Telegram, TelegramSendRefused } from "../src/telegram.js";
 import { Store, type Delivery } from "../src/store.js";
 
 const epoch = Date.parse("2026-10-08T12:00:00Z");
@@ -26,10 +27,26 @@ const connection = {
   chatId: "42",
   conversationId: "",
 };
-async function fixture(answer = "**Resultado do cron**", linked = true) {
+/** A scheduled answer reaches Telegram only when the model calls notify. */
+function speaking(text: string) {
+  return [
+    fauxAssistantMessage([fauxToolCall("notify", { text })], {
+      stopReason: "toolUse" as const,
+    }),
+    fauxAssistantMessage(text),
+  ];
+}
+async function fixture(
+  answer = "**Resultado do cron**",
+  linked = true,
+  deliver = true,
+  thread?: number,
+) {
   const dir = await mkdtemp(join(tmpdir(), "pi-task-telegram-"));
   const faux = fauxProvider();
-  faux.setResponses([fauxAssistantMessage(answer)]);
+  faux.setResponses(
+    deliver ? speaking(answer) : [fauxAssistantMessage(answer)],
+  );
   const models = createModels();
   models.setProvider(faux.provider);
   const options = {
@@ -47,6 +64,12 @@ async function fixture(answer = "**Resultado do cron**", linked = true) {
     JSON.stringify({ token: "123456:fake-local-only", botId: 123456 }),
   );
   if (linked) {
+    if (thread)
+      app.store.run(
+        "INSERT INTO telegram_topic_conversations VALUES (?,?)",
+        id,
+        thread,
+      );
     app.store.run("INSERT INTO telegram VALUES (?,?,?)", "42", id, "42");
     app.store.run("INSERT INTO telegram_grants VALUES (?,?,?)", "42", "42", id);
     app.store.run(
@@ -65,13 +88,29 @@ async function fixture(answer = "**Resultado do cron**", linked = true) {
     delivery: linked ? "web_telegram" : "web",
   });
   const task = tasks.get(createdTask.id)!;
-  const sent: Array<{ chat: string; text: string }> = [];
+  const sent: Array<{
+    chat: string;
+    text: string;
+    replyTo?: number;
+    thread?: number;
+  }> = [];
   let uncertain = false;
+  let refuseReply = false;
   const transport = {
-    send: async (chat: string, text: string) => {
-      sent.push({ chat, text });
+    send: async (
+      chat: string,
+      text: string,
+      options?: { replyTo?: number; messageThreadId?: number },
+    ) => {
+      if (options?.replyTo && refuseReply) throw new TelegramSendRefused(400);
+      sent.push({
+        chat,
+        text,
+        replyTo: options?.replyTo,
+        thread: options?.messageThreadId,
+      });
       if (uncertain) throw new Error("mock result unknown");
-      return { message_id: sent.length };
+      return { message_id: 700 + sent.length };
     },
   };
   const engine = (
@@ -118,6 +157,9 @@ async function fixture(answer = "**Resultado do cron**", linked = true) {
     },
     set uncertain(value: boolean) {
       uncertain = value;
+    },
+    set refuseReply(value: boolean) {
+      refuseReply = value;
     },
     set time(value: number) {
       now = value;
@@ -179,7 +221,7 @@ test("completed cron queues one Telegram result and retry/restart never duplicat
     await f.tasks.tick();
     await f.engine().flush();
     assert.equal(f.sent.length, 1);
-    assert.equal(f.faux.state.callCount, 1);
+    assert.equal(f.faux.state.callCount, 2);
     assert.equal(f.tasks.runs(f.task.id).length, 1);
     assert.equal(f.app.store.all("SELECT * FROM requests").length, 1);
     assert.equal(f.app.store.all("SELECT * FROM deliveries").length, 1);
@@ -254,7 +296,7 @@ test("a terminal task answer beyond the first thousand history entries is delive
     await f.engine().flush();
     assert.equal(f.sent.length, 1);
     assert.match(f.sent[0]!.text, /Resposta final depois do histórico extenso/);
-    assert.equal(f.faux.state.callCount, 1);
+    assert.equal(f.faux.state.callCount, 2);
   } finally {
     await f.close();
   }
@@ -451,7 +493,7 @@ test("an uncertain cron Telegram send is never retried or reformatted after rest
     f.uncertain = false;
     await f.engine().flush();
     assert.equal(f.sent.length, 1);
-    assert.equal(f.faux.state.callCount, 1);
+    assert.equal(f.faux.state.callCount, 2);
   } finally {
     await f.close();
   }
@@ -465,7 +507,7 @@ test("a completed cron with an unsent outbox survives restart and concurrent flu
     const telegram = f.engine();
     await Promise.all([telegram.flush(), telegram.flush(), f.tasks.tick()]);
     assert.equal(f.sent.length, 1);
-    assert.equal(f.faux.state.callCount, 1);
+    assert.equal(f.faux.state.callCount, 2);
     assert.equal(f.tasks.runs(f.task.id)[0]?.requestId, run.requestId);
     assert.equal(
       f.app.store.get<Delivery>("SELECT * FROM deliveries")?.state,
@@ -635,7 +677,7 @@ test("each long-message part rechecks authorization and revocation cancels the r
   }
 });
 
-test("terminal notification and request receipt roll back together; restart queues the persisted answer without a new model call", async () => {
+test("a failed request settlement keeps the notify already queued and restart does not send it again", async () => {
   const f = await fixture();
   try {
     f.deferTaskFlush = true;
@@ -651,8 +693,8 @@ test("terminal notification and request receipt roll back together; restart queu
         ?.status,
       "pending",
     );
-    assert.equal(f.app.store.all("SELECT * FROM task_notifications").length, 0);
-    assert.equal(f.app.store.all("SELECT * FROM deliveries").length, 0);
+    // notify commits before settlement. The rolled-back receipt does not drop it.
+    assert.equal(f.app.store.all("SELECT * FROM deliveries").length, 1);
     const submission = f.app.store.get<{ submissionId: number }>(
       "SELECT submissionId FROM requests",
     )!.submissionId;
@@ -673,14 +715,14 @@ test("terminal notification and request receipt roll back together; restart queu
     );
     await f.engine().flush();
     assert.equal(f.sent.length, 1);
-    assert.equal(f.faux.state.callCount, 1);
+    assert.equal(f.faux.state.callCount, 2);
     assert.equal(
       f.app.store.get<{ submissionId: number }>(
         "SELECT submissionId FROM requests",
       )?.submissionId,
       submission,
     );
-    assert.equal(f.app.store.all("SELECT * FROM task_notifications").length, 1);
+    assert.equal(f.app.store.all("SELECT * FROM deliveries").length, 1);
   } finally {
     await f.close();
   }
@@ -717,13 +759,13 @@ test(
       )!.submissionId;
       assert.equal(f.app.store.all("SELECT * FROM deliveries").length, 0);
       const resumed = fauxProvider();
-      resumed.setResponses([fauxAssistantMessage("Resultado retomado")]);
+      resumed.setResponses(speaking("Resultado retomado"));
       await f.reopen(() => f.models.setProvider(resumed.provider));
       await f.run();
       await f.engine().flush();
       assert.equal(f.sent.length, 1);
       assert.match(f.sent[0]!.text, /Resultado retomado/);
-      assert.equal(resumed.state.callCount, 1);
+      assert.equal(resumed.state.callCount, 2);
       assert.equal(f.app.store.all("SELECT * FROM requests").length, 1);
       assert.equal(
         f.app.store.get<{ submissionId: number }>(
@@ -822,9 +864,20 @@ test("a manual run respects delivery=none and posts nothing", async () => {
   }
 });
 
-test("a scheduled run that produced nothing sends nothing", async () => {
-  for (const answer of ["", "   \n\t ", "\u200b", "\ufeff\u200c\u200d\u200b"]) {
-    const f = await fixture(answer);
+test("a scheduled run that does not call notify sends nothing and logs the final text", async () => {
+  const answers = [
+    "Nada nas duas caixas.",
+    "Fila vazia",
+    "",
+    "\u200b\u200c\u200d\ufeff",
+  ];
+  for (const answer of answers) {
+    const f = await fixture(answer, true, false);
+    const lines: string[] = [];
+    const log = console.log;
+    console.log = (...parts: unknown[]) => {
+      lines.push(parts.map(String).join(" "));
+    };
     try {
       f.tasks.setDelivery(f.task.id, "web_telegram");
       const run = await f.run();
@@ -836,81 +889,218 @@ test("a scheduled run that produced nothing sends nothing", async () => {
         "nenhuma entrega registrada",
       );
       assert.equal(run.status, "silencioso", JSON.stringify(answer));
+      const logged = lines.find((line) => line.includes("run agendado"));
+      assert.ok(logged, JSON.stringify(lines));
+      assert.match(logged!, new RegExp(`id=${f.task.id}`));
+      assert.match(logged!, /notify=não/);
+      const flat = answer.replace(/\s+/g, " ").trim();
+      if (flat)
+        assert.match(
+          logged!,
+          new RegExp(flat.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        );
     } finally {
+      console.log = log;
       await f.close();
     }
   }
 });
 
-test("an invisible mark beside real text still delivers the text", async () => {
-  const f = await fixture("\u200b Resumo corporativo: 3 caixas sem novidade.");
+test("notify with real text posts to the schedule chat and topic", async () => {
+  const f = await fixture("Alerta real: 2 caixas novas.", true, true, 9);
   try {
-    f.tasks.setDelivery(f.task.id, "web_telegram");
-    await f.run();
+    const run = await f.run();
     await f.engine().flush();
     assert.equal(f.sent.length, 1);
-    assert.match(f.sent[0]!.text, /Resumo corporativo/);
-    assert.match(f.sent[0]!.text, /3 caixas sem novidade/);
+    assert.equal(f.sent[0]!.chat, "42");
+    const row = f.app.store.get<{
+      chat: string;
+      messageThreadId: number | null;
+      text: string;
+    }>("SELECT chat,messageThreadId,text FROM deliveries");
+    assert.equal(row?.chat, "42");
+    assert.equal(row?.messageThreadId, 9);
+    assert.match(row?.text ?? "", /Alerta real/);
+    assert.equal(run.status, "ok");
+    const blob = JSON.stringify(
+      (await (await f.app.conversation(f.id)).context(context)).messages,
+    );
+    assert.match(blob, /O texto final deste run não é entregue/);
+    assert.match(blob, /chame notify/);
   } finally {
     await f.close();
   }
 });
 
-test("a scheduled run that only says there is nothing sends nothing", async () => {
-  const f = await fixture("Nada relevante nas duas caixas.");
+test("notify replyTo in the same chat is a reply and keeps the schedule topic", async () => {
+  const f = await fixture("Segue o alerta.", true, false, 9);
+  f.app.store.run(
+    "INSERT INTO telegram_seen(chat,messageId,author,excerpt) VALUES ('42',77,'usuário','pode olhar isso')",
+  );
+  f.faux.setResponses([
+    fauxAssistantMessage(
+      [fauxToolCall("notify", { text: "Segue o alerta.", replyTo: 77 })],
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("ok"),
+  ]);
   try {
+    await f.run();
+    await f.engine().flush();
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.sent[0]!.chat, "42");
+    assert.equal(f.sent[0]!.replyTo, 77);
+    assert.equal(f.sent[0]!.thread, 9);
+    assert.match(f.sent[0]!.text, /Segue o alerta/);
+    const blob = JSON.stringify(
+      (await (await f.app.conversation(f.id)).context(context)).messages,
+    );
+    assert.match(blob, /#77 usuário: pode olhar isso/);
+  } finally {
+    await f.close();
+  }
+});
+
+test("notify replyTo from another chat is ignored and logged", async () => {
+  const f = await fixture("Aviso.", true, false, 9);
+  f.app.store.run(
+    "INSERT INTO telegram_seen(chat,messageId,author,excerpt) VALUES ('99',88,'bot','outro chat')",
+  );
+  const lines: string[] = [];
+  const log = console.log;
+  console.log = (...parts: unknown[]) => {
+    lines.push(parts.map(String).join(" "));
+  };
+  f.faux.setResponses([
+    fauxAssistantMessage(
+      [fauxToolCall("notify", { text: "Aviso.", replyTo: 88 })],
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("ok"),
+  ]);
+  try {
+    await f.run();
+    await f.engine().flush();
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.sent[0]!.chat, "42");
+    assert.equal(f.sent[0]!.replyTo, undefined);
+    assert.equal(f.sent[0]!.thread, 9);
+    assert.ok(
+      lines.some((line) => /replyTo=88/.test(line) && /chat 99/.test(line)),
+      JSON.stringify(lines),
+    );
+  } finally {
+    console.log = log;
+    await f.close();
+  }
+});
+
+test("a deleted replyTo is delivered as a normal topic message", async () => {
+  const f = await fixture("Ainda vale.", true, false, 9);
+  f.app.store.run(
+    "INSERT INTO telegram_seen(chat,messageId,author,excerpt) VALUES ('42',77,'bot','aviso antigo')",
+  );
+  f.refuseReply = true;
+  const lines: string[] = [];
+  const log = console.log;
+  console.log = (...parts: unknown[]) => {
+    lines.push(parts.map(String).join(" "));
+  };
+  f.faux.setResponses([
+    fauxAssistantMessage(
+      [fauxToolCall("notify", { text: "Ainda vale.", replyTo: 77 })],
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("ok"),
+  ]);
+  try {
+    await f.run();
+    await f.engine().flush();
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.sent[0]!.replyTo, undefined);
+    assert.equal(f.sent[0]!.chat, "42");
+    assert.equal(f.sent[0]!.thread, 9);
+    assert.match(f.sent[0]!.text, /Ainda vale/);
+    assert.ok(
+      lines.some((line) => /replyTo=77/.test(line) && /sem reply/.test(line)),
+      JSON.stringify(lines),
+    );
+  } finally {
+    console.log = log;
+    await f.close();
+  }
+});
+
+test("notify with invisible text is refused and sends nothing", async () => {
+  const f = await fixture("\u200b", true, false);
+  try {
+    f.faux.setResponses([
+      fauxAssistantMessage(
+        [fauxToolCall("notify", { text: "\u200b\u00a0\u2060\ufeff" })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage("\u200b"),
+    ]);
     f.tasks.setDelivery(f.task.id, "web_telegram");
     const run = await f.run();
     await f.engine().flush();
     assert.equal(f.sent.length, 0);
+    assert.equal(f.app.store.all("SELECT * FROM deliveries").length, 0);
     assert.equal(run.status, "silencioso");
+    const transcript = JSON.stringify(
+      (await (await f.app.conversation(f.id)).context(context)).messages,
+    );
+    assert.match(transcript, /ficou vazio/);
+    assert.match(transcript, /Nada foi enviado/);
   } finally {
     await f.close();
   }
 });
 
-test("a real summary that mentions the phrase still reaches the chat", async () => {
-  const f = await fixture(
-    "Resumo das caixas:\n- 3 e-mails de clientes\n- nada relevante no corpo\n- release v1.2 saiu",
-  );
+test("an interactive turn still delivers its final text and is not offered notify", async () => {
+  const f = await fixture("ignorado", true, false);
+  let offered = "";
+  f.faux.setResponses([
+    async (transcript) => {
+      offered = JSON.stringify(transcript.messages);
+      return fauxAssistantMessage("Resposta ao usuário no tópico.");
+    },
+  ]);
   try {
-    f.tasks.setDelivery(f.task.id, "web_telegram");
-    await f.run();
-    await f.engine().flush();
-    assert.equal(f.sent.length, 1);
-    assert.match(f.sent[0]!.text, /release v1\.2/);
+    await f.app.admit(f.id, "telegram:oi", "oi", {
+      source: "telegram",
+      chat: "42",
+      user: "42",
+    });
+    await (await f.app.conversation(f.id)).waitForIdle(context);
+    for (let n = 0; n < 50; n++) {
+      if (!f.app.store.get("SELECT 1 FROM requests WHERE status='pending'"))
+        break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.match(
+      f.sent.map((row) => row.text).join("\n"),
+      /Resposta ao usuário/,
+    );
+    assert.equal(offered.includes('"name":"notify"'), false);
+    assert.equal(offered.includes("chame notify"), false);
   } finally {
     await f.close();
   }
 });
 
-test("only a bare acknowledgement counts as nothing to report", () => {
-  const silent = [
-    "Nada relevante nas duas caixas.",
-    "Nada relevante.",
-    "nada relevante",
-    "  Nada   relevante   nas   caixas  ",
-    "Nenhuma release nas últimas 24h.",
-    "Sem novidades.",
-    "Nada a relatar.",
-    "Caixas limpas.",
-    "Nada exige ação.",
-    "Nenhuma mensagem nova.",
-    "Agenda livre.",
-  ];
-  for (const answer of silent)
-    assert.equal(isNullAcknowledgement(answer), true, answer);
-  const delivered = [
-    "Resumo:\\n- 3 e-mails\\n- nada relevante no corpo\\n- release v1.2",
-    "Nada relevante nas caixas. Mas o release v1.2 saiu e precisa de atenção.",
-    `${"palavra ".repeat(40)}nada relevante`,
+test("blank text is not a message, whatever the invisible characters", () => {
+  for (const value of [
     "",
-    "   ",
-    "Falha ao consultar o provedor: HTTP 500",
-    "Nada relevante nas caixas. Ação: revisar o release v1.2 antes de 18h.",
-  ];
-  for (const answer of delivered)
-    assert.equal(isNullAcknowledgement(answer), false, answer);
+    "   \n\t ",
+    "\u200b",
+    "\ufeff\u200c\u200d\u200b",
+    "\u00a0\u200e\u200f\u2060",
+    "\u200b\u0301",
+  ])
+    assert.equal(isBlankMessage(value), true, JSON.stringify(value));
+  assert.equal(isBlankMessage("Fila vazia"), false);
+  assert.equal(isBlankMessage("a\u200b"), false);
 });
 
 test("task ok requires a durable delivery row, not a previous chat message id", async () => {

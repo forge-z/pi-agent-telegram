@@ -1,14 +1,14 @@
 # Pi-Agent verification
 
-Validation on 2026-10-15, in an isolated worktree and temporary test volumes. No deployment, real Telegram request, email, paid model/tool call, webhook change or production data was involved.
+Validation on 2026-10-22, in an isolated worktree and temporary test volumes. No deployment, real Telegram request, email, paid model/tool call, webhook change or production data was involved.
 
 ## Automated checks
 
-- `npm ci` with the committed lockfile; Pi durable/AI/chord are pinned to 1.3.0 (aligned with [packages/durable](https://github.com/earendil-works/pi/tree/main/packages/durable) on Pi `main`).
+- `npm ci` with the committed lockfile; Pi durable/AI/chord are pinned to 1.4.0 (aligned with [packages/durable](https://github.com/earendil-works/pi/tree/v1.4.0/packages/durable) on Pi `v1.4.0`).
 - Internal `defineTool` handlers return model text via `output`, not `content`, per pi-durable 1.2+.
 - `npm run check`, `npm run lint`, `npm run build`, `npm run format:check` and `git diff --check` pass.
-- `npm test`: **272 passed, 0 failed**, with concurrency limited to 2.
-- `node --import tsx --test --test-concurrency=2 test/clean*.test.ts test/telegram-approval-review.test.ts`: **30 passed** in the focused clean flow/protocol/lifecycle/compaction suites; these are also included in the full suite.
+- `npm test`: **400 passed, 0 failed**, with concurrency limited to 2.
+- The clean flow, protocol, lifecycle and compaction suites, plus `test/telegram-approval-review.test.ts`, are included in that full run. Schema 2 of `durable.sqlite` is covered by `test/durable-schema.test.ts`.
 - `docker compose config --quiet` passes without runtime credentials or exposed ports.
 
 The retained tests exercise durable admission, recovery, task occurrences, conversation isolation, delivery authorization and MCP ledgers. Tests specific to the removed web UI/server, login and topic mirroring were removed together with those surfaces.

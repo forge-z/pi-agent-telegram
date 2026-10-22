@@ -1,4 +1,5 @@
 import { telegramIdentity } from "./telegram-identity.js";
+import { acceptedReplyTo } from "./telegram-reply.js";
 import { childIds, type Store } from "./store.js";
 
 export interface TelegramRoute {
@@ -134,46 +135,14 @@ export function taskTelegramAvailable(store: Store, conversationId: string) {
 }
 
 /**
- * A scheduled run's message is its own content. Whitespace and the invisible marks a model
- * likes to emit (U+200B, U+FEFF, U+200C, U+200D) are not content, and a task title never is.
+ * Spaces and invisible characters are not a message. Categories, not a fixed list:
+ * separators (Z, including NBSP), controls (Cc), format characters (Cf: ZWSP through
+ * the bidi marks, word joiner, BOM) and marks that do not take space on their own.
  */
-/** A sentence that only says "there is nothing", which is the same as saying nothing.
- * Anchored on purpose: a real summary can mention "nada relevante" in the middle. */
-const NULL_ACK: RegExp[] = [
-  /^nada (relevante|novo|a relatar|a informar|a reportar|a avisar|exige acao|importante|urgente|critico)/,
-  /^sem (novidades|novidade|alteracoes|alteracao|movimento|pendencia|pendencias|nada)/,
-  /^(as |os )?(caixas|caixa|inbox|agenda|calendario|fila|filas) (estao |esta )?(limpas|limpa|livre|vazias|vazia)/,
-  /^(nenhuma|nenhum) (releases|release|mensagens|mensagem|novidades|novidade|atualizacoes|atualizacao|alteracoes|alteracao|itens|item)/,
-  /^tudo (em ordem|tranquilo|certo|ok)/,
-];
-/** Words that may follow the empty acknowledgement without making it content. */
-const NULL_ACK_TAIL =
-  /^( (nas?|nos?|em|de|da|do|das|dos|nesta|neste|hoje|agora|ultima|ultimas|ultimo|ultimos|duas|tres|quatro|cinco|[0-9]+h?|[a-z]+)){0,5}$/;
+const INVISIBLE = /[\p{Cc}\p{Cf}\p{Z}\p{Mn}\p{Me}]/gu;
 
-/** Nothing above this many characters is ever a bare acknowledgement. */
-const NULL_ACK_LIMIT = 240;
-
-/**
- * Whether a scheduled run's whole answer is a confirmation that there is nothing to report.
- * Only the whole message counts: a summary that quotes the phrase keeps its message.
- */
-export function isNullAcknowledgement(answer: string | null | undefined) {
-  const text = (answer ?? "")
-    .trim()
-    .replace(/[\s\u200b\ufeff\u200c\u200d]+/g, " ")
-    .replace(/[.!?;:\u2026\s]+$/, "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase();
-  if (!text || text.length > NULL_ACK_LIMIT) return false;
-  return NULL_ACK.some((pattern) => {
-    const match = pattern.exec(text);
-    return !!match && NULL_ACK_TAIL.test(text.slice(match[0].length));
-  });
-}
-
-export function isSilentResult(result: string | null | undefined) {
-  return !(result ?? "").replace(/[\s\u200b\ufeff\u200c\u200d]/g, "");
+export function isBlankMessage(value: string | null | undefined) {
+  return !(value ?? "").replace(INVISIBLE, "");
 }
 
 /** True when a terminal occurrence's user-visible result reached Telegram (or was intentionally skipped). */
@@ -207,31 +176,182 @@ export function taskOccurrenceDelivered(
   return false;
 }
 
-/** Freeze a terminal occurrence's destination, including a skipped notification.
- * Replays must never send an old result to a newly linked conversation/chat. */
-export function queueTaskTelegram(
-  store: Store,
-  conversationId: string,
-  requestId: string,
-  result: string,
-) {
-  const task = store.get<{
-    title: string;
-    delivery: string | null;
-    destinationChat: string | null;
-    destinationUser: string | null;
-    destinationBotId: string | null;
-    destinationMessageThreadId: number | null;
-    destinationReason: string | null;
-  }>(
-    `SELECT t.title,r.delivery,r.destinationChat,r.destinationUser,r.destinationBotId,r.destinationMessageThreadId,r.destinationReason
+type TaskDelivery = {
+  delivery: string | null;
+  destinationChat: string | null;
+  destinationUser: string | null;
+  destinationBotId: string | null;
+  destinationMessageThreadId: number | null;
+  destinationReason: string | null;
+};
+
+function taskDelivery(store: Store, conversationId: string, requestId: string) {
+  return store.get<TaskDelivery>(
+    `SELECT r.delivery,r.destinationChat,r.destinationUser,r.destinationBotId,r.destinationMessageThreadId,r.destinationReason
      FROM task_runs r JOIN tasks t ON t.id=r.taskId
      WHERE r.requestId=? AND COALESCE(r.conversationId,t.conversationId)=?`,
     requestId,
     conversationId,
   );
+}
+
+/** The occurrence's frozen chat and topic, or why it cannot be used. */
+function taskRoute(store: Store, conversationId: string, task: TaskDelivery) {
+  const frozen: TelegramRoute | undefined =
+    task.delivery === "web_telegram" &&
+    !task.destinationReason &&
+    task.destinationChat &&
+    task.destinationUser &&
+    task.destinationBotId
+      ? {
+          chat: task.destinationChat,
+          user: task.destinationUser,
+          botId: task.destinationBotId,
+          conversationId,
+          messageThreadId: task.destinationMessageThreadId,
+        }
+      : undefined;
+  const route =
+    frozen && telegramRouteAuthorized(store, frozen) ? frozen : undefined;
+  const reason = route
+    ? null
+    : (task.destinationReason ??
+      (frozen
+        ? "Vínculo Telegram revogado antes do envio."
+        : "Destino legado não comprovado. Selecione o destino para execuções futuras."));
+  return { route, reason };
+}
+
+function rememberRouteError(store: Store, requestId: string, reason: string) {
+  store.run(
+    "UPDATE tasks SET lastError=? WHERE id=(SELECT taskId FROM task_runs WHERE requestId=?)",
+    reason,
+    requestId,
+  );
+}
+
+/** True when this occurrence already queued a `notify` message. */
+export function runNotified(
+  store: Store,
+  conversationId: string,
+  requestId: string,
+) {
+  const prefix = `${conversationId}:${requestId}:notify`;
+  return !!store.get(
+    "SELECT 1 FROM deliveries WHERE id>=? AND id<?",
+    ...childIds(prefix),
+  );
+}
+
+/**
+ * Post one `notify` message to the occurrence's chat and topic.
+ * Returns an error for the model when nothing was sent.
+ */
+export function queueNotify(
+  store: Store,
+  conversationId: string,
+  requestId: string,
+  callId: string,
+  text: string,
+  replyTo?: number,
+) {
+  if (isBlankMessage(text))
+    return "notify recusou o texto: depois de remover espaços e caracteres invisíveis ele ficou vazio. Nada foi enviado.";
+  const task = taskDelivery(store, conversationId, requestId);
+  const source = store.get<{ source: string }>(
+    "SELECT source FROM requests WHERE conversationId=? AND requestId=?",
+    conversationId,
+    requestId,
+  )?.source;
+  if (source === "task" && !task)
+    return "Não há ocorrência de agendamento para esta chamada. Nada foi enviado.";
+  if (task?.delivery === "none")
+    return "Este agendamento não envia mensagens. Nada foi enviado.";
+  if (task?.delivery === "web")
+    return "Este agendamento não tem destino no Telegram. Nada foi enviado.";
+  const resolved = task ? taskRoute(store, conversationId, task) : undefined;
+  const route =
+    resolved?.route ??
+    (!task ? telegramConversationRoute(store, conversationId) : undefined);
+  if (!route) {
+    const reason =
+      resolved?.reason ??
+      "Esta conversa não está vinculada a um chat do Telegram.";
+    if (task) rememberRouteError(store, requestId, reason);
+    return `${reason} Nada foi enviado.`;
+  }
+  const notificationId = `${conversationId}:${requestId}:task-notification`;
+  const safeCall = callId.replace(/[^\w.-]/g, "_").slice(0, 80) || "call";
+  const prefix = `${conversationId}:${requestId}:notify:${safeCall}`;
+  store.db.exec("SAVEPOINT notify_delivery");
+  try {
+    const existing = store.get<{ state: string }>(
+      "SELECT state FROM task_notifications WHERE id=?",
+      notificationId,
+    );
+    if (!existing && task) {
+      store.run(
+        `INSERT INTO task_notifications(id,conversationId,requestId,chat,user,botId,state,messageThreadId)
+         VALUES (?,?,?,?,?,?,'queued',?)`,
+        notificationId,
+        conversationId,
+        requestId,
+        route.chat,
+        route.user,
+        route.botId,
+        route.messageThreadId,
+      );
+    } else if (
+      existing &&
+      existing.state !== "queued" &&
+      existing.state !== "sent"
+    ) {
+      store.db.exec("RELEASE SAVEPOINT notify_delivery");
+      return "O destino deste agendamento não aceita mensagens. Nada foi enviado.";
+    }
+    const reply = acceptedReplyTo(store, route.chat, replyTo);
+    store.queueTelegram(
+      prefix,
+      route.chat,
+      text,
+      3500,
+      conversationId,
+      route.messageThreadId,
+      undefined,
+      undefined,
+      reply,
+    );
+    if (task)
+      store.run(
+        `INSERT OR IGNORE INTO task_notification_parts(deliveryId,notificationId)
+         SELECT id,? FROM deliveries WHERE id>=? AND id<?`,
+        notificationId,
+        ...childIds(prefix),
+      );
+    store.db.exec("RELEASE SAVEPOINT notify_delivery");
+  } catch (error) {
+    store.db.exec("ROLLBACK TO SAVEPOINT notify_delivery");
+    store.db.exec("RELEASE SAVEPOINT notify_delivery");
+    throw error;
+  }
+  if (!runNotified(store, conversationId, requestId))
+    return "notify não enviou: o texto não produziu mensagem. Nada foi enviado.";
+  return;
+}
+
+/** Freeze a terminal occurrence's destination, including a skipped notification.
+ * Replays must never send an old result to a newly linked conversation/chat.
+ * `kind` keeps a system failure distinct from messages `notify` already queued. */
+export function queueTaskTelegram(
+  store: Store,
+  conversationId: string,
+  requestId: string,
+  result: string,
+  kind = "task-notification",
+) {
+  const task = taskDelivery(store, conversationId, requestId);
   if (!task) return;
-  const id = `${conversationId}:${requestId}:task-notification`;
+  const id = `${conversationId}:${requestId}:${kind}`;
   store.db.exec("SAVEPOINT task_notification");
   try {
     if (!store.get("SELECT 1 FROM task_notifications WHERE id=?", id)) {
@@ -251,28 +371,7 @@ export function queueTaskTelegram(
         store.db.exec("RELEASE SAVEPOINT task_notification");
         return;
       }
-      const frozen: TelegramRoute | undefined =
-        task.delivery === "web_telegram" &&
-        !task.destinationReason &&
-        task.destinationChat &&
-        task.destinationUser &&
-        task.destinationBotId
-          ? {
-              chat: task.destinationChat,
-              user: task.destinationUser,
-              botId: task.destinationBotId,
-              conversationId,
-              messageThreadId: task.destinationMessageThreadId,
-            }
-          : undefined;
-      const route =
-        frozen && telegramRouteAuthorized(store, frozen) ? frozen : undefined;
-      const reason = route
-        ? null
-        : (task.destinationReason ??
-          (frozen
-            ? "Vínculo Telegram revogado antes do envio."
-            : "Destino legado não comprovado. Selecione o destino para execuções futuras."));
+      const { route, reason } = taskRoute(store, conversationId, task);
       store.run(
         `INSERT INTO task_notifications(id,conversationId,requestId,chat,user,botId,state,messageThreadId,reason)
          VALUES (?,?,?,?,?,?,?,?,?)`,
@@ -286,23 +385,8 @@ export function queueTaskTelegram(
         route?.messageThreadId ?? null,
         reason,
       );
-      if (reason)
-        store.run(
-          "UPDATE tasks SET lastError=? WHERE id=(SELECT taskId FROM task_runs WHERE requestId=?)",
-          reason,
-          requestId,
-        );
-      if (route) {
-        // The result is the message. A scheduled run that produced nothing sends nothing;
-        // a task title is never message content.
-        if (isSilentResult(result)) {
-          store.run(
-            "UPDATE task_notifications SET state='silent' WHERE id=?",
-            id,
-          );
-          store.db.exec("RELEASE SAVEPOINT task_notification");
-          return;
-        }
+      if (reason) rememberRouteError(store, requestId, reason);
+      if (route && !isBlankMessage(result)) {
         store.queueTelegram(
           id,
           route.chat,

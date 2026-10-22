@@ -133,7 +133,7 @@ e `medium` e aceita `max`:
 LLM_MODELS=deepseek-flash|1000000|384000|off+low+high+max
 ```
 
-Esses valores vêm do catálogo do `pi-ai` 1.3.0 que embute `deepseek-flash` com
+Esses valores vêm do catálogo do `pi-ai` 1.4.0 que embute `deepseek-flash` com
 `contextWindow=1000000`, `maxTokens=384000` e esse mapa de níveis (`off/low/high/max`).
 
 ### Nunca use build args para segredos
@@ -158,6 +158,10 @@ build nem necessidade de **Source commit availability → Available during build
   rode duas instâncias contra o mesmo volume.
 - Antes de trocar de versão, faça backup do volume. Tópicos e conversas só são criados
   no primeiro uso — nada é criado no startup.
+- **Upgrade para o Pi 1.4.0.** O primeiro boot migra `/app/data/durable.sqlite` para o
+  schema 2 do pi-durable. Essa migração não tem rollback: a imagem anterior não lê o
+  schema 2. Faça backup do volume antes do deploy e, se precisar voltar, restaure o
+  backup junto com a imagem antiga.
 
 ## 5. Hardening e possíveis atritos
 
@@ -203,7 +207,9 @@ imagem.
 - Rebuild local: `npm run compose:up`, ou
   `SOURCE_COMMIT=$(git rev-parse HEAD) docker compose up -d --build`.
 - Rollback: selecione um commit anterior no Coolify e redeploy. Restaure o backup do
-  volume junto — o ledger SQLite é a única fonte de verdade das conversas.
+  volume junto — o ledger SQLite é a única fonte de verdade das conversas. O primeiro
+  boot desta versão migra `durable.sqlite` para o schema 2 sem caminho de volta; a
+  imagem anterior não abre esse arquivo.
 
 ## 9. Quando algo falha
 

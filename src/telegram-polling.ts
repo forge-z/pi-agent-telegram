@@ -21,6 +21,7 @@ export const cleanCommands = [
   { command: "stop", description: "Interromper execução deste tópico" },
   { command: "status", description: "Modelo, MCPs, execução e versão" },
   { command: "reload", description: "Começar uma conversa nova" },
+  { command: "retomar", description: "Retomar tarefa estacionada por quedas" },
   { command: "help", description: "Ajuda" },
 ];
 /**
@@ -144,6 +145,14 @@ export class TelegramPolling {
                   : {}),
                 ...(options?.messageThreadId
                   ? { message_thread_id: options.messageThreadId }
+                  : {}),
+                ...(options?.replyTo
+                  ? {
+                      reply_parameters: {
+                        message_id: options.replyTo,
+                        allow_sending_without_reply: true,
+                      },
+                    }
                   : {}),
                 ...(options?.replyMarkup
                   ? { reply_markup: options.replyMarkup }

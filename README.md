@@ -28,7 +28,7 @@ The supported Executor is **v2, the cloud build** (`https://mcp.executor.sh/mcp`
 3. Optional, for a group: add the bot, then in **@BotFather** `/setprivacy` → **Disable**, otherwise Telegram only delivers commands and mentions. Put the group's negative id in `TELEGRAM_ALLOWED_CHATS`.
 4. Optional, for one conversation per topic: turn the group into a **forum** (group settings → Topics). Each topic gets its own history, model and effort; no extra configuration.
 
-The command menu (`/model`, `/thinking`, `/crons`, `/stop`, `/status`, `/reload`, `/help`) is registered by the app itself on start and again on `/status`, so there is no `/setcommands` to do.
+The command menu (`/model`, `/thinking`, `/crons`, `/stop`, `/status`, `/reload`, `/retomar`, `/help`) is registered by the app itself on start and again on `/status`, so there is no `/setcommands` to do.
 
 ## Install
 
@@ -117,7 +117,8 @@ Roughly in the order a personal assistant needs them: mail, web, voice, then scr
 - **Images** — a model that reads them receives the picture itself; a text-only model gets a description from `VISION_MODEL`.
 - **Voice notes** — transcribed into the turn text; the audio never enters the model context or the history.
 - **Origin is explicit** — a converted message arrives as `[áudio transcrito · {"origin":"audio","model":"whisper-1"}]`, so the model never confuses a transcription with something you typed. A failed transcription is admitted with the reason instead of disappearing.
-- **Schedules** — create a cron in the chat; scheduled runs never approve anything and never create new schedules. Any schedule can also be fired on demand — **Rodar agora** in `/crons`, or `tasks_run_now` for the model — through the same pipeline and the same delivery, without moving the next run.
+- **Schedules** — create a cron in the chat; scheduled runs never approve anything and never create new schedules. Any schedule can also be fired on demand — **Rodar agora** in `/crons`, or `tasks_run_now` for the model — through the same pipeline and the same delivery, without moving the next run. A run that is not an interactive user turn does not deliver its final text. It speaks only by calling `notify`, which posts to that schedule's chat and topic and may be called more than once. Text that is empty once spaces and invisible characters are removed is refused. `replyTo` is a `message_id` already seen in that same chat; if it cannot be confirmed, the reply is ignored and the notice still posts in the topic. Recent ids are in the run's context. If there is nothing to report, the model calls nothing: the run stays `silencioso` and the final text is written to the log with the routine id. Runner failures (exception, timeout, provider error, a parked task, a job error) are still announced by the system, with the cause, and do not depend on the model. `delivery: none` still sends nothing.
+- **Telegram replies** — when a message replies to another one, and when it quotes a passage, the turn receives the id, the author (bot or user) and the text or caption, truncated when long.
 - **Async jobs by manifest** — each job declares how it is dispatched, watched and read; the core only knows state, queue, dedupe and delivery. The official Executor path is built in and needs no configuration. Sandbox code tasks on Instabox (`instabox_code_task`) run agents in the background and report via status polling. Reference: [docs/jobs.md](docs/jobs.md).
 - **Container clock** — `TZ` (e.g. `America/Sao_Paulo`) moves log timestamps only; schedules keep their own IANA timezone and never shift.
 - **Approvals** — every effectful tool call becomes a card with Approve, Deny and Edit; the result is recorded before it is delivered.
@@ -129,6 +130,7 @@ Roughly in the order a personal assistant needs them: mail, web, voice, then scr
 | `/status`    | the three models in use, effort, MCP servers and version              |
 | `/reload`    | reload this conversation and clear uncertain MCP flags (history kept) |
 | `/destravar` | same as `/reload` when the conversation is stuck on uncertain MCP     |
+| `/retomar`   | run again a task parked after repeated crashes                        |
 | `/model`     | provider and model for this conversation                              |
 | `/thinking`  | effort for this conversation                                          |
 | `/crons`     | create and manage schedules                                           |
@@ -141,6 +143,7 @@ Roughly in the order a personal assistant needs them: mail, web, voice, then scr
 - **Discovery reports ids only**. Without `LLM_MODELS`, every model claims no reasoning and `/thinking` offers `off` alone.
 - **Compaction** summarises older turns automatically, so a long conversation does not grow forever.
 - Chat history, credentials and the ledger are only as private as the volume and the host: protect the volume and its backups.
+- **Upgrade from Pi 1.3.** The first boot migrates `durable.sqlite` to schema 2, and that migration has no rollback. Back up the volume before deploying. Rolling the image back without restoring that backup leaves the ledger on a schema the previous release does not read.
 
 ## Projects
 

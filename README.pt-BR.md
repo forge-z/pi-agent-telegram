@@ -28,7 +28,7 @@ O repositório e o container mantêm o nome `pi-agent-tg` para não quebrar volu
 3. Opcional, para grupo: adicione o bot e, no **@BotFather**, `/setprivacy` → **Disable**; sem isso o Telegram só entrega comandos e menções. O id negativo do grupo vai em `TELEGRAM_ALLOWED_CHATS`.
 4. Opcional, para uma conversa por tópico: transforme o grupo em **fórum** (configurações do grupo → Tópicos). Cada tópico fica com histórico, modelo e esforço próprios, sem configuração extra.
 
-O menu de comandos (`/model`, `/thinking`, `/crons`, `/stop`, `/status`, `/reload`, `/help`) é registrado pelo próprio app ao subir e de novo no `/status` — não há `/setcommands` para fazer.
+O menu de comandos (`/model`, `/thinking`, `/crons`, `/stop`, `/status`, `/reload`, `/retomar`, `/help`) é registrado pelo próprio app ao subir e de novo no `/status` — não há `/setcommands` para fazer.
 
 ## Instalação
 
@@ -119,9 +119,9 @@ Mais ou menos na ordem em que um assistente pessoal precisa: e-mail, web, voz, d
 - **Fuso do container** — `TZ` (ex.: `America/Sao_Paulo`) muda só o horário dos logs; agendamentos guardam o próprio timezone IANA e não se movem.
 - **Versão do Executor** — a suportada é a **v2 da nuvem** (`https://mcp.executor.sh/mcp`); cada integração é um app do Executor. Jobs são manifestos (`ASYNC_JOB_MANIFESTS`) ou os embutidos do TinyFish e do Instabox. A conta da leitura vem da chamada. `ASYNC_JOB_TOOLS` e `EXECUTOR_ACCOUNT_ID` não são lidas.
 - **Jobs assíncronos por manifesto** — cada job é descrito em `ASYNC_JOB_MANIFESTS` (disparo, como observar, vocabulário de status, caminhos de id/resultado). O núcleo só conhece estado, fila, dedupe e entrega, então integrar outro provedor é escrever manifesto, não patch. Tarefas de código na sandbox Instabox (`instabox_code_task`) rodam em segundo plano e entregam o resultado (incluindo link de PR) via poller de status. O caminho oficial do Executor v2 já vem pronto, sem configuração. Referência completa em [docs/jobs.md](docs/jobs.md).
-- **Agendamento que responde "nada a relatar"** — quando a mensagem inteira é só uma confirmação de vazio ("nada relevante", "sem novidades", "caixas limpas", "nenhuma release"…), nada é entregue e o run fica `silencioso` (motivo `suppressed:null-ack` no log). Só casa a mensagem inteira, nunca um trecho, e mensagens acima de 240 caracteres nunca são suprimidas.
 - **Resultado MCP incerto** — quando o provedor perde o retorno de uma chamada, a conversa para de executar ações até alguém verificar. **Leituras continuam funcionando** (incluindo `execute` só de consulta no Executor), uma leitura bem-sucedida já dispensa a pendência, o tópico recebe um aviso com botão de registro, e `/destravar` (ou `/reload`) limpa o flag **sem apagar o histórico**. Detalhes em [docs/mcp-uncertain.md](docs/mcp-uncertain.md).
-- **Execução silenciosa não gera mensagem** — se o turno de um agendamento (ou de um disparo manual) não sobra nada além de espaços ou caracteres invisíveis, **nada é enviado** e o run fica registrado como `silencioso`. Título de tarefa nunca vira mensagem; `delivery: none` continua sem envio de qualquer forma.
+- **Agendamento fala só por `notify`** — o texto final de um run que não é um turno do usuário (agenda, disparo manual, job) **não é entregue**. Para avisar, o modelo chama `notify`, que posta no chat e no tópico daquele agendamento e pode ser chamada mais de uma vez. Texto que fica vazio depois de tirar espaços e caracteres invisíveis é recusado e nada sai. `replyTo` é o `message_id` de uma mensagem já vista neste mesmo chat; se não der para confirmar, o reply é ignorado e o aviso sai no tópico mesmo assim. Os ids recentes entram no contexto do run. Se não houver o que relatar, o modelo não chama nada: o run fica `silencioso` e o texto final vai para o log, com o id da rotina. Falha do runner (exceção, timeout, erro de provedor, tarefa estacionada, erro de job) continua sendo avisada pelo sistema, com a causa, e não depende do modelo. `delivery: none` continua sem envio.
+- **Resposta no Telegram** — quando a mensagem responde outra (e quando traz uma citação), o turno recebe o id, o autor (bot ou usuário) e o texto ou a legenda, truncados se forem longos.
 - **Agendamentos** — crie um cron pelo chat; execuções agendadas nunca aprovam nada e nunca criam novos agendamentos. Qualquer agendamento pode ser disparado na hora — **Rodar agora** no `/crons`, ou `tasks_run_now` para o modelo — pelo mesmo pipeline e com a mesma entrega, sem mexer no próximo horário.
 - **Aprovações** — toda ferramenta com efeito vira um cartão com Aprovar, Negar e Editar; o resultado é registrado antes de ser entregue.
 
@@ -132,6 +132,7 @@ Mais ou menos na ordem em que um assistente pessoal precisa: e-mail, web, voz, d
 | `/status`    | os três modelos em uso, esforço, MCPs e versão                                 |
 | `/reload`    | recarregar esta conversa e dispensar resultado MCP incerto (histórico mantido) |
 | `/destravar` | o mesmo que `/reload` quando a conversa está travada por MCP incerto           |
+| `/retomar`   | executar de novo uma tarefa estacionada depois de quedas seguidas              |
 | `/model`     | provedor e modelo desta conversa                                               |
 | `/thinking`  | esforço desta conversa                                                         |
 | `/crons`     | criar e gerenciar agendamentos                                                 |
@@ -144,6 +145,7 @@ Mais ou menos na ordem em que um assistente pessoal precisa: e-mail, web, voz, d
 - **A descoberta informa só ids.** Sem `LLM_MODELS`, todo modelo declara não ter raciocínio e o `/thinking` oferece apenas `off`.
 - **Compactação** resume turnos antigos automaticamente, para a conversa não crescer sem fim.
 - Histórico, credenciais e registro são tão privados quanto o volume e o host: proteja o volume e os backups.
+- **Upgrade a partir do Pi 1.3.** O primeiro boot migra o `durable.sqlite` para o schema 2, e essa migração não tem rollback. Faça backup do volume antes do deploy. Voltar a imagem sem restaurar esse backup deixa o ledger num schema que o release anterior não lê.
 
 ## Projetos
 

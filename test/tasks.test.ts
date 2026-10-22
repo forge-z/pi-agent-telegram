@@ -9,6 +9,7 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import {
   fauxAssistantMessage,
   fauxProvider,
+  fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux";
 import {
   Runtime,
@@ -496,12 +497,15 @@ test("admission failures and terminal input errors stay visible, pending work su
   }
 });
 
-test("a scheduled run posts nothing when the answer is only the silence sentinel", async () => {
+test("a scheduled run posts only what notify sends", async () => {
   const dir = await temp();
   const faux = fauxProvider();
   faux.setResponses([
-    fauxAssistantMessage("<silent/>"),
-    fauxAssistantMessage("Resumo pronto <silent/> agora"),
+    fauxAssistantMessage("Nada nas duas caixas."),
+    fauxAssistantMessage([fauxToolCall("notify", { text: "Resumo pronto" })], {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("Resumo pronto"),
   ]);
   const models = createModels();
   models.setProvider(faux.provider);
@@ -522,23 +526,18 @@ test("a scheduled run posts nothing when the answer is only the silence sentinel
     const silent = tasks.runs(task.id)[0];
     assert.equal(silent.state, "done");
     assert.equal(silent.status, "silencioso");
-    assert.equal(silent.summary, "");
-    assert.ok(silent.startedAt && silent.finishedAt);
+    assert.match(silent.summary!, /Nada nas duas caixas/);
     assert.equal(app.store.all("SELECT * FROM deliveries").length, 0);
-    assert.equal(app.store.all("SELECT * FROM task_notifications").length, 0);
 
-    // A real answer still posts, and the sentinel never reaches the chat.
     await tasks.runNow(task.id);
     await settle(app, conversationId);
     await tasks.tick();
     assert.equal(tasks.runs(task.id)[0].status, "ok");
-    assert.match(tasks.runs(task.id)[0].summary!, /^Resumo pronto/);
     const texts = app.store
       .all<{ text: string }>("SELECT text FROM deliveries")
       .map((row) => row.text);
     assert.equal(texts.length, 1);
     assert.ok(texts[0].includes("Resumo pronto"));
-    assert.ok(!texts[0].includes("silent"));
   } finally {
     await tasks.close();
     await app.close();
@@ -619,11 +618,13 @@ test("delivery none stops posting and the execution log stays queryable", async 
 test("three consecutive scheduled occurrences in one conversation all answer, with no reused requestId", async () => {
   const dir = await temp();
   const faux = fauxProvider();
-  faux.setResponses([
-    fauxAssistantMessage("ping 1"),
-    fauxAssistantMessage("ping 2"),
-    fauxAssistantMessage("ping 3"),
-  ]);
+  const ping = (text: string) => [
+    fauxAssistantMessage([fauxToolCall("notify", { text })], {
+      stopReason: "toolUse" as const,
+    }),
+    fauxAssistantMessage(text),
+  ];
+  faux.setResponses([...ping("ping 1"), ...ping("ping 2"), ...ping("ping 3")]);
   const models = createModels();
   models.setProvider(faux.provider);
   const app = await Runtime.open({ dir, models, gateway });
