@@ -9,6 +9,13 @@ import type { Store } from "./store.js";
 export const CONVERSATION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export class TrashBlockedError extends Error {}
 
+/**
+ * Physical layouts this purge can read. v1 is the original durable schema.
+ * v2 rebuilds `tasks` only so a task may be `sleeping`; every column stays the
+ * same. A later version is refused until these checks are audited against it.
+ */
+const DURABLE_PURGE_SCHEMA_VERSIONS = new Set([1, 2]);
+
 const object = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 const identity = (value: unknown) =>
@@ -83,6 +90,12 @@ function supportedRecord(record: unknown, type: string): boolean {
         );
       if (state.status === "pending" || state.status === "running")
         return Object.hasOwn(state, "checkpoint");
+      if (state.status === "sleeping")
+        return (
+          Object.hasOwn(state, "checkpoint") &&
+          typeof state.until === "number" &&
+          Number.isFinite(state.until)
+        );
       return (
         (state.status === "terminal" || state.status === "completing") &&
         object(state.outcome) &&
@@ -201,7 +214,7 @@ export async function assertDurablePurgeSafe(tx: SqliteExecutor, id: number) {
   const schema = await tx.get<{ version: number }>(
     "SELECT version FROM durable_schema WHERE singleton=1",
   );
-  if (schema?.version !== 1)
+  if (!DURABLE_PURGE_SCHEMA_VERSIONS.has(schema?.version ?? -1))
     throw new TrashBlockedError(
       "Versão do histórico incompatível com exclusão permanente.",
     );

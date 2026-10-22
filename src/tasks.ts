@@ -143,7 +143,7 @@ function publicTask(row: TaskRow): Task {
 }
 
 /** Calendar admission only. Pi's Harness owns model execution and durable input replay.
- * See pi-durable/dist/harness/scheduler.js and TaskRuntime.sleep in dist/types.d.ts.
+ * See pi-durable/dist/harness/scheduler.js and TaskRuntime.sleepUntil in dist/types.d.ts.
  * No OS cron, shell invocation, or independent model executor is used here.
  */
 export class Tasks {

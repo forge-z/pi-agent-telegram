@@ -77,7 +77,10 @@ which is why the id is required.
 
 1. the row is created **before** the dispatch, so a lost response is still covered;
 2. delivery is at-least-once with a stable request id (`job:<row>:<run>`) — settlement and
-   the worker converge on one message;
+   the worker converge on one message. The turn that summarizes a finished job does not
+   deliver its final text; it calls `notify` to post in the topic. A runner failure
+   (the turn itself faulting, or the poller giving up) is still posted by the system
+   with the cause, and does not depend on that call;
 3. `unknown` is not `failed`: a job that is not visible yet is silence until `graceMinutes`;
 4. the Executor's own envelope status is never read as the job's status — the status comes
    from the object that carries the job id;
