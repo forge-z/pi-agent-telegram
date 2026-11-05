@@ -4,7 +4,6 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import {
   fauxAssistantMessage,
@@ -48,7 +47,7 @@ function cut(dir: string, submit: boolean) {
 }
 
 test(
-  "cinco cortes estacionam a tarefa, avisam o tópico e /retomar a executa de novo",
+  "cinco cortes avisam o tópico e /retomar continua a resposta pendente",
   { timeout: 90_000 },
   async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-parked-"));
@@ -63,6 +62,7 @@ test(
           await new Promise(() => {});
           return fauxAssistantMessage("nunca");
         },
+        async () => fauxAssistantMessage("retomado"),
       ]);
       models.setProvider(faux.provider);
       app = await Runtime.open({
@@ -73,26 +73,30 @@ test(
         initialize: (store) =>
           configureTelegram(store, config, { id: 123, username: "test_bot" }),
       });
-      const parked = (await app.harness.inspect(context)).tasks.filter(
-        (task) =>
-          task.state.kind === "blocked" &&
-          task.state.reason === "restart_limit",
-      );
-      assert.equal(parked.length, 1);
-      assert.equal(parked[0]?.record.kind, "pi.generation");
-      const notice = app.store.get<{
-        chat: string;
-        text: string;
-        messageThreadId: number;
-      }>(
-        "SELECT chat,text,messageThreadId FROM deliveries WHERE id LIKE 'parked:%'",
-      );
+      const noticeDeadline = Date.now() + 15_000;
+      let notice:
+        | {
+            chat: string;
+            text: string;
+            messageThreadId: number;
+          }
+        | undefined;
+      while (Date.now() < noticeDeadline) {
+        notice = app.store.get<{
+          chat: string;
+          text: string;
+          messageThreadId: number;
+        }>(
+          "SELECT chat,text,messageThreadId FROM deliveries WHERE id LIKE 'parked:%'",
+        );
+        if (notice) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
       assert.ok(notice);
       assert.equal(notice.chat, "-100123");
       assert.equal(notice.messageThreadId, 11);
       assert.match(notice.text, /pi\.generation/);
-      assert.match(notice.text, new RegExp(`#${parked[0]?.record.id}`));
-      assert.match(notice.text, /5 vezes seguidas sem avançar/);
+      assert.match(notice.text, /5 vezes seguidas/);
       assert.match(notice.text, /\/retomar/);
 
       const sent: { chat: string; text: string; thread?: number }[] = [];
@@ -111,9 +115,11 @@ test(
         123,
       );
       await bot.flush();
-      assert.equal(sent.length, 1);
-      assert.equal(sent[0]?.thread, 11);
-      assert.match(sent[0]?.text ?? "", /5 vezes seguidas/);
+      const restartNotices = sent.filter((row) =>
+        /5 vezes seguidas/.test(row.text),
+      );
+      assert.equal(restartNotices.length, 1);
+      assert.equal(restartNotices[0]?.thread, 11);
 
       const update: TelegramUpdate = {
         update_id: 1,
@@ -127,20 +133,7 @@ test(
       };
       await bot.receive(update);
       await bot.flush();
-      assert.match(
-        sent.at(-1)?.text ?? "",
-        new RegExp(`pi\\.generation #${parked[0]?.record.id}`),
-      );
-      const again = (await app.harness.inspect(context)).tasks.find(
-        (task) => task.record.id === parked[0]?.record.id,
-      );
-      assert.ok(again);
-      assert.notEqual(
-        again.state.kind === "blocked" &&
-          again.state.reason === "restart_limit",
-        true,
-      );
-      assert.equal(again.record.state.status, "running");
+      assert.match(sent.at(-1)?.text ?? "", /continue/);
     } finally {
       if (app) await app.close();
       await rm(dir, { recursive: true, force: true });

@@ -23,8 +23,10 @@ import {
 } from "@earendil-works/pi-ai/models";
 import {
   LLM_PROVIDER_ID,
+  bootstrapModels,
   environmentModels,
   operatorSecret,
+  SetupRequiredError,
 } from "../dist/src/config.js";
 import { PROVIDERS } from "../dist/src/providers.js";
 import { probeImageSupport } from "../dist/src/vision.js";
@@ -37,6 +39,13 @@ import {
   modelDefaultsConfirmedKey,
   modelDefaultsKey,
 } from "../dist/src/settings.js";
+import { Store, SqlCredentials } from "../dist/src/store.js";
+import {
+  oauthInteractionFromReadline,
+  runSubscriptionLogin,
+  subscriptionChatCatalog,
+  writeChatgptAuthMode,
+} from "../dist/src/subscription-login.js";
 
 const MODE = "live";
 const usage = `Uso: npm run setup -- [opções]
@@ -45,8 +54,8 @@ const usage = `Uso: npm run setup -- [opções]
   pergunta provedor, chave, modelo, esforço, visão e áudio.
 
   --list                      mostra o estado atual
-  --provider <id|url>         deepseek | gemini | openai | opencode-zen | opencode-go |
-                              openrouter | custom | uma URL https://...
+  --provider <id|url>         chatgpt | openai-codex | deepseek | gemini | openai |
+                              opencode-zen | opencode-go | openrouter | custom | URL
   --key-stdin                 lê a chave do stdin (evita histórico e \`ps\`)
   --model <id>                id do modelo
   --effort <level>            off|minimal|low|medium|high|xhigh|max
@@ -252,7 +261,93 @@ const resolved = {
   apiKey: "",
   providerId: "custom",
   audioKey: "",
+  mode: "api",
+  /** pi-ai provider id for defaults (/model): `llm` or `openai-codex` / `openai`. */
+  piProviderId: LLM_PROVIDER_ID,
 };
+
+function activeProviderId() {
+  return resolved.mode === "subscription"
+    ? resolved.piProviderId
+    : LLM_PROVIDER_ID;
+}
+
+function isSubscriptionChoice(raw) {
+  const value = String(raw ?? "")
+    .trim()
+    .toLowerCase();
+  return (
+    value === "0" ||
+    value === "chatgpt" ||
+    value === "subscription" ||
+    value === "openai-codex" ||
+    value === "openai-subscription"
+  );
+}
+
+function subscriptionPiProvider(raw) {
+  const value = String(raw ?? "")
+    .trim()
+    .toLowerCase();
+  return value === "openai" ? "openai" : "openai-codex";
+}
+
+async function loadSubscriptionCatalog(readline, piProviderId) {
+  const store = new Store(dir);
+  const credentials = new SqlCredentials(store);
+  const stored = readStoredSetup(dir);
+  try {
+    models = await bootstrapModels(credentials, process.env, { stored });
+  } catch (error) {
+    if (error instanceof SetupRequiredError) {
+      models = await bootstrapModels(
+        credentials,
+        { ...process.env, LLM_AUTH: "chatgpt" },
+        { stored },
+      );
+    } else throw error;
+  }
+  if (!(await models.checkAuth(piProviderId))) {
+    if (!readline) {
+      store.close();
+      const err = new Error(
+        "Assinatura ChatGPT não autenticada. Rode `npm run login` ou `npm run setup` com terminal interativo (docker exec -it).",
+      );
+      err.code = "SUBSCRIPTION_LOGIN_REQUIRED";
+      throw err;
+    }
+    const deviceAnswer = await readline.question(
+      "Login por código de dispositivo (recomendado em VPS)? [Y/n]: ",
+    );
+    const deviceCodeOnly = !/^n/i.test(String(deviceAnswer).trim());
+    console.log(
+      "Siga o login OAuth abaixo (código de dispositivo ou cole a URL de redirect se pedido).",
+    );
+    const interaction = oauthInteractionFromReadline(readline, {
+      deviceCodeOnly,
+    });
+    await runSubscriptionLogin(store, models, piProviderId, interaction, {
+      deviceCodeOnly,
+    });
+  } else {
+    writeChatgptAuthMode(store);
+  }
+  resolved.mode = "subscription";
+  resolved.piProviderId = piProviderId;
+  resolved.providerId = piProviderId;
+  resolved.baseUrl = models.getProvider(piProviderId)?.baseUrl ?? "";
+  resolved.apiKey = "";
+  catalog = subscriptionChatCatalog(models, piProviderId);
+  store.close();
+  if (!catalog.length)
+    fail("Nenhum modelo de chat disponível para a assinatura autenticada.");
+}
+
+function inferChatVision(entry) {
+  const model = models.getModel(activeProviderId(), entry.id);
+  return Boolean(model?.input?.includes("image"));
+}
+
 /** Endpoints that are not chat models, even when the provider lists them. */
 const NOT_CHAT =
   /(tts|whisper|transcri|embedding|embed-|aqa|imagen|veo|dall-e|moderation|realtime)/i;
@@ -285,6 +380,8 @@ async function loadCatalog(baseUrl, apiKey) {
       id: model.id.replace(/^models\//, ""),
       efforts: getSupportedThinkingLevels(model),
     }));
+  resolved.mode = "api";
+  resolved.piProviderId = LLM_PROVIDER_ID;
   if (!catalog.length)
     fail("Nenhum modelo de chat no catálogo. Confira o provedor e a chave.");
 }
@@ -395,23 +492,29 @@ function label(settings) {
     : "nenhum escolhido (implícito: primeiro do catálogo)";
 }
 function printState(baseUrl) {
-  console.log(`Provedor: ${LLM_PROVIDER_ID}`);
+  const provider = activeProviderId();
+  console.log(`Provedor: ${provider}`);
   console.log(
-    `Endereço: ${baseUrl || process.env.LLM_BASE_URL?.trim() || "(não definido)"}`,
+    resolved.mode === "subscription"
+      ? "Autenticação: assinatura ChatGPT (OAuth no volume; equivalente a LLM_AUTH=chatgpt)"
+      : `Endereço: ${baseUrl || process.env.LLM_BASE_URL?.trim() || "(não definido)"}`,
   );
   console.log(`Padrão global: ${label(current())}`);
   console.log(`Funções: ${functionLabel(effectiveFunctions())}`);
   console.log(`Catálogo (${catalog.length}):`);
   for (const entry of catalog)
     console.log(
-      `  ${LLM_PROVIDER_ID}/${entry.id}  —  esforços: ${entry.efforts.join(" ")}`,
+      `  ${provider}/${entry.id}  —  esforços: ${entry.efforts.join(" ")}`,
     );
 }
 function entryFor(input) {
   const raw = String(input ?? "").trim();
-  const id = raw.startsWith(`${LLM_PROVIDER_ID}/`)
-    ? raw.slice(LLM_PROVIDER_ID.length + 1)
-    : raw;
+  const provider = activeProviderId();
+  const id = raw.startsWith(`${provider}/`)
+    ? raw.slice(provider.length + 1)
+    : raw.startsWith(`${LLM_PROVIDER_ID}/`)
+      ? raw.slice(LLM_PROVIDER_ID.length + 1)
+      : raw;
   const entry = catalog.find((candidate) => candidate.id === id);
   if (!entry)
     fail(
@@ -425,12 +528,70 @@ function effortFor(entry, input) {
   if (!requested)
     return previous && entry.efforts.includes(previous.effort)
       ? previous.effort
-      : clampThinkingLevel(models.getModel(LLM_PROVIDER_ID, entry.id), "high");
+      : clampThinkingLevel(
+          models.getModel(activeProviderId(), entry.id),
+          "high",
+        );
   if (!entry.efforts.includes(requested))
     fail(`Esforço inválido para ${entry.id}: use ${entry.efforts.join("|")}.`);
   return requested;
 }
+function commitSubscription(entry, effort, functions = currentFunctions()) {
+  const provider = resolved.piProviderId;
+  const settings = { provider, modelId: entry.id, effort };
+  const registered = models.getProvider(provider);
+  const record = {
+    providerId: provider,
+    baseUrl: registered?.baseUrl ?? resolved.baseUrl,
+    modelId: entry.id,
+    effort,
+    authMode: "chatgpt",
+    ...(resolved.chatVision === undefined
+      ? {}
+      : { chatVision: resolved.chatVision }),
+    ...(functions.vision ? { vision: functions.vision } : {}),
+    ...(functions.audio
+      ? {
+          audio: {
+            modelId: functions.audio.modelId,
+            api: functions.audio.api ?? "openai",
+            baseUrl:
+              process.env.AUDIO_BASE_URL?.trim() ||
+              (functions.audio.api === "gemini"
+                ? "https://generativelanguage.googleapis.com/v1beta"
+                : "https://api.openai.com/v1"),
+            ...(functions.audio.language
+              ? { language: functions.audio.language }
+              : {}),
+          },
+        }
+      : {}),
+  };
+  if (options.dryRun) {
+    console.log(`(dry-run) gravaria ${label(settings)} como padrão global.`);
+    return;
+  }
+  save(settings);
+  writeStoredSetup(db, record, {}, MODE);
+  const authStore = new Store(dir);
+  try {
+    writeChatgptAuthMode(authStore);
+  } finally {
+    authStore.close();
+  }
+  console.log(`Padrão global: ${label(settings)}`);
+  console.log(
+    `Configuração gravada no volume (${record.providerId}, authMode=chatgpt) — defina LLM_AUTH=chatgpt no deploy ou use só o registro do volume.`,
+  );
+  console.log(`Banco: ${join(dir, "app.sqlite")}`);
+  console.log(
+    "Conversas novas usam esse padrão; /model no Telegram continua sobrepondo por conversa.",
+  );
+}
+
 function commit(entry, effort, functions = currentFunctions()) {
+  if (resolved.mode === "subscription")
+    return commitSubscription(entry, effort, functions);
   const settings = { provider: LLM_PROVIDER_ID, modelId: entry.id, effort };
   const baseUrl = resolved.baseUrl.replace(/\/+$/, "");
   const apiKey = resolved.apiKey || undefined;
@@ -505,17 +666,71 @@ function commit(entry, effort, functions = currentFunctions()) {
     "Conversas novas usam esse padrão; /model no Telegram continua sobrepondo por conversa.",
   );
 }
-async function interactive() {
-  const readline = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-  try {
-    // 1/2 provider and key, so a fresh volume can build the catalog at all
-    const before = readStoredSetup(dir);
-    let baseUrl = process.env.LLM_BASE_URL?.trim() || before.record?.baseUrl;
-    let apiKey = operatorSecret(process.env, "LLM_API_KEY") ?? before.apiKey;
-
+async function runModelWizard(readline) {
+  if (!catalog.length) return fail("Nenhum modelo de chat neste provedor.");
+  const providerTag = activeProviderId();
+  console.log(`\nPadrão global atual: ${label(current())}`);
+  catalog.forEach((entry, index) =>
+    console.log(
+      `  [${index + 1}] ${providerTag}/${entry.id}  (esforços: ${entry.efforts.join(" ")})`,
+    ),
+  );
+  const answer = (
+    await readline.question("\nModelo (número ou id, q cancela): ")
+  ).trim();
+  if (!answer || answer === "q") return fail("Cancelado.", 0);
+  const index = Number(answer);
+  const entry =
+    Number.isSafeInteger(index) && index >= 1 && index <= catalog.length
+      ? catalog[index - 1]
+      : entryFor(answer);
+  console.log(`\nEsforços de ${entry.id}: ${entry.efforts.join(" ")}`);
+  const effort = effortFor(entry, await readline.question("Esforço: "));
+  const prefill = effectiveFunctions();
+  const stored = currentFunctions();
+  if (resolved.mode === "subscription") {
+    resolved.chatVision = inferChatVision(entry);
+    console.log(
+      `\nModelo do chat: ${
+        resolved.chatVision
+          ? "lê imagens (catálogo pi-ai)"
+          : "NÃO lê imagens (catálogo pi-ai)"
+      }`,
+    );
+  } else {
+    const chatProbe = await probeImageSupport({
+      modelId: entry.id,
+      baseUrl: resolved.baseUrl,
+      apiKey: resolved.apiKey,
+    });
+    resolved.chatVision = chatProbe.verdict === "vision";
+    console.log(
+      `\nModelo do chat: ${
+        resolved.chatVision
+          ? "lê imagens"
+          : chatProbe.verdict === "text"
+            ? "NÃO lê imagens"
+            : "não foi possível confirmar se lê imagens"
+      }${chatProbe.detail ? ` (${chatProbe.detail})` : ""}`,
+    );
+  }
+  console.log(
+    `\nIMAGEM — ${resolved.chatVision ? "Enter mantém o do chat, " : ""}"-" desativa. Modelos do mesmo provedor:`,
+  );
+  catalog.forEach((entry, index) =>
+    console.log(`  [${index + 1}] ${entry.id}`),
+  );
+  const visionAnswer = (
+    await readline.question(
+      `Modelo de visão [${prefill.vision?.modelId ?? "usa o do chat"}] (ou "o" para outro provedor): `,
+    )
+  ).trim();
+  let vision = stored.vision;
+  let visionBase = resolved.baseUrl;
+  let visionKey = resolved.apiKey;
+  if (visionAnswer === "-") vision = undefined;
+  else if (visionAnswer === "o") {
+    // Another provider: pick from the curated list instead of typing a URL.
     PROVIDERS.forEach((entry, index) =>
       console.log(
         `  [${index + 1}] ${entry.name}${entry.hint ? ` — ${entry.hint}` : ""}`,
@@ -523,14 +738,231 @@ async function interactive() {
     );
     const providerAnswer = (
       await readline.question(
-        `\nProvedor [${baseUrl ? `atual: ${baseUrl}` : "1"}]: `,
+        `Provedor de visão [${PROVIDERS.length} = outro endpoint]: `,
       )
     ).trim();
+    const picked = providerFromAnswer(providerAnswer);
+    if (!picked) return fail("Provedor de visão inválido.");
+    let base = picked.baseUrl;
+    if (!base)
+      base = (
+        await readline.question("URL raiz do provedor de visão: ")
+      ).trim();
+    if (!base) return fail("Visão desativada: sem endpoint.");
+    visionBase = base;
+    if (host(base) === host(resolved.baseUrl) && resolved.apiKey)
+      visionKey = resolved.apiKey;
+    else {
+      readline.pause();
+      visionKey = await hidden(
+        `Chave de ${PROVIDERS.find((entry) => entry.id === picked.id)?.name ?? "visão"} (não aparece): `,
+      );
+      readline.resume();
+    }
+    if (!visionKey) return fail("Visão desativada: sem chave.");
+    // Its own model list, so the id is not typed from memory either.
+    const listed = await listModels(base, visionKey);
+    if (listed.ok) {
+      const ids = listed.ids
+        .filter((id) => !NOT_CHAT.test(id))
+        .map((id) => id.replace(/^models\//, ""));
+      ids
+        .slice(0, 25)
+        .forEach((id, index) => console.log(`  [${index + 1}] ${id}`));
+      const modelAnswer = (
+        await readline.question("Modelo de visão (número ou id): ")
+      ).trim();
+      const index = Number(modelAnswer);
+      vision = {
+        modelId:
+          Number.isSafeInteger(index) && index >= 1 && index <= ids.length
+            ? ids[index - 1]
+            : modelAnswer,
+        baseUrl: base,
+      };
+    } else {
+      console.log(`  ! não consegui listar (${listed.detail})`);
+      vision = { modelId: "", baseUrl: base };
+    }
+  } else if (visionAnswer) vision = { modelId: pickFromCatalog(visionAnswer) };
+  if (vision) {
+    if (!vision.modelId) {
+      vision.modelId = (
+        await readline.question("Modelo de visão (id): ")
+      ).trim();
+      if (!vision.modelId) return fail("Visão desativada: sem modelo.");
+    }
+    resolved.visionKey = visionKey;
+    // Ask the chosen model itself, so the operator sees the truth before saving.
+    const verdict = await probeImageSupport({
+      modelId: vision.modelId,
+      baseUrl: visionBase,
+      apiKey: visionKey,
+    });
+    const label = {
+      vision: "lê imagens",
+      text: "só texto",
+      unknown: "não confirmado",
+    }[verdict.verdict];
+    console.log(
+      `  ${verdict.verdict === "vision" ? "✔" : verdict.verdict === "text" ? "✘" : "?"} ${vision.modelId}: ${label}${verdict.detail ? ` (${verdict.detail})` : ""}`,
+    );
+    if (verdict.verdict !== "vision") {
+      const keep = (
+        await readline.question("  Usar mesmo assim? [y/N] ")
+      ).trim();
+      if (!/^y(es)?$/i.test(keep)) vision = undefined;
+    }
+  }
+
+  // 4/4 audio: its own provider, because a chat endpoint does not transcribe
+  console.log('\nÁUDIO — Enter desativa, "-" desativa');
+  AUDIO_PROVIDERS.forEach((entry, index) =>
+    console.log(
+      `  [${index + 1}] ${entry.name}${entry.model ? ` — ${entry.model}` : ""}${entry.hint ? ` (${entry.hint})` : ""}`,
+    ),
+  );
+  const audioAnswer = (
+    await readline.question(
+      `Transcrição [${prefill.audio ? `${prefill.audio.modelId}` : "desativada"}]: `,
+    )
+  ).trim();
+  let audio = stored.audio;
+  if (audioAnswer === "-") audio = undefined;
+  else if (audioAnswer) {
+    const picked = pickAudio(audioAnswer);
+    if (!picked) return fail("Opção de áudio inválida.");
+    let base = picked.baseUrl;
+    let api = picked.api;
+    let model = picked.model;
+    if (!base) {
+      base = (
+        await readline.question("Endpoint de transcrição (URL raiz): ")
+      ).trim();
+      const format = (
+        await readline.question(
+          "Formato [1] OpenAI multipart [2] Gemini JSON [1]: ",
+        )
+      ).trim();
+      api = format === "2" ? "gemini" : "openai";
+      model = (await readline.question("Modelo de transcrição (id): ")).trim();
+      if (!base || !model)
+        return fail("Áudio desativado: faltou endpoint ou modelo.");
+    }
+    let audioKey = host(base) === host(resolved.baseUrl) ? resolved.apiKey : "";
+    if (!audioKey) {
+      readline.pause();
+      audioKey = await hidden(`Chave da ${picked.name} (não aparece): `);
+      readline.resume();
+    }
+    if (!audioKey) return fail("Áudio desativado: sem chave.");
+    resolved.audioKey = audioKey;
+    const language = (
+      await readline.question(`Idioma [${prefill.audio?.language || "auto"}]: `)
+    ).trim();
+    audio = {
+      modelId: model,
+      api,
+      baseUrl: base,
+      ...(language ? { language } : {}),
+    };
+    console.log(
+      "  ⚠ o modelo precisa aceitar ogg (whisper-1, Gemini e Groq aceitam)",
+    );
+  }
+  const selection = {
+    ...(vision ? { vision } : {}),
+    ...(audio ? { audio } : {}),
+  };
+  console.log(`\n${functionLabel(selection)}`);
+  const confirm = (
+    await readline.question(`Gravar chat ${entry.id} · ${effort}? [y/N] `)
+  ).trim();
+  if (!/^y(es)?$/i.test(confirm)) return fail("Cancelado.", 0);
+  commit(entry, effort, selection);
+  if (options.dryRun)
+    console.log(`(dry-run) gravaria ${functionLabel(selection)}.`);
+  else console.log(`Funções: ${functionLabel(selection)}`);
+}
+
+async function interactive() {
+  const readline = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  try {
+    const before = readStoredSetup(dir);
+    let baseUrl = process.env.LLM_BASE_URL?.trim() || before.record?.baseUrl;
+    let apiKey = operatorSecret(process.env, "LLM_API_KEY") ?? before.apiKey;
+
+    console.log(
+      "  [0] ChatGPT (assinatura Plus/Pro — OAuth, sem chave de API)",
+    );
+    PROVIDERS.forEach((entry, index) =>
+      console.log(
+        `  [${index + 1}] ${entry.name}${entry.hint ? ` — ${entry.hint}` : ""}`,
+      ),
+    );
+    const defaultHint =
+      before.record?.authMode === "chatgpt"
+        ? "0"
+        : baseUrl
+          ? `atual: ${baseUrl}`
+          : "1";
+    const providerAnswer = (
+      await readline.question(`\nProvedor [${defaultHint}]: `)
+    ).trim();
+
+    const useSubscription =
+      isSubscriptionChoice(providerAnswer) ||
+      (!providerAnswer && before.record?.authMode === "chatgpt");
+
+    if (useSubscription) {
+      let piProviderId = "openai";
+      if (
+        before.record?.authMode === "chatgpt" &&
+        (before.record.providerId === "openai" ||
+          before.record.providerId === "openai-codex")
+      ) {
+        piProviderId = before.record.providerId;
+      }
+      if (
+        providerAnswer &&
+        providerAnswer !== "0" &&
+        providerAnswer !== "chatgpt" &&
+        providerAnswer !== "subscription"
+      ) {
+        piProviderId = subscriptionPiProvider(providerAnswer);
+      } else if (
+        !providerAnswer &&
+        before.record?.authMode === "chatgpt" &&
+        before.record.providerId
+      ) {
+        piProviderId = before.record.providerId;
+      } else if (!providerAnswer && before.record?.authMode !== "chatgpt") {
+        const subFlow = (
+          await readline.question(
+            "Assinatura [1] Sign in with ChatGPT (openai) [2] Codex legado (openai-codex) [1]: ",
+          )
+        ).trim();
+        piProviderId = subFlow === "2" ? "openai-codex" : "openai";
+      } else if (providerAnswer === "0" || providerAnswer === "chatgpt") {
+        const subFlow = (
+          await readline.question(
+            "Assinatura [1] Sign in with ChatGPT (openai) [2] Codex legado (openai-codex) [1]: ",
+          )
+        ).trim();
+        piProviderId = subFlow === "2" ? "openai-codex" : "openai";
+      }
+      await loadSubscriptionCatalog(readline, piProviderId);
+      await runModelWizard(readline);
+      return;
+    }
+
     if (providerAnswer) {
       const picked = providerFromAnswer(providerAnswer);
       if (!picked)
         return fail("Provedor inválido: use o número, o id ou a URL raiz.");
-      // "Outro" has no endpoint of its own: ask for the root URL.
       let pickedUrl = picked.baseUrl;
       if (!pickedUrl)
         pickedUrl = (
@@ -541,7 +973,6 @@ async function interactive() {
       if (!pickedUrl) return fail("Provedor inválido: sem URL.");
       if (pickedUrl !== baseUrl) {
         baseUrl = pickedUrl;
-        // A different provider means a different key.
         apiKey = undefined;
       }
     }
@@ -568,224 +999,8 @@ async function interactive() {
     resolved.apiKey = apiKey;
     resolved.providerId = providerIdFor(baseUrl);
     await loadCatalog(baseUrl, apiKey);
-
-    // 2/2 model, effort and the optional backends
-    if (!catalog.length) return fail("Nenhum modelo de chat neste provedor.");
-    console.log(`\nPadrão global atual: ${label(current())}`);
-    catalog.forEach((entry, index) =>
-      console.log(
-        `  [${index + 1}] ${LLM_PROVIDER_ID}/${entry.id}  (esforços: ${entry.efforts.join(" ")})`,
-      ),
-    );
-    const answer = (
-      await readline.question("\nModelo (número ou id, q cancela): ")
-    ).trim();
-    if (!answer || answer === "q") return fail("Cancelado.", 0);
-    const index = Number(answer);
-    const entry =
-      Number.isSafeInteger(index) && index >= 1 && index <= catalog.length
-        ? catalog[index - 1]
-        : entryFor(answer);
-    console.log(`\nEsforços de ${entry.id}: ${entry.efforts.join(" ")}`);
-    const effort = effortFor(entry, await readline.question("Esforço: "));
-    const prefill = effectiveFunctions();
-    const stored = currentFunctions();
-    // 3/4 image: the same catalog, minus the choice of keeping the chat model
-    // Does the chat model itself read images? The probe decides what "Enter mantém"
-    // means, so the operator does not have to guess.
-    const chatProbe = await probeImageSupport({
-      modelId: entry.id,
-      baseUrl: resolved.baseUrl,
-      apiKey: resolved.apiKey,
-    });
-    resolved.chatVision = chatProbe.verdict === "vision";
-    console.log(
-      `\nModelo do chat: ${
-        resolved.chatVision
-          ? "lê imagens"
-          : chatProbe.verdict === "text"
-            ? "NÃO lê imagens"
-            : "não foi possível confirmar se lê imagens"
-      }${chatProbe.detail ? ` (${chatProbe.detail})` : ""}`,
-    );
-    console.log(
-      `\nIMAGEM — ${resolved.chatVision ? "Enter mantém o do chat, " : ""}"-" desativa. Modelos do mesmo provedor:`,
-    );
-    catalog.forEach((entry, index) =>
-      console.log(`  [${index + 1}] ${entry.id}`),
-    );
-    const visionAnswer = (
-      await readline.question(
-        `Modelo de visão [${prefill.vision?.modelId ?? "usa o do chat"}] (ou "o" para outro provedor): `,
-      )
-    ).trim();
-    let vision = stored.vision;
-    let visionBase = resolved.baseUrl;
-    let visionKey = resolved.apiKey;
-    if (visionAnswer === "-") vision = undefined;
-    else if (visionAnswer === "o") {
-      // Another provider: pick from the curated list instead of typing a URL.
-      PROVIDERS.forEach((entry, index) =>
-        console.log(
-          `  [${index + 1}] ${entry.name}${entry.hint ? ` — ${entry.hint}` : ""}`,
-        ),
-      );
-      const providerAnswer = (
-        await readline.question(
-          `Provedor de visão [${PROVIDERS.length} = outro endpoint]: `,
-        )
-      ).trim();
-      const picked = providerFromAnswer(providerAnswer);
-      if (!picked) return fail("Provedor de visão inválido.");
-      let base = picked.baseUrl;
-      if (!base)
-        base = (
-          await readline.question("URL raiz do provedor de visão: ")
-        ).trim();
-      if (!base) return fail("Visão desativada: sem endpoint.");
-      visionBase = base;
-      if (host(base) === host(resolved.baseUrl) && resolved.apiKey)
-        visionKey = resolved.apiKey;
-      else {
-        readline.pause();
-        visionKey = await hidden(
-          `Chave de ${PROVIDERS.find((entry) => entry.id === picked.id)?.name ?? "visão"} (não aparece): `,
-        );
-        readline.resume();
-      }
-      if (!visionKey) return fail("Visão desativada: sem chave.");
-      // Its own model list, so the id is not typed from memory either.
-      const listed = await listModels(base, visionKey);
-      if (listed.ok) {
-        const ids = listed.ids
-          .filter((id) => !NOT_CHAT.test(id))
-          .map((id) => id.replace(/^models\//, ""));
-        ids
-          .slice(0, 25)
-          .forEach((id, index) => console.log(`  [${index + 1}] ${id}`));
-        const modelAnswer = (
-          await readline.question("Modelo de visão (número ou id): ")
-        ).trim();
-        const index = Number(modelAnswer);
-        vision = {
-          modelId:
-            Number.isSafeInteger(index) && index >= 1 && index <= ids.length
-              ? ids[index - 1]
-              : modelAnswer,
-          baseUrl: base,
-        };
-      } else {
-        console.log(`  ! não consegui listar (${listed.detail})`);
-        vision = { modelId: "", baseUrl: base };
-      }
-    } else if (visionAnswer)
-      vision = { modelId: pickFromCatalog(visionAnswer) };
-    if (vision) {
-      if (!vision.modelId) {
-        vision.modelId = (
-          await readline.question("Modelo de visão (id): ")
-        ).trim();
-        if (!vision.modelId) return fail("Visão desativada: sem modelo.");
-      }
-      resolved.visionKey = visionKey;
-      // Ask the chosen model itself, so the operator sees the truth before saving.
-      const verdict = await probeImageSupport({
-        modelId: vision.modelId,
-        baseUrl: visionBase,
-        apiKey: visionKey,
-      });
-      const label = {
-        vision: "lê imagens",
-        text: "só texto",
-        unknown: "não confirmado",
-      }[verdict.verdict];
-      console.log(
-        `  ${verdict.verdict === "vision" ? "✔" : verdict.verdict === "text" ? "✘" : "?"} ${vision.modelId}: ${label}${verdict.detail ? ` (${verdict.detail})` : ""}`,
-      );
-      if (verdict.verdict !== "vision") {
-        const keep = (
-          await readline.question("  Usar mesmo assim? [y/N] ")
-        ).trim();
-        if (!/^y(es)?$/i.test(keep)) vision = undefined;
-      }
-    }
-
-    // 4/4 audio: its own provider, because a chat endpoint does not transcribe
-    console.log('\nÁUDIO — Enter desativa, "-" desativa');
-    AUDIO_PROVIDERS.forEach((entry, index) =>
-      console.log(
-        `  [${index + 1}] ${entry.name}${entry.model ? ` — ${entry.model}` : ""}${entry.hint ? ` (${entry.hint})` : ""}`,
-      ),
-    );
-    const audioAnswer = (
-      await readline.question(
-        `Transcrição [${prefill.audio ? `${prefill.audio.modelId}` : "desativada"}]: `,
-      )
-    ).trim();
-    let audio = stored.audio;
-    if (audioAnswer === "-") audio = undefined;
-    else if (audioAnswer) {
-      const picked = pickAudio(audioAnswer);
-      if (!picked) return fail("Opção de áudio inválida.");
-      let base = picked.baseUrl;
-      let api = picked.api;
-      let model = picked.model;
-      if (!base) {
-        base = (
-          await readline.question("Endpoint de transcrição (URL raiz): ")
-        ).trim();
-        const format = (
-          await readline.question(
-            "Formato [1] OpenAI multipart [2] Gemini JSON [1]: ",
-          )
-        ).trim();
-        api = format === "2" ? "gemini" : "openai";
-        model = (
-          await readline.question("Modelo de transcrição (id): ")
-        ).trim();
-        if (!base || !model)
-          return fail("Áudio desativado: faltou endpoint ou modelo.");
-      }
-      let audioKey =
-        host(base) === host(resolved.baseUrl) ? resolved.apiKey : "";
-      if (!audioKey) {
-        readline.pause();
-        audioKey = await hidden(`Chave da ${picked.name} (não aparece): `);
-        readline.resume();
-      }
-      if (!audioKey) return fail("Áudio desativado: sem chave.");
-      resolved.audioKey = audioKey;
-      const language = (
-        await readline.question(
-          `Idioma [${prefill.audio?.language || "auto"}]: `,
-        )
-      ).trim();
-      audio = {
-        modelId: model,
-        api,
-        baseUrl: base,
-        ...(language ? { language } : {}),
-      };
-      console.log(
-        "  ⚠ o modelo precisa aceitar ogg (whisper-1, Gemini e Groq aceitam)",
-      );
-    }
-    const selection = {
-      ...(vision ? { vision } : {}),
-      ...(audio ? { audio } : {}),
-    };
-    console.log(`\n${functionLabel(selection)}`);
-    console.log(`\n${functionLabel(selection)}`);
-    const confirm = (
-      await readline.question(`Gravar chat ${entry.id} · ${effort}? [y/N] `)
-    ).trim();
-    if (!/^y(es)?$/i.test(confirm)) return fail("Cancelado.", 0);
-    commit(entry, effort, selection);
-    if (options.dryRun)
-      console.log(`(dry-run) gravaria ${functionLabel(selection)}.`);
-    else console.log(`Funções: ${functionLabel(selection)}`);
+    await runModelWizard(readline);
   } catch (error) {
-    // Ctrl+D / closed stdin must cancel, not print a stack trace.
     if (error instanceof Error && error.name === "AbortError")
       return fail("Cancelado.", 0);
     throw error;
@@ -845,27 +1060,59 @@ try {
   } else {
     // Non-interactive path: flags, then the environment, then the stored setup.
     const stored = readStoredSetup(dir);
-    const picked = options.provider
-      ? providerFromAnswer(options.provider)
-      : undefined;
+    const subscriptionFlags =
+      options.provider && isSubscriptionChoice(options.provider);
+    if (subscriptionFlags) {
+      const piProviderId =
+        options.provider === "openai-codex" ? "openai-codex" : "openai";
+      await loadSubscriptionCatalog(undefined, piProviderId);
+    } else {
+      const picked = options.provider
+        ? providerFromAnswer(options.provider)
+        : undefined;
+      const baseUrl =
+        picked?.baseUrl ??
+        process.env.LLM_BASE_URL?.trim() ??
+        stored.record?.baseUrl;
+      const apiKey = options.keyStdin
+        ? (await readStdin()).trim()
+        : (operatorSecret(process.env, "LLM_API_KEY") ?? stored.apiKey);
+      if (baseUrl && apiKey) {
+        resolved.baseUrl = baseUrl;
+        resolved.apiKey = apiKey;
+        resolved.providerId = providerIdFor(baseUrl);
+        await loadCatalog(baseUrl, apiKey);
+      } else if (writes && !subscriptionFlags)
+        fail(
+          "Falta provedor ou chave: use --provider e LLM_API_KEY (ou --key-stdin), ou --provider chatgpt|openai-codex após login.",
+        );
+    }
     const baseUrl =
-      picked?.baseUrl ??
-      process.env.LLM_BASE_URL?.trim() ??
+      resolved.baseUrl ||
+      process.env.LLM_BASE_URL?.trim() ||
       stored.record?.baseUrl;
-    const apiKey = options.keyStdin
-      ? (await readStdin()).trim()
-      : (operatorSecret(process.env, "LLM_API_KEY") ?? stored.apiKey);
-    if (baseUrl && apiKey) {
-      resolved.baseUrl = baseUrl;
-      resolved.apiKey = apiKey;
-      resolved.providerId = providerIdFor(baseUrl);
-      await loadCatalog(baseUrl, apiKey);
-    } else if (writes)
-      fail(
-        "Falta provedor ou chave: use --provider e LLM_API_KEY (ou --key-stdin).",
-      );
+    if (
+      !writes &&
+      !catalog.length &&
+      stored.record?.authMode === "chatgpt" &&
+      stored.record.providerId
+    ) {
+      try {
+        await loadSubscriptionCatalog(
+          undefined,
+          stored.record.providerId === "openai" ? "openai" : "openai-codex",
+        );
+      } catch (error) {
+        if (!(
+          error instanceof Error && error.code === "SUBSCRIPTION_LOGIN_REQUIRED"
+        ))
+          throw error;
+      }
+    }
     if (!writes) printState(baseUrl);
-    else {
+    else if (!catalog.length && subscriptionFlags)
+      fail("Catálogo vazio: confira o login da assinatura.");
+    else if (writes) {
       const entry = entryFor(
         options.model ?? current()?.modelId ?? catalog[0]?.id,
       );
@@ -873,15 +1120,22 @@ try {
         ? selectionFromFlags()
         : currentFunctions();
       if (resolved.chatVision === undefined) {
-        const probe = await probeImageSupport({
-          modelId: entry.id,
-          baseUrl: resolved.baseUrl,
-          apiKey: resolved.apiKey,
-        });
-        resolved.chatVision = probe.verdict === "vision";
-        console.log(
-          `Modelo do chat: ${probe.verdict === "vision" ? "lê imagens" : probe.verdict === "text" ? "NÃO lê imagens" : "não confirmado"}${probe.detail ? ` (${probe.detail})` : ""}`,
-        );
+        if (resolved.mode === "subscription") {
+          resolved.chatVision = inferChatVision(entry);
+          console.log(
+            `Modelo do chat: ${resolved.chatVision ? "lê imagens (catálogo)" : "NÃO lê imagens (catálogo)"}`,
+          );
+        } else {
+          const probe = await probeImageSupport({
+            modelId: entry.id,
+            baseUrl: resolved.baseUrl,
+            apiKey: resolved.apiKey,
+          });
+          resolved.chatVision = probe.verdict === "vision";
+          console.log(
+            `Modelo do chat: ${probe.verdict === "vision" ? "lê imagens" : probe.verdict === "text" ? "NÃO lê imagens" : "não confirmado"}${probe.detail ? ` (${probe.detail})` : ""}`,
+          );
+        }
       }
       commit(entry, effortFor(entry, options.effort), selection);
       if (functionFlags) {

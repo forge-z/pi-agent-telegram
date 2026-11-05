@@ -12,6 +12,8 @@ export interface SetupRecord {
   baseUrl: string;
   modelId: string;
   effort?: string;
+  /** Persisted on the volume; equivalent to `LLM_AUTH=chatgpt` when env is unset. */
+  authMode?: "chatgpt";
   /** Probe result for the chat model, so runtime stops guessing it reads images. */
   chatVision?: boolean;
   vision?: { modelId: string; baseUrl?: string };
@@ -53,10 +55,16 @@ export function readStoredSetup(dir: string, mode = "live"): StoredSetup {
     const apiKey = credential?.value
       ? (JSON.parse(credential.value) as { key?: string }).key
       : undefined;
+    const subscription =
+      record?.authMode === "chatgpt" ||
+      record?.providerId === "openai" ||
+      record?.providerId === "openai-codex";
     // A record without an endpoint is a half-written row (an old wizard bug): treat it
     // as "not configured" instead of failing every attempt to start.
     return {
-      ...(record?.modelId && record.baseUrl ? { record } : {}),
+      ...(record?.modelId && (record.baseUrl || subscription)
+        ? { record }
+        : {}),
       ...(apiKey ? { apiKey } : {}),
     };
   } catch {
@@ -90,6 +98,8 @@ export function writeStoredSetup(
   );
   if (keys.chat)
     write.run("llm", JSON.stringify({ type: "api_key", key: keys.chat }));
+  else if (record.authMode === "chatgpt")
+    db.prepare("DELETE FROM credentials WHERE provider=?").run("llm");
   // A function on another host needs its own key; empty removes a stale one.
   for (const kind of ["vision", "audio"] as const) {
     const key = keys[kind];

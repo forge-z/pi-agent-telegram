@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { Type } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { defineTool, type ToolExecutionApi } from "@earendil-works/pi-durable";
 import type { Runtime } from "./runtime.js";
 import { INSTABOX_CODE_TASK_TOOL } from "./job-manifest.js";

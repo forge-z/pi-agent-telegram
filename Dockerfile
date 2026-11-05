@@ -17,7 +17,7 @@ COPY --chmod=0644 package*.json ./
 RUN --mount=type=secret,id=npm_ca \
     if [ -f /run/secrets/npm_ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/npm_ca; fi; npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
 COPY --from=build --chown=node:node /app/dist ./dist
-COPY --chown=node:node scripts/diagnose-tg-runtime.mjs scripts/diagnose-tg-deploy.sh scripts/setup-model.mjs ./scripts/
+COPY --chown=node:node scripts/diagnose-tg-runtime.mjs scripts/diagnose-tg-deploy.sh scripts/setup-model.mjs scripts/login.mjs ./scripts/
 COPY --chown=node:node LICENSE THIRD_PARTY_NOTICES.md ./
 COPY --chown=node:node vendor ./vendor
 RUN mkdir -p /app/data && chown node:node /app/data && chmod 700 /app/data
