@@ -4,7 +4,7 @@ import { Runtime } from "./runtime.js";
 import { McpGateway } from "./mcp.js";
 import {
   readConfig,
-  environmentModels,
+  bootstrapModels,
   LLM_PROVIDER_ID,
   secretRedactor,
   SetupRequiredError,
@@ -12,6 +12,7 @@ import {
   telegramAllowlistMisconfiguration,
 } from "./config.js";
 import { readStoredSetup, type StoredSetup } from "./setup.js";
+import { Store, SqlCredentials } from "./store.js";
 
 /**
  * A bot with no provider cannot answer, and killing the container would take away the
@@ -21,27 +22,42 @@ import { readStoredSetup, type StoredSetup } from "./setup.js";
 async function modelsOrWait(dir: string) {
   for (let attempt = 0; ; attempt += 1) {
     const stored = readStoredSetup(dir);
+    const store = new Store(dir);
     try {
-      return {
-        models: await environmentModels(process.env, { stored }),
+      const credentials = new SqlCredentials(store);
+      const models = await bootstrapModels(credentials, process.env, {
         stored,
-      };
+      });
+      return { models, stored, store };
     } catch (error) {
+      store.close();
       if (!(error instanceof SetupRequiredError)) throw error;
-      if (attempt === 0)
+      if (attempt === 0) {
+        const needsLogin = setupNeedsLogin(error);
         console.error(
-          "Sem provedor configurado. Rode `npm run setup` no terminal do container; " +
-            "o bot começa a responder sozinho quando o assistente terminar.",
+          needsLogin
+            ? "Assinatura ChatGPT ainda não autenticada. Rode `npm run login` no terminal do container; " +
+                "o bot começa a responder sozinho quando o login terminar."
+            : "Sem provedor configurado. Rode `npm run setup` no terminal do container; " +
+                "o bot começa a responder sozinho quando o assistente terminar.",
         );
+      }
       // Waiting is the expected state, not a fault: keep the healthcheck green so the
       // platform does not restart the container that holds the terminal you need.
       writeFileSync(
         join(dir, "health.json"),
-        JSON.stringify({ at: Date.now(), waiting: "setup" }),
+        JSON.stringify({
+          at: Date.now(),
+          waiting: setupNeedsLogin(error) ? "login" : "setup",
+        }),
       );
       await new Promise((done) => setTimeout(done, 10_000));
     }
   }
+}
+
+function setupNeedsLogin(error: SetupRequiredError) {
+  return /login/i.test(error.message);
 }
 import { TelegramBotApi } from "./telegram-api.js";
 import { configureTelegram, TelegramPolling } from "./telegram-polling.js";
@@ -53,14 +69,24 @@ try {
   const {
     models,
     stored,
+    store: bootstrapStore,
   }: {
-    models: Awaited<ReturnType<typeof environmentModels>>;
+    models: Awaited<ReturnType<typeof bootstrapModels>>;
     stored: StoredSetup;
+    store: Store;
   } = await modelsOrWait(dir);
   // Safe deploy hint: endpoint and catalog only, never credentials.
-  const catalog = models.getModels(LLM_PROVIDER_ID);
+  const llm = models.getProvider(LLM_PROVIDER_ID);
+  const llmCatalog = models.getModels(LLM_PROVIDER_ID);
+  const oauthProviders = models
+    .getProviders()
+    .filter(
+      (provider) => provider.id === "openai" || provider.id === "openai-codex",
+    );
   console.info(
-    `Pi-Agent: provedor ${LLM_PROVIDER_ID} (${models.getProvider(LLM_PROVIDER_ID)?.baseUrl ?? "sem endpoint"}) — ${catalog.length} modelo(s), reasoning habilitado em ${catalog.filter((model) => model.reasoning).length}.`,
+    llm
+      ? `Pi-Agent: provedor ${LLM_PROVIDER_ID} (${llm.baseUrl ?? "sem endpoint"}) — ${llmCatalog.length} modelo(s), reasoning habilitado em ${llmCatalog.filter((model) => model.reasoning).length}.`
+      : `Pi-Agent: sem provedor LLM_*; assinatura ChatGPT via ${oauthProviders.map((p) => p.id).join(", ") || "openai"}.`,
   );
   const api = new TelegramBotApi(config.token);
   const bot = (await api.call("getMe")) as { id: number; username?: string };
@@ -70,6 +96,7 @@ try {
   const gateway = new McpGateway(config.mcp);
   const app = await Runtime.open({
     dir,
+    store: bootstrapStore,
     gateway,
     models,
     mode: "live",
@@ -77,7 +104,11 @@ try {
     // Bootstrap only: the choice from `npm run setup` seeds the default once;
     // /model and /thinking own it afterwards.
     ...(stored.record
-      ? { modelId: stored.record.modelId, effort: stored.record.effort }
+      ? {
+          provider: stored.record.providerId,
+          modelId: stored.record.modelId,
+          effort: stored.record.effort,
+        }
       : {}),
     redact: secretRedactor(process.env, config.mcp),
     initialize: (store) => configureTelegram(store, config, bot),

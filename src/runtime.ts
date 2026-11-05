@@ -24,7 +24,8 @@ import {
   fauxProvider,
   fauxAssistantMessage,
 } from "@earendil-works/pi-ai/providers/faux";
-import { Type, type ImageContent, type Message } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
+import type { ImageContent, Message } from "@earendil-works/pi-ai";
 import {
   Harness,
   createRegistry,
@@ -40,8 +41,11 @@ import {
   type Submission,
   type SubmissionId,
   type EntryId,
-  type ReportInfo,
+  type Report,
+  type ReportTask,
   type UserInput,
+  ConversationBusy,
+  ConversationIdle,
 } from "@earendil-works/pi-durable";
 import {
   openNodeSqliteDatabase,
@@ -116,22 +120,14 @@ export function settleFailureCategory(settled: {
     : settled.status;
 }
 /**
- * What the owner of a parked task is told. The count comes from Pi's own report
- * (`cut off N times`); the chat states that cause and how to run the task again.
+ * What the owner is told when Pi hits the restart limit on a built-in task.
+ * The count comes from the report (`restarts`); the chat explains how to retry.
  */
-function parkedTaskNotice(
-  error: unknown,
-  task: { id: number | string; kind: string },
-) {
-  const detail = error instanceof Error ? error.message : String(error);
-  const cuts = /cut off (\d+) times/.exec(detail)?.[1];
-  const cause = cuts
-    ? `foi interrompida ${cuts} vezes seguidas sem avançar (limite de reinício) e ficou estacionada`
-    : detail;
+function restartLimitNotice(task: ReportTask, restarts: number) {
   return [
-    `Tarefa estacionada: ${task.kind} #${task.id} nesta conversa.`,
-    `Causa: ${cause}.`,
-    "Envie /retomar neste tópico para executá-la de novo.",
+    `Tarefa interrompida: ${task.kind} #${task.id} nesta conversa.`,
+    `Causa: foi cortada ${restarts} vezes seguidas sem avançar (limite de reinício).`,
+    "Envie /retomar neste tópico para tentar continuar a resposta pendente.",
   ].join("\n");
 }
 /**
@@ -157,6 +153,8 @@ export function settleFailureReason(settled: {
 
 interface RuntimeOptions {
   dir: string;
+  /** When set with externally built `models`, must be the same Store the credential adapter uses. */
+  store?: Store;
   telegramOnly?: boolean;
   redact?: (text: string) => string;
   initialize?: (store: Store) => void;
@@ -293,7 +291,7 @@ export class Runtime {
   }
   private constructor(readonly options: RuntimeOptions) {
     this.pendingJobs = new PendingJobs(this, options.env ?? process.env);
-    this.store = new Store(options.dir);
+    this.store = options.store ?? new Store(options.dir);
     this.actions = new Actions(this.store, options.gateway);
     this.models =
       options.models ??
@@ -921,7 +919,7 @@ export class Runtime {
             followUpMode: "one-at-a-time",
             retry: { maxRetries: 2 },
           },
-          onReport: (error, info) => app!.notifyParked(error, info),
+          onReport: (report) => app!.notifyRestartLimit(report),
         },
         context,
       );
@@ -1619,16 +1617,17 @@ export class Runtime {
     return this.options.now?.() ?? Date.now();
   }
 
-  /** A task parked by the restart limit is told to the conversation's topic, once. */
-  private notifyParked(error: unknown, info: ReportInfo) {
-    if (info.type !== "task_parked") return;
-    const conversationId = String(info.task.conversationId);
-    const text = parkedTaskNotice(error, info.task);
+  /** A built-in task that hit the restart limit is announced once in the conversation topic. */
+  private notifyRestartLimit(report: Report) {
+    if (report.kind !== "task_interrupted" || report.reason !== "restart_limit")
+      return;
+    const text = restartLimitNotice(report.task, report.restarts);
     console.warn(text);
+    const conversationId = String(report.task.conversationId);
     const route = telegramConversationRoute(this.store, conversationId);
     if (!route) return;
     this.store.queueTelegram(
-      `parked:${info.task.id}`,
+      `parked:${report.task.id}`,
       route.chat,
       text,
       3500,
@@ -1638,21 +1637,18 @@ export class Runtime {
     this.flushTelegramPending?.();
   }
 
-  /** Run again the tasks this conversation left parked. Returns the ones it resumed. */
+  /** After restart-limit failure, try a durable `continue` on the idle conversation. */
   async resumeParked(conversationId: string) {
-    const inspection = await this.harness.inspect(context);
-    const parked = inspection.tasks.filter(
-      (task) =>
-        String(task.record.conversationId) === conversationId &&
-        task.state.kind === "blocked" &&
-        task.state.reason === "restart_limit",
-    );
-    for (const task of parked)
-      await this.harness.retryTask(task.record.id, context);
-    return parked.map((task) => ({
-      id: String(task.record.id),
-      kind: task.record.kind,
-    }));
+    this.harness.resume();
+    const conversation = await this.conversation(conversationId);
+    try {
+      await conversation.submit({ type: "continue" }, context);
+      return [{ id: conversationId, kind: "continue" }];
+    } catch (error) {
+      if (error instanceof ConversationBusy) return [];
+      if (error instanceof ConversationIdle) return [];
+      throw error;
+    }
   }
 
   /** One serial sweep, with failures isolated so another conversation can expire. */
@@ -2717,11 +2713,11 @@ export class Runtime {
   }
   async snapshot(id: string, compact = false) {
     const conversation = await this.conversation(id);
-    const view = await conversation.viewState(context);
+    const watch = await conversation.watch(context);
     try {
       return {
         settings: await this.settings.conversation(id),
-        view: view.value,
+        view: watch.value,
         // Completed MCP payloads already live in immutable history. Compact
         // clients need only unresolved controls, not a second copy of results.
         actions: compact
@@ -2758,7 +2754,7 @@ export class Runtime {
         ),
       };
     } finally {
-      view.dispose();
+      await watch.stop();
     }
   }
   conversationDeliveryRows(id: string, compact = false) {
@@ -2833,11 +2829,12 @@ export class Runtime {
   }
   async watch(id: string, listener: () => void) {
     const conversation = await this.conversation(id);
-    const view = await conversation.viewState(context);
-    const off = view.subscribe(listener);
-    return () => {
-      off();
-      view.dispose();
+    const handle = await conversation.watch(context);
+    handle.start(async () => {
+      listener();
+    });
+    return async () => {
+      await handle.stop();
     };
   }
   async close() {

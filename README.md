@@ -50,8 +50,22 @@ docker exec -it <container> npm run setup
 **Run this before the bot is usable.** A fresh container has no provider, so it logs `Configuração inicial ausente` and waits — it stays up and healthy rather than restart-looping, which is what keeps the terminal available. The wizard is what ends that wait. It speaks Portuguese; this is the flow:
 
 ```
+[0] ChatGPT (assinatura Plus/Pro — OAuth, sem chave de API)
 [1] DeepSeek  [2] Gemini  [3] OpenAI  [4] OpenCode Zen
 [5] OpenCode Go  [6] OpenRouter  [7] Outro (OpenAI-compatible)
+Provedor [1]: 0
+Assinatura [1] Sign in with ChatGPT (openai) [2] Codex legado (openai-codex) [1]: 1
+Siga o login OAuth abaixo (código de dispositivo ou cole a URL de redirect se pedido).
+…
+openai/gpt-5  —  esforços: off low high
+Modelo (número ou id): 1
+Esforço: high
+Configuração gravada no volume (openai, authMode=chatgpt) — defina LLM_AUTH=chatgpt no deploy ou use só o registro do volume.
+```
+
+Or pick **`[3] OpenAI`** (or any other entry) for the classic API-key flow:
+
+```
 Provedor [1]: 2
 Chave de API (não aparece): █                     ← hidden; validated on the spot
   ✔ chave válida — 63 modelos listados
@@ -68,14 +82,18 @@ Gravar? [y/N] y
 Configuração gravada no volume (gemini) — as variáveis LLM_* deixam de ser necessárias.
 ```
 
-1. **Provider** — a number from the list, an id, or a root URL. "Outro" asks for the URL.
-2. **Key** — never echoed, checked against `GET /models` before going further; a wrong key is rejected right there.
-3. **Model and effort** — the list is what that provider actually serves, not a guess.
+1. **Provider** — **`[0] ChatGPT`** (OAuth, no `LLM_API_KEY`) or a number, id, or root URL of an API-key provider. For ChatGPT, choose Sign in with ChatGPT (`openai`) or legacy Codex (`openai-codex`); the login is the same as `npm run login`.
+2. **Key** — API-key mode only. Never echoed, checked against `GET /models` before going further; a wrong key is rejected right there.
+3. **Model and effort** — the list uses the matching pi-ai provider (`llm` with a key, or `openai` / `openai-codex` on a subscription). The global default is stored in `meta` with the same `provider` `/model` expects.
 4. **Image** — the chat model is probed; if it reads images, Enter keeps it as is. `o` opens the provider list again (vision on Gemini while the chat runs on DeepSeek), `-` disables.
 5. **Audio** — a transcription endpoint, since a chat endpoint cannot transcribe. It warns that the model must accept OGG/Opus.
 6. **Confirm** — the choice goes to `meta`, the keys to `credentials`, and the bot starts answering within ten seconds. No restart.
 
 Every step after the first can be skipped with Enter, and `npm run setup` can be run again later: it shows the current values and keeps whatever you do not change. Environment variables still work and win over the stored setup.
+
+## ChatGPT subscription (no API key)
+
+Set `LLM_AUTH=chatgpt` without `LLM_API_KEY`, start the container, then run `docker exec -it <container> npm run login` once. Tokens are stored in the volume SQLite (`credentials` table) with automatic refresh via pi-ai. Use `/model` to pick `openai` (Sign in with ChatGPT) or `openai-codex` (legacy Codex; `npm run login -- openai-codex --device-code` for headless VPS). The same login is offered as **`[0] ChatGPT`** inside `npm run setup`. API-key mode (`LLM_*` or setup options `[1]`–`[7]`) is unchanged. See [README.pt-BR.md](README.pt-BR.md) for the full walkthrough. There is no `/login` Telegram command: OAuth needs a localhost callback or pasted redirect URL, not a link-only flow.
 
 ## Providers it already knows
 

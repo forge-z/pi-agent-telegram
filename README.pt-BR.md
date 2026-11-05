@@ -50,8 +50,22 @@ docker exec -it <container> npm run setup
 **Rode isto antes de o bot ser útil.** Container novo não tem provedor, então ele registra `Configuração inicial ausente` e espera — fica de pé e saudável em vez de entrar em restart loop, que é o que mantém o terminal disponível. O wizard é o que encerra essa espera:
 
 ```
+[0] ChatGPT (assinatura Plus/Pro — OAuth, sem chave de API)
 [1] DeepSeek  [2] Gemini  [3] OpenAI  [4] OpenCode Zen
 [5] OpenCode Go  [6] OpenRouter  [7] Outro (OpenAI-compatible)
+Provedor [1]: 0
+Assinatura [1] Sign in with ChatGPT (openai) [2] Codex legado (openai-codex) [1]: 1
+Siga o login OAuth abaixo (código de dispositivo ou cole a URL de redirect se pedido).
+…
+openai/gpt-5  —  esforços: off low high
+Modelo (número ou id): 1
+Esforço: high
+Configuração gravada no volume (openai, authMode=chatgpt) — defina LLM_AUTH=chatgpt no deploy ou use só o registro do volume.
+```
+
+Ou escolha **`[3] OpenAI`** (ou outro) para o fluxo clássico com chave de API:
+
+```
 Provedor [1]: 2
 Chave de API (não aparece): █                  ← oculta; valida na hora
   ✔ chave válida — 63 modelos listados
@@ -68,14 +82,44 @@ Gravar? [y/N] y
 Configuração gravada no volume (gemini) — as variáveis LLM_* deixam de ser necessárias.
 ```
 
-1. **Provedor** — número da lista, id ou URL raiz. "Outro" pede a URL.
-2. **Chave** — nunca aparece na tela, e é validada em `GET /models` antes de seguir.
-3. **Modelo e esforço** — a lista é o que o provedor realmente serve.
+1. **Provedor** — **`[0] ChatGPT`** (OAuth, sem `LLM_API_KEY`) ou número/id/URL de um provedor com chave. No ChatGPT, escolha Sign in with ChatGPT (`openai`) ou Codex legado (`openai-codex`); o login é o mesmo do `npm run login`.
+2. **Chave** — só no modo chave de API; nunca aparece na tela, e é validada em `GET /models` antes de seguir.
+3. **Modelo e esforço** — a lista usa o provedor pi-ai correto (`llm` com chave, ou `openai` / `openai-codex` na assinatura). O padrão global fica em `meta` com o mesmo `provider` que o `/model` espera.
 4. **Imagem** — o modelo do chat é sondado; se lê imagens, Enter mantém. `o` abre a lista de provedores de novo (visão no Gemini com chat na DeepSeek), `-` desativa.
 5. **Áudio** — endpoint de transcrição, porque endpoint de chat não transcreve; avisa que o modelo precisa aceitar OGG/Opus.
 6. **Confirmar** — a escolha vai para `meta`, as chaves para `credentials`, e o bot começa a responder em até dez segundos. Sem restart.
 
 Qualquer passo depois do primeiro pode ser pulado com Enter, e o `npm run setup` pode ser rodado de novo: mostra os valores atuais e mantém o que você não mudar. Variáveis de ambiente continuam valendo e **vencem** o registro.
+
+## Assinatura ChatGPT (sem chave de API)
+
+Para usar a **assinatura ChatGPT Plus/Pro** (Sign in with ChatGPT ou Codex legado) em vez de `LLM_API_KEY`:
+
+1. No `.env` ou no painel do deploy, defina `LLM_AUTH=chatgpt` (sem `LLM_API_KEY`).
+2. Suba o container — ele fica aguardando login, saudável, como no wizard inicial.
+3. No terminal do container (precisa de TTY para colar a URL de retorno):
+
+   ```sh
+   docker exec -it <container> npm run login
+   ```
+
+   Por padrão entra no fluxo **Sign in with ChatGPT** (`openai`). O script imprime a URL de autorização; abra no navegador do operador. Se o callback em `localhost:1455` não existir no servidor (Docker típico), **cole a URL final de redirecionamento** quando o terminal pedir.
+
+   Codex legado (modelos GPT-5.x Codex):
+
+   ```sh
+   docker exec -it <container> npm run login -- openai-codex --device-code
+   ```
+
+   O fluxo `--device-code` só precisa abrir o link e confirmar o código — não usa callback local; é o mais simples em VPS.
+
+4. Tokens OAuth ficam no volume (`app.sqlite`, tabela `credentials`); o pi-ai renova automaticamente. Escolha o modelo em `/model` (provedores `openai` ou `openai-codex`).
+
+Logout: `npm run login -- --logout openai`.
+
+**Por que não há `/login` no Telegram:** o Sign in with ChatGPT exige callback OAuth em `localhost` ou colar a URL de redirecionamento completa — não há fluxo só “abrir link e pronto” confiável sem interação no terminal. O Codex aceita device code, mas ainda exige digitar o código no site; o CLI no container é o caminho suportado.
+
+Modo **chave de API** (`LLM_*` ou `npm run setup` com `[1]`–`[7]`) continua igual. Assinatura ChatGPT pode ser configurada **no próprio `npm run setup` (`[0]`)** ou com `npm run login`; os provedores `openai` / `openai-codex` aparecem no `/model` depois do OAuth.
 
 ## Provedores que ele já conhece
 

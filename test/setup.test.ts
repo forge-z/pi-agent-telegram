@@ -146,6 +146,39 @@ test("a half-written record is treated as not configured", async () => {
   assert.deepEqual(readStoredSetup(dir), {});
 });
 
+test("chatgpt auth mode clears the llm api key on write", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-setup-"));
+  const db = new DatabaseSync(join(dir, "app.sqlite"));
+  try {
+    writeStoredSetup(
+      db,
+      {
+        providerId: "custom",
+        baseUrl: "https://api.example/v1",
+        modelId: "m-0",
+      },
+      { chat: "sk-old" },
+    );
+    writeStoredSetup(
+      db,
+      {
+        providerId: "openai-codex",
+        baseUrl: "https://chatgpt.com/backend-api",
+        modelId: "gpt-5",
+        effort: "high",
+        authMode: "chatgpt",
+      },
+      {},
+    );
+  } finally {
+    db.close();
+  }
+  const stored = readStoredSetup(dir);
+  assert.equal(stored.record?.authMode, "chatgpt");
+  assert.equal(stored.apiKey, undefined);
+  assert.equal(stored.record?.modelId, "gpt-5");
+});
+
 test("the backend keys are stored next to the chat key", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-setup-"));
   const db = new DatabaseSync(join(dir, "app.sqlite"));

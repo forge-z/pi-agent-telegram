@@ -8,10 +8,17 @@ import {
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { knownModelRows } from "./providers.js";
 import type {
+  CredentialStore,
   ModelThinkingLevel,
   ThinkingLevelMap,
 } from "@earendil-works/pi-ai";
 import type { McpConfig } from "./mcp.js";
+import {
+  anySubscriptionAuthenticated,
+  chatgptAuthMode,
+  registerSubscriptionProviders,
+  subscriptionSetupPending,
+} from "./subscription-auth.js";
 
 type Env = Record<string, string | undefined>;
 const secret = (env: Env, name: string) =>
@@ -376,10 +383,9 @@ function declaredInput(env: Env) {
   return ["text" as const, ...images.map(() => "image" as const)];
 }
 /**
- * Registers the one OpenAI-compatible provider from LLM_BASE_URL and LLM_API_KEY.
- * LLM_MODELS declares the catalog explicitly (and is the only way to enable
- * reasoning); without it the catalog is read from `GET {LLM_BASE_URL}/models`.
- * No credential store or OAuth registration: only server-side API keys.
+ * Registers the generic OpenAI-compatible `llm` provider from env/setup API keys.
+ * ChatGPT subscription OAuth uses pi-ai providers `openai` / `openai-codex` via
+ * `bootstrapModels` and `npm run login`.
  */
 /**
  * No usable provider: the bot waits for `npm run setup` instead of exiting, so the
@@ -388,19 +394,21 @@ function declaredInput(env: Env) {
 export class SetupRequiredError extends Error {
   constructor(missing = "provedor, chave") {
     super(
-      `Configuração inicial ausente (${missing}). Rode \`npm run setup\` no terminal do container.`,
+      missing.includes("login")
+        ? `Configuração inicial ausente (${missing}). Rode \`npm run login\` no terminal do container (ou configure LLM_* / \`npm run setup\`).`
+        : `Configuração inicial ausente (${missing}). Rode \`npm run setup\` no terminal do container.`,
     );
   }
 }
-export async function environmentModels(
-  env: Env = process.env,
+
+async function registerLlmApiKeyProvider(
+  models: MutableModels,
+  env: Env,
   deps: {
     fetch?: typeof fetch;
-    /** Written by `npm run setup`; env stays the declarative override. */
-    /** Exactly what `readStoredSetup` returns: one shape, so the two cannot drift. */
     stored?: StoredSetup;
-  } = {},
-): Promise<MutableModels> {
+  },
+) {
   // Env wins, as documented everywhere else: an operator who exports LLM_* keeps
   // control, and the stored setup covers the case where nothing is exported.
   const rawBase =
@@ -440,7 +448,6 @@ export async function environmentModels(
     throw new Error(
       "Nenhum modelo disponível. Verifique LLM_BASE_URL ou defina LLM_MODELS.",
     );
-  const models = createModels();
   models.setProvider(
     createProvider({
       id: LLM_PROVIDER_ID,
@@ -475,7 +482,56 @@ export async function environmentModels(
       api: openAICompletionsApi(),
     }),
   );
-  return models;
+}
+
+/**
+ * Builds the runtime model registry: optional API-key `llm` provider plus, when a
+ * persistent credential store is supplied, pi-ai ChatGPT/Codex subscription providers.
+ */
+export async function bootstrapModels(
+  credentials: CredentialStore | undefined,
+  env: Env = process.env,
+  deps: {
+    fetch?: typeof fetch;
+    stored?: StoredSetup;
+  } = {},
+): Promise<MutableModels> {
+  const models = createModels(credentials ? { credentials } : {});
+
+  let llmRegistered = false;
+  try {
+    await registerLlmApiKeyProvider(models, env, deps);
+    llmRegistered = true;
+  } catch (error) {
+    if (!(error instanceof SetupRequiredError)) throw error;
+    if (!credentials) throw error;
+  }
+
+  if (credentials) registerSubscriptionProviders(models);
+
+  if (llmRegistered) return models;
+
+  const wantsSubscription =
+    chatgptAuthMode(env) || subscriptionSetupPending(deps.stored?.record);
+  if (credentials && wantsSubscription) {
+    if (await anySubscriptionAuthenticated(models)) return models;
+    throw new SetupRequiredError("login ChatGPT");
+  }
+  if (credentials && (await anySubscriptionAuthenticated(models)))
+    return models;
+
+  throw new SetupRequiredError();
+}
+
+/** Test and setup-script entry: API-key provider only (no OAuth registration). */
+export async function environmentModels(
+  env: Env = process.env,
+  deps: {
+    fetch?: typeof fetch;
+    stored?: StoredSetup;
+  } = {},
+): Promise<MutableModels> {
+  return bootstrapModels(undefined, env, deps);
 }
 
 const startupSecret =
