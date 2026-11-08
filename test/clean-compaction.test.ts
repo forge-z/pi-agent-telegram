@@ -42,9 +42,8 @@ test("upstream automatic compaction uses active conversation model/effort, prese
   const app = await Runtime.open({
     dir,
     models,
-    gateway: { call: async () => ({}) },
+    gateway: { catalog: async () => [] },
     modelId: "initial",
-    telegramOnly: true,
     initialize: (store) =>
       configureTelegram(
         store,

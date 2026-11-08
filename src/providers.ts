@@ -1,4 +1,8 @@
-/** Providers offered by `npm run setup`. Data, not logic: adding one is a single row. */
+/**
+ * Compat-only hints for the generic `llm` reserve (menu "Outro") and for a
+ * vision backend that still speaks OpenAI chat completions. The official chat
+ * menu is the pi-ai catalog in `native-providers.ts`, not this list.
+ */
 interface ProviderEntry {
   id: string;
   name: string;

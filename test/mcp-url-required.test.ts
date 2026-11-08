@@ -441,14 +441,6 @@ test("direct initialization instructions reach actual model context as bounded u
     await app.submit(id, "metadata", "Inspect local mock context");
     await (await app.conversation(id)).waitForIdle(context);
     assert.ok(captured);
-    const legacy = new McpGateway([
-      { ...f.config, mode: "legacy", readTools: ["write"] },
-    ]);
-    try {
-      assert.equal((await legacy.catalog())[0].instructions, undefined);
-    } finally {
-      await legacy.close();
-    }
     assert.equal(f.counts.tools, 0);
   } finally {
     await app.close();
@@ -458,14 +450,12 @@ test("direct initialization instructions reach actual model context as bounded u
   }
 });
 
-test("URL-required errors never automatically retry a tool under an explicit legacy read policy", async () => {
+test("URL-required errors are not retried on a direct call", async () => {
   const f = await fixture();
-  const gateway = new McpGateway([
-    { ...f.config, mode: "legacy", readTools: ["write"] },
-  ]);
+  const gateway = new McpGateway([f.config]);
   try {
     await assert.rejects(
-      gateway.call("mock", "write", {}, "read"),
+      gateway.callDirect("mock", "write", {}),
       McpUrlElicitationRequiredError,
     );
     assert.equal(f.counts.writes, 1);

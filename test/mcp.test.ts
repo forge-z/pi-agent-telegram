@@ -9,7 +9,7 @@ import { join, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { McpGateway, McpNotSentError, type McpConfig } from "../src/mcp.js";
-test("real MCP SDK connects to local HTTP mock, exposes explicit allowlists, calls read/action tools", async () => {
+test("real MCP SDK connects in direct mode and calls discovered tools", async () => {
   const mcp = new McpServer({ name: "mock", version: "1.0.0" });
   let reads = 0;
   let writes = 0;
@@ -35,8 +35,9 @@ test("real MCP SDK connects to local HTTP mock, exposes explicit allowlists, cal
     {
       name: "mock",
       url: `http://127.0.0.1:${address.port}/mcp`,
-      readTools: ["lookup"],
-      actionTools: ["create"],
+      mode: "direct",
+      readTools: [],
+      actionTools: [],
     },
   ]);
   try {
@@ -46,6 +47,7 @@ test("real MCP SDK connects to local HTTP mock, exposes explicit allowlists, cal
     assert.equal(reads, 0);
     const catalog = JSON.stringify(await gateway.catalog());
     assert.match(catalog, /lookup/);
+    assert.match(catalog, /"operation":"direct"/);
     assert.match(catalog, /inputSchema/);
     assert.doesNotMatch(catalog, /http:/);
     assert.throws(
@@ -60,19 +62,28 @@ test("real MCP SDK connects to local HTTP mock, exposes explicit allowlists, cal
         ]),
       /HTTPS/,
     );
+    assert.throws(
+      () =>
+        new McpGateway([
+          {
+            name: "old",
+            url: "http://127.0.0.1:9/mcp",
+            mode: "legacy",
+            readTools: [],
+            actionTools: [],
+          } as unknown as McpConfig,
+        ]),
+      /modo/,
+    );
     assert.match(
-      JSON.stringify(await gateway.call("mock", "lookup", {}, "read")),
+      JSON.stringify(await gateway.callDirect("mock", "lookup", {})),
       /preview/,
     );
     await assert.rejects(
-      gateway.call("mock", "create", {}, "read"),
-      /não autorizada/,
+      gateway.callDirect("missing", "lookup", {}),
+      /restrições configuradas/,
     );
-    await assert.rejects(
-      gateway.call("unknown", "lookup", {}, "read"),
-      /não autorizada/,
-    );
-    await gateway.call("mock", "create", {}, "action");
+    await gateway.callDirect("mock", "create", {});
     assert.equal(reads, 1);
     assert.equal(writes, 1);
   } finally {
@@ -175,7 +186,7 @@ test("an unreadable or multi-line MCP token file fails before sending, without e
     ] as const) {
       const gateway = new McpGateway([config(file)]);
       try {
-        const error = await gateway.call("files", "lookup", {}, "read").then(
+        const error = await gateway.callDirect("files", "lookup", {}).then(
           () => undefined,
           (error: unknown) => error,
         );

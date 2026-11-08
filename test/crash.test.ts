@@ -53,16 +53,10 @@ test(
       await exited;
       // A stale owner lease must expire before a new owner opens the same SQLite volume.
       await new Promise((resolve) => setTimeout(resolve, 31000));
-      let external = 0,
-        sends = 0;
+      let sends = 0;
       app = await Runtime.open({
         dir,
-        gateway: {
-          call: async () => {
-            external++;
-            return {};
-          },
-        },
+        gateway: { catalog: async () => [] },
       });
       const id = app.store.get<{ id: string }>(
         "SELECT id FROM conversations",
@@ -70,7 +64,6 @@ test(
       await (await app.conversation(id)).waitForIdle(context);
       await new Promise((resolve) => setTimeout(resolve, 20));
       assert.equal(app.store.actions(id)[0].state, "uncertain");
-      assert.equal(external, 0);
       const telegram = new Telegram(
         app,
         {
@@ -90,10 +83,7 @@ test(
         )?.state,
         "uncertain",
       );
-      assert.equal(
-        await readFile(`${dir}/effects.log`, "utf8"),
-        "write\nsend\n",
-      );
+      assert.equal(await readFile(`${dir}/effects.log`, "utf8"), "send\n");
       const snapshot = await app.snapshot(id);
       assert.equal(
         snapshot.view.entries.filter((e) => e.kind === "pi.user").length,

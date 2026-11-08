@@ -23,8 +23,7 @@ async function fixture() {
   const options = {
     dir,
     models,
-    gateway: { call: async () => ({}) },
-    telegramOnly: true,
+    gateway: { catalog: async () => [] },
     initialize: (store: Runtime["store"]) =>
       configureTelegram(store, config, { id: 123 }),
   };

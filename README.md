@@ -28,7 +28,7 @@ The supported Executor is **v2, the cloud build** (`https://mcp.executor.sh/mcp`
 3. Optional, for a group: add the bot, then in **@BotFather** `/setprivacy` → **Disable**, otherwise Telegram only delivers commands and mentions. Put the group's negative id in `TELEGRAM_ALLOWED_CHATS`.
 4. Optional, for one conversation per topic: turn the group into a **forum** (group settings → Topics). Each topic gets its own history, model and effort; no extra configuration.
 
-The command menu (`/model`, `/thinking`, `/crons`, `/stop`, `/status`, `/reload`, `/retomar`, `/help`) is registered by the app itself on start and again on `/status`, so there is no `/setcommands` to do.
+The command menu (`/model`, `/thinking`, `/crons`, `/stop`, `/status`, `/reload`, `/new`, `/resume`, `/help`) is registered by the app itself on start and again on `/status`, so there is no `/setcommands` to do. `/retomar` still resumes a parked task, and `/destravar` still clears an uncertain MCP result; neither is on the menu.
 
 ## Install
 
@@ -41,6 +41,25 @@ docker compose up -d --build
 
 Required: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USERS`. Add `EXECUTOR_MCP_URL` + `EXECUTOR_TOKEN` to give it tools. Everything else is optional and documented in [.env.example](.env.example).
 
+That Executor pair registers one **direct** server (the default, also when `mode` is omitted). Its tools — search, describe, call, execute, resume, skills — stay in the prompt with full schemas, and an effectful call still pauses on the approval card ("Aprovação MCP pendente"). A large MCP beside it can set `"mode": "deferred"` so its schemas stay hidden until the model calls `tool_search`. Names in `alwaysLoad` stay direct. `allowedTools` and `deniedTools` apply in both modes. Executor itself stays direct:
+
+```json
+[
+  {
+    "name": "executor",
+    "url": "https://executor.example/mcp",
+    "tokenEnv": "EXECUTOR_TOKEN"
+  },
+  {
+    "name": "github",
+    "url": "https://github.example/mcp",
+    "tokenEnv": "GH_TOKEN",
+    "mode": "deferred",
+    "alwaysLoad": ["search_code"]
+  }
+]
+```
+
 ## Configure once
 
 ```sh
@@ -51,65 +70,46 @@ docker exec -it <container> npm run setup
 
 ```
 [0] ChatGPT (assinatura Plus/Pro — OAuth, sem chave de API)
-[1] DeepSeek  [2] Gemini  [3] OpenAI  [4] OpenCode Zen
-[5] OpenCode Go  [6] OpenRouter  [7] Outro (OpenAI-compatible)
-Provedor [1]: 0
-Assinatura [1] Sign in with ChatGPT (openai) [2] Codex legado (openai-codex) [1]: 1
-Siga o login OAuth abaixo (código de dispositivo ou cole a URL de redirect se pedido).
+[1] Anthropic — catálogo oficial
 …
-openai/gpt-5  —  esforços: off low high
-Modelo (número ou id): 1
+[n] Outro (OpenAI-compatible) — reserva opcional
+Provedor [1]: anthropic
+Chave de API (não aparece): █                     ← hidden; never printed
+Modelo (número ou id): 3
 Esforço: high
-Configuração gravada no volume (openai, authMode=chatgpt) — defina LLM_AUTH=chatgpt no deploy ou use só o registro do volume.
+Modelo do chat: lê imagens (catálogo pi-ai)
+…
+Configuração gravada no volume (anthropic) — chave em credentials com esse id.
 ```
 
-Or pick **`[3] OpenAI`** (or any other entry) for the classic API-key flow:
-
-```
-Provedor [1]: 2
-Chave de API (não aparece): █                     ← hidden; validated on the spot
-  ✔ chave válida — 63 modelos listados
-Modelo (número ou id): 12
-Esforço: high
-Modelo do chat: lê imagens                        ← the model is asked, not assumed
-IMAGEM — Enter mantém o do chat, "-" desativa
-Modelo de visão [usa o do chat]:                  ← or "o" for another provider
-ÁUDIO — Enter desativa
-  [1] OpenAI — whisper-1  [2] Groq  [3] Gemini  [4] Outro
-Transcrição [desativada]: 1
-Idioma [auto]: pt
-Gravar? [y/N] y
-Configuração gravada no volume (gemini) — as variáveis LLM_* deixam de ser necessárias.
-```
-
-1. **Provider** — **`[0] ChatGPT`** (OAuth, no `LLM_API_KEY`) or a number, id, or root URL of an API-key provider. For ChatGPT, choose Sign in with ChatGPT (`openai`) or legacy Codex (`openai-codex`); the login is the same as `npm run login`.
-2. **Key** — API-key mode only. Never echoed, checked against `GET /models` before going further; a wrong key is rejected right there.
-3. **Model and effort** — the list uses the matching pi-ai provider (`llm` with a key, or `openai` / `openai-codex` on a subscription). The global default is stored in `meta` with the same `provider` `/model` expects.
-4. **Image** — the chat model is probed; if it reads images, Enter keeps it as is. `o` opens the provider list again (vision on Gemini while the chat runs on DeepSeek), `-` disables.
+1. **Provider** — `[0]` is the ChatGPT subscription (same login as `npm run login`). The numbered rows are official pi-ai providers (API key). The last row, **Outro**, is the optional OpenAI-compatible reserve.
+2. **Key** — never echoed. Official providers store it under the provider id (`anthropic`, `openai`, `google`, …). The compat reserve is the only path that calls `GET /models`.
+3. **Model and effort** — the official catalog: native API, context window, reasoning levels and prices. `/model` lists `provider/modelId` and only switches; it never asks for a key or a login.
+4. **Image** — taken from the catalog for an official model. `o` can still point vision at another OpenAI-compatible endpoint, `-` disables.
 5. **Audio** — a transcription endpoint, since a chat endpoint cannot transcribe. It warns that the model must accept OGG/Opus.
-6. **Confirm** — the choice goes to `meta`, the keys to `credentials`, and the bot starts answering within ten seconds. No restart.
+6. **Confirm** — the choice goes to `meta`, the key to `credentials`, and the bot starts answering within ten seconds. No restart. `LLM_BASE_URL` and `LLM_API_KEY` are not required.
 
-Every step after the first can be skipped with Enter, and `npm run setup` can be run again later: it shows the current values and keeps whatever you do not change. Environment variables still work and win over the stored setup.
+`npm run setup` can be run again later. A complete official setup is not replaced by leftover `LLM_BASE_URL` / `LLM_API_KEY`. Those two variables only apply to the compat reserve, and only when no official setup is stored.
 
 ## ChatGPT subscription (no API key)
 
-Set `LLM_AUTH=chatgpt` without `LLM_API_KEY`, start the container, then run `docker exec -it <container> npm run login` once. Tokens are stored in the volume SQLite (`credentials` table) with automatic refresh via pi-ai. Use `/model` to pick `openai` (Sign in with ChatGPT) or `openai-codex` (legacy Codex; `npm run login -- openai-codex --device-code` for headless VPS). The same login is offered as **`[0] ChatGPT`** inside `npm run setup`. API-key mode (`LLM_*` or setup options `[1]`–`[7]`) is unchanged. See [README.pt-BR.md](README.pt-BR.md) for the full walkthrough. There is no `/login` Telegram command: OAuth needs a localhost callback or pasted redirect URL, not a link-only flow.
+Start the container and run `docker exec -it <container> npm run login` once (or pick `[0]` in `npm run setup`). Tokens are stored in the volume SQLite (`credentials` table) with automatic refresh via pi-ai. Use `/model` to pick `openai` (Sign in with ChatGPT) or `openai-codex` (legacy Codex; `npm run login -- openai-codex --device-code` for headless VPS). See [README.pt-BR.md](README.pt-BR.md) for the full walkthrough. There is no `/login` Telegram command: OAuth needs a localhost callback or pasted redirect URL, not a link-only flow. `LLM_AUTH=chatgpt` is optional; the volume record is enough.
 
-## Providers it already knows
+`npm run setup` is the full wizard, including vision and audio. `npm run login` is OAuth only (and the headless Codex device-code path). Both write the volume. There is no third command. When login finds no model yet, it stores the first catalog model; `/model` changes it. Anthropic here is an API key, not a Claude subscription login.
 
-`.env` is not the only way in, and the wizard ships with these endpoints:
+## Providers
 
-| Provider     | Endpoint                                                  | Notes                                                      |
-| ------------ | --------------------------------------------------------- | ---------------------------------------------------------- |
-| DeepSeek     | `https://api.deepseek.com`                                | `deepseek-flash` reads images; limits and levels are known |
-| Gemini       | `https://generativelanguage.googleapis.com/v1beta/openai` | the OpenAI-compatible surface; free tier works             |
-| OpenAI       | `https://api.openai.com/v1`                               | also the audio path (`/audio/transcriptions`)              |
-| OpenCode Zen | `https://opencode.ai/zen/v1`                              | separate catalogue from Go                                 |
-| OpenCode Go  | `https://opencode.ai/zen/go/v1`                           | the key may not be the same                                |
-| OpenRouter   | `https://openrouter.ai/api/v1`                            | many models, `:free` variants included                     |
-| Other        | any root URL                                              | anything that speaks the OpenAI completion API             |
+The wizard lists every pi-ai provider that accepts a single API key (Anthropic, OpenAI, Google, Groq, xAI, DeepSeek, Mistral, OpenRouter, OpenCode Zen, OpenCode Go, and the rest of that catalog). Each one uses the library's native API, context window, reasoning levels and prices. The menu is generated from the installed `@earendil-works/pi-ai` catalog, not from a second list in this repo.
+
+| Path             | What it is                                                                           |
+| ---------------- | ------------------------------------------------------------------------------------ |
+| Official API key | `npm run setup`, key stored as `credentials.provider = <pi-ai id>`                   |
+| ChatGPT / Codex  | `npm run login` or setup `[0]`, providers `openai` and `openai-codex`                |
+| Outro            | optional OpenAI-compatible reserve (`llm`) for a proxy or a host pi-ai does not ship |
 
 Audio is configured separately because a chat endpoint does not transcribe: OpenAI, Groq and Gemini are offered with their default model.
+
+An existing volume that still has `credentials.provider = 'llm'` keeps working. On the next start, if `LLM_BASE_URL` / `LLM_API_KEY` are unset and the saved model exists in the native catalog, the key is copied onto that provider. If the model is not in the catalog, the bot stays on the compat endpoint.
 
 ## There's an API or MCP for that
 
@@ -143,25 +143,25 @@ Roughly in the order a personal assistant needs them: mail, web, voice, then scr
 
 ## Commands
 
-| Command      | What it does                                                          |
-| ------------ | --------------------------------------------------------------------- |
-| `/status`    | the three models in use, effort, MCP servers and version              |
-| `/reload`    | reload this conversation and clear uncertain MCP flags (history kept) |
-| `/destravar` | same as `/reload` when the conversation is stuck on uncertain MCP     |
-| `/retomar`   | run again a task parked after repeated crashes                        |
-| `/model`     | provider and model for this conversation                              |
-| `/thinking`  | effort for this conversation                                          |
-| `/crons`     | create and manage schedules                                           |
-| `/stop`      | cancel what is running in this topic                                  |
-| `/help`      | the same list, in the chat                                            |
+| Command     | What it does                                                                                  |
+| ----------- | --------------------------------------------------------------------------------------------- |
+| `/status`   | the three models in use, effort, MCP servers (error, tool count and names) and version        |
+| `/reload`   | dismiss uncertain MCP results in this conversation (history kept). `/destravar` is the same   |
+| `/new`      | start another conversation in this topic; the previous one stays on disk. `/nova` is the same |
+| `/resume`   | run again a task parked after repeated crashes. `/retomar` is the same                        |
+| `/model`    | provider and model for this conversation                                                      |
+| `/thinking` | effort for this conversation                                                                  |
+| `/crons`    | create and manage schedules                                                                   |
+| `/stop`     | cancel what is running in this topic                                                          |
+| `/help`     | the same list, in the chat                                                                    |
 
 ## Limits worth knowing
 
 - A **transcription model must accept OGG/Opus** — it is the only format Telegram sends for a voice note. `whisper-1`, Gemini and Groq do; the `gpt-4o-transcribe` family does not list it.
-- **Discovery reports ids only**. Without `LLM_MODELS`, every model claims no reasoning and `/thinking` offers `off` alone.
+- **The compat reserve reports ids only**. Without `LLM_MODELS`, a model on provider `llm` claims no reasoning and `/thinking` offers `off` alone. Official providers already declare their levels.
 - **Compaction** summarises older turns automatically, so a long conversation does not grow forever.
 - Chat history, credentials and the ledger are only as private as the volume and the host: protect the volume and its backups.
-- **Upgrade from Pi 1.3.** The first boot migrates `durable.sqlite` to schema 2, and that migration has no rollback. Back up the volume before deploying. Rolling the image back without restoring that backup leaves the ledger on a schema the previous release does not read.
+- **Upgrade from Pi 1.3.** The first boot migrates `durable.sqlite` to schema 2, and that migration has no rollback. Back up the volume before deploying. Rolling the image back without restoring that backup leaves the ledger on a schema the previous release does not read. This release does not add another migration.
 
 ## Projects
 

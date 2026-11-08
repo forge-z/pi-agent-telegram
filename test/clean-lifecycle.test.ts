@@ -27,8 +27,7 @@ async function fixture() {
   const options = {
     dir,
     models,
-    gateway: { call: async () => ({}) },
-    telegramOnly: true,
+    gateway: { catalog: async () => [] },
     initialize: (store: Runtime["store"]) =>
       configureTelegram(store, config, { id: 123 }),
   };
@@ -99,7 +98,8 @@ test("polling readiness, health and graceful stop stay offline and create no top
         "stop",
         "status",
         "reload",
-        "retomar",
+        "new",
+        "resume",
         "help",
       ],
     );

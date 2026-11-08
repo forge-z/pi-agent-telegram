@@ -22,8 +22,7 @@ models.setProvider(faux.provider);
 const app = await Runtime.open({
   dir,
   models,
-  gateway: { call: async () => ({}) },
-  telegramOnly: true,
+  gateway: { catalog: async () => [] },
   initialize: (store) =>
     configureTelegram(
       store,

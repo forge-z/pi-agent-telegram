@@ -243,35 +243,6 @@ test("direct allow and deny policy supports omitted allowlists, deny-all, and de
   }
 });
 
-test("legacy read/action lists remain available only through the legacy call API", async () => {
-  const counters = { reads: 0, writes: 0 };
-  const running = await serve(makeServer(counters));
-  const gateway = new McpGateway([
-    {
-      name: "mock",
-      url: running.url,
-      readTools: ["lookup"],
-      actionTools: ["execute"],
-    },
-  ]);
-  try {
-    assert.match(
-      JSON.stringify(await gateway.call("mock", "lookup", {}, "read")),
-      /current context/,
-    );
-    await assert.rejects(
-      gateway.call("mock", "execute", {}, "read"),
-      /não autorizada/,
-    );
-    await gateway.call("mock", "execute", { code: "legacy" }, "action");
-    await assert.rejects(gateway.callDirect("mock", "lookup", {}));
-    assert.deepEqual(counters, { reads: 1, writes: 1 });
-  } finally {
-    await gateway.close();
-    await running.close();
-  }
-});
-
 test("catalog keeps healthy MCP servers available when another server fails", async () => {
   const running = await serve(makeServer({ reads: 0, writes: 0 }));
   const failingServer = createServer((_req, res) => {

@@ -12,9 +12,7 @@ import {
 import type { FauxResponseStep } from "@earendil-works/pi-ai";
 import { Runtime } from "../src/runtime.js";
 import { Store, type Delivery } from "../src/store.js";
-const gateway = {
-  call: async () => ({ content: [{ type: "text", text: "context" }] }),
-};
+const gateway = { catalog: async () => [] };
 async function temp() {
   return mkdtemp(join(tmpdir(), "pi-agent-test-"));
 }
@@ -103,129 +101,6 @@ test("concurrent web/Telegram inputs serialize and same requestId deduplicates a
   }
 });
 
-test("Durable tools wire MCP reads and proposals; confirmation runs external effect once", async () => {
-  const dir = await temp();
-  let writes = 0;
-  const gateway = {
-    call: async (
-      _server: string,
-      _tool: string,
-      _args: Record<string, unknown>,
-      kind: "read" | "action",
-    ) => {
-      if (kind === "action") writes++;
-      return {
-        content: [
-          { type: "text", text: kind === "read" ? "preview" : "saved" },
-        ],
-      };
-    },
-  };
-  const { models } = model([
-    fauxAssistantMessage(
-      {
-        type: "toolCall",
-        id: "read-1",
-        name: "mcp_read",
-        arguments: {
-          server: "mock",
-          tool: "lookup",
-          arguments: { name: "event" },
-        },
-      },
-      { stopReason: "toolUse" },
-    ),
-    fauxAssistantMessage(
-      {
-        type: "toolCall",
-        id: "propose-1",
-        name: "propose_action",
-        arguments: {
-          server: "mock",
-          tool: "create",
-          arguments: { name: "event" },
-        },
-      },
-      { stopReason: "toolUse" },
-    ),
-    fauxAssistantMessage("Please confirm in the app"),
-    fauxAssistantMessage("Action confirmed"),
-  ]);
-  let app = await Runtime.open({ dir, gateway, models });
-  try {
-    const id = await app.create();
-    await app.submit(id, "tools", "Create event");
-    await wait(app, id);
-    const action = app.store.actions(id)[0];
-    assert.equal(action.state, "pending");
-    assert.equal(writes, 0);
-    await app.close();
-    app = await Runtime.open({ dir, gateway, models });
-    const results = await Promise.all([
-      app.actions.decide(id, action.id, "approve"),
-      app.actions.decide(id, action.id, "approve"),
-      app.actions.decide(id, action.id, "deny"),
-    ]);
-    assert.equal(writes, 1);
-    assert.ok(results.every((r) => ["running", "done"].includes(r.state)));
-    assert.equal(app.store.actions(id)[0].state, "done");
-    await app.recordAction(app.store.actions(id)[0]);
-    await wait(app, id);
-  } finally {
-    await app.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("uncertain effects require reconciliation and never replay after restart", async () => {
-  const dir = await temp();
-  let writes = 0;
-  const gateway = {
-    call: async (
-      _s: string,
-      _t: string,
-      _a: Record<string, unknown>,
-      kind: "read" | "action",
-    ) => {
-      if (kind === "action") {
-        writes++;
-        throw new Error("connection lost after write");
-      }
-      return { content: [] };
-    },
-  };
-  let app = await Runtime.open({ dir, gateway });
-  try {
-    const id = await app.create();
-    assert.throws(
-      () => app.actions.propose(id, 1, "mock", "write", {}),
-      /Leia/,
-    );
-    await app.actions.read(id, "mock", "read", {});
-    const action = app.actions.propose(id, 2, "mock", "write", {});
-    assert.equal(
-      (await app.actions.decide(id, action.id, "approve")).state,
-      "uncertain",
-    );
-    assert.equal(writes, 1);
-    await app.close();
-    app = await Runtime.open({ dir, gateway });
-    assert.equal(
-      (await app.actions.decide(id, action.id, "approve")).state,
-      "uncertain",
-    );
-    assert.equal(writes, 1);
-    assert.equal(
-      app.actions.reconcile(id, action.id, "Verified write exists").state,
-      "reconciled",
-    );
-    assert.equal(writes, 1);
-  } finally {
-    await app.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
 test("persisted in-flight actions and deliveries become uncertain, owner lock rejects second process", async () => {
   const dir = await temp();
   const app = await Runtime.open({ dir, gateway });
@@ -252,36 +127,6 @@ test("persisted in-flight actions and deliveries become uncertain, owner lock re
       store.close();
     }
   } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("read evidence is scoped to current input and server, replayed proposal stays idempotent", async () => {
-  const dir = await temp();
-  const app = await Runtime.open({ dir, gateway });
-  try {
-    const id = await app.create();
-    await app.actions.read(id, "mock", "read", {}, "input1");
-    assert.throws(
-      () => app.actions.propose(id, 50, "mock", "write", {}, "input2"),
-      /Leia/,
-    );
-    assert.throws(
-      () => app.actions.propose(id, 50, "different", "write", {}, "input1"),
-      /Leia/,
-    );
-    const first = app.actions.propose(id, 50, "mock", "write", {}, "input1");
-    app.store.run("DELETE FROM reads");
-    assert.equal(
-      app.actions.propose(id, 50, "mock", "write", {}, "input1").id,
-      first.id,
-    );
-    assert.throws(
-      () => app.actions.propose(id, 50, "mock", "changed", {}, "input1"),
-      /outro conteúdo/,
-    );
-  } finally {
-    await app.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

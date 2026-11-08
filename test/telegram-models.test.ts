@@ -85,7 +85,7 @@ async function fixture() {
     name: "Desconectado",
     auth: {},
   });
-  const options = { dir, models, gateway: { call: async () => ({}) } };
+  const options = { dir, models, gateway: { catalog: async () => [] } };
   let app = await Runtime.open(options);
   const anchor = await app.create("Web anchor");
   linkChat(app, "100", "42", anchor);

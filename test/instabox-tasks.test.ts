@@ -118,7 +118,6 @@ async function createFixture(
     dir,
     gateway,
     models,
-    telegramOnly: false,
     env,
   });
 

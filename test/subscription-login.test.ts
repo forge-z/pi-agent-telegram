@@ -125,9 +125,8 @@ test("setup with openai-codex default validates after bootstrap", async () => {
     dir,
     store,
     models,
-    gateway: { call: async () => ({}) },
+    gateway: { catalog: async () => [] },
     mode: "live",
-    telegramOnly: true,
   });
   try {
     const defaults = app.settings.defaults();

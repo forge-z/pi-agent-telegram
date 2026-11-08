@@ -74,9 +74,10 @@ cat <<'EOF'
 - TELEGRAM_ALLOWED_CHATS é opcional (omita em DM; supergrupo = negativo, ex. -100…).
 - TELEGRAM_ALLOWED_USERS = user ID de quem controla o bot (@userinfobot no privado).
 - Chat privado: CHATS pode ser o mesmo ID positivo do seu usuário.
-- LLM_BASE_URL + LLM_API_KEY registram um provedor OpenAI-compatible (id llm).
+- npm run setup é o assistente completo (provedor, visão e áudio). npm run login é só OAuth (device-code: npm run login -- openai-codex --device-code). Os dois gravam no volume; LLM_* no ambiente vence.
+- LLM_BASE_URL + LLM_API_KEY continuam válidos e vencem o volume, mas não são obrigatórios depois do setup.
 - Sem LLM_MODELS o catálogo vem de GET {LLM_BASE_URL}/models e fica sem reasoning.
-- Padrão global: npm run setup-model -- --list | --model llm/<id> [--effort high].
+- Padrão global: npm run setup -- --list. /model troca o modelo no chat.
 - Rebuild após git pull: SOURCE_COMMIT=$(git rev-parse HEAD) docker compose up -d --build
 - Um processo por volume: use o volume dedicado pi_agent_tg_data.
 EOF

@@ -116,9 +116,7 @@ export class Settings {
     // MODEL_PROVIDER/MODEL_ID leaving the environment must not leave live
     // conversations without a model: fall back to the first catalog entry.
     if (!modelId)
-      throw new SettingsError(
-        "Nenhum modelo disponível. Confira LLM_BASE_URL/LLM_MODELS e rode npm run setup-model.",
-      );
+      throw new SettingsError("Nenhum modelo disponível. Rode npm run setup.");
     const model = this.app.models.getModel(provider, modelId);
     // The stored setup is a bootstrap, so a model it names must exist: failing here is
     // better than silently running another one.
@@ -217,7 +215,7 @@ export class Settings {
       )
         return undefined;
       const current = this.defaults();
-      return `Aviso: nenhum modelo padrão foi escolhido; usando ${current.provider}/${current.modelId} com esforço ${current.effort}. Ajuste com /model e /thinking, ou defina o padrão no terminal do container com npm run setup-model.`;
+      return `Aviso: nenhum modelo padrão foi escolhido; usando ${current.provider}/${current.modelId} com esforço ${current.effort}. Ajuste com /model e /thinking, ou defina o padrão no terminal do container com npm run setup.`;
     } catch {
       /* A missing or removed catalog must not block the reply path. */
       return undefined;

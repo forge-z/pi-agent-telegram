@@ -34,8 +34,9 @@ const usage = `Uso: npm run login -- [openai|openai-codex] [--device-code]
   openai-codex    OpenAI Codex (legado, modelos GPT-5.x Codex)
   --device-code   Só para openai-codex: login por código de dispositivo (sem localhost)
 
-Tokens ficam em DATA_DIR/app.sqlite (tabela credentials). O bot recarrega sozinho
-em até ~10s. Defina LLM_AUTH=chatgpt se for usar assinatura sem LLM_API_KEY.`;
+Tokens ficam em DATA_DIR/app.sqlite (tabela credentials, provedor openai ou
+openai-codex). O bot recarrega sozinho em até ~10s. LLM_BASE_URL e LLM_API_KEY
+não são necessárias. LLM_AUTH=chatgpt é opcional: o registro no volume basta.`;
 
 function fail(message, code = 1) {
   console.error(message);
@@ -113,12 +114,12 @@ try {
 rl.close();
 
 function seedSetupIfEmpty(providerId) {
-  if (stored.record?.modelId) return;
+  if (stored.record?.modelId) return false;
   const provider = models.getProvider(providerId);
-  if (!provider) return;
+  if (!provider) return false;
   const catalog = subscriptionChatCatalog(models, providerId);
   const model = catalog[0];
-  if (!model) return;
+  if (!model) return false;
   const effort =
     model.efforts.find((level) => level === "high") ??
     model.efforts.at(-1) ??
@@ -156,10 +157,13 @@ function seedSetupIfEmpty(providerId) {
   console.log(
     `Padrão gravado: ${providerId} / ${model.id} (esforço ${effort}).`,
   );
+  return true;
 }
 
-seedSetupIfEmpty(providerArg);
+const seededFirstCatalogModel = seedSetupIfEmpty(providerArg);
 store.close();
 console.log(
-  "Login concluído. Tokens salvos no volume; o bot passa a usar a assinatura após o próximo ciclo de espera (~10s) ou reinício.",
+  seededFirstCatalogModel
+    ? "Login concluído. O primeiro modelo do catálogo foi escolhido; /model troca. Tokens salvos no volume; o bot passa a usar a assinatura após o próximo ciclo de espera (~10s) ou reinício."
+    : "Login concluído. Tokens salvos no volume; o bot passa a usar a assinatura após o próximo ciclo de espera (~10s) ou reinício. O modelo já gravado permanece; /model troca.",
 );

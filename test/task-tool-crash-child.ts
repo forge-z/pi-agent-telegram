@@ -27,7 +27,7 @@ const models = createModels();
 models.setProvider(faux.provider);
 const app = await Runtime.open({
   dir: process.argv[2],
-  gateway: { call: async () => ({}) },
+  gateway: { catalog: async () => [] },
   models,
 });
 const create = app.tasks.create.bind(app.tasks);
@@ -39,9 +39,39 @@ app.tasks.create = async (...args) => {
   return task;
 };
 const id = await app.create();
+app.store.run(
+  "INSERT OR IGNORE INTO credentials VALUES ('telegram:bot',?)",
+  JSON.stringify({ botId: 123456, token: "123456:synthetic-test" }),
+);
+app.store.run("INSERT OR IGNORE INTO telegram VALUES (?,?,?)", "42", id, "42");
+app.store.run(
+  "INSERT OR IGNORE INTO telegram_grants VALUES (?,?,?)",
+  "42",
+  "42",
+  id,
+);
+app.store.run(
+  "INSERT OR IGNORE INTO telegram_conversations VALUES (?,?,?)",
+  id,
+  "42",
+  "42",
+);
+app.store.run(
+  "INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+  "telegram:connection",
+  JSON.stringify({
+    enabled: true,
+    bot: { id: 123456 },
+    userId: "42",
+    chatId: "42",
+    conversationId: id,
+  }),
+);
 await app.submit(
   id,
   "create-crash",
   "Remind me once at the specified UTC time",
+  "telegram",
+  "42",
 );
 setInterval(() => {}, 1000);
