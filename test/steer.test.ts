@@ -52,7 +52,6 @@ async function fixture(
     dir,
     models,
     gateway,
-    telegramOnly: true,
     initialize: (store) => configureTelegram(store, config, { id: 123 }),
   });
   return {

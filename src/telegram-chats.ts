@@ -22,17 +22,12 @@ export class TelegramChats {
       owner.chat,
       owner.user,
     );
-    if (!row)
-      throw new CommandError(
-        "Conversa não autorizada. Vincule novamente pela web.",
-      );
+    if (!row) throw new CommandError("Conversa não autorizada.");
     if (
       this.dedicated(row.conversationId) &&
       !this.owns(row.conversationId, owner)
     )
-      throw new CommandError(
-        "Conversa não autorizada. Vincule novamente pela web.",
-      );
+      throw new CommandError("Conversa não autorizada.");
     this.app.assertConversationAvailable(row.conversationId);
     return row.conversationId;
   }
@@ -44,25 +39,19 @@ export class TelegramChats {
     const configured = this.app.store.get(
       "SELECT 1 FROM meta WHERE key='telegram:connection'",
     );
-    if (!configured) {
-      if (this.app.options.telegramOnly)
-        throw new CommandError(
-          "Configuração Telegram incompleta no volume (metadados ausentes). Reinicie o serviço; se persistir, confira TELEGRAM_ALLOWED_USERS e TELEGRAM_ALLOWED_CHATS.",
-        );
-      this.binding(owner);
-      return;
-    }
+    if (!configured)
+      throw new CommandError(
+        "Configuração Telegram incompleta no volume (metadados ausentes). Reinicie o serviço; se persistir, confira TELEGRAM_ALLOWED_USERS e TELEGRAM_ALLOWED_CHATS.",
+      );
     const route = this.configuredOwner(owner);
     if (!route || route.chat !== owner.chat || route.user !== owner.user)
       throw new CommandError(
-        this.app.options.telegramOnly
-          ? "Conexão Telegram não autorizada. Confira TELEGRAM_ALLOWED_USERS e TELEGRAM_ALLOWED_CHATS (IDs do seu usuário e do chat) e reinicie o serviço."
-          : "Conexão Telegram não autorizada. Vincule novamente pela web.",
+        "Conexão Telegram não autorizada. Confira TELEGRAM_ALLOWED_USERS e TELEGRAM_ALLOWED_CHATS (IDs do seu usuário e do chat) e reinicie o serviço.",
       );
   }
   assertCreationAuthority(id: string, owner: TelegramOwner) {
     this.connection(owner);
-    if (!id && this.app.options.telegramOnly) return;
+    if (!id) return;
     if (
       !this.app.store.get(
         "SELECT 1 FROM telegram_grants g JOIN conversations c ON c.id=g.conversationId WHERE g.chat=? AND g.user=? AND g.conversationId=?",
@@ -71,41 +60,14 @@ export class TelegramChats {
         id,
       )
     )
-      throw new CommandError(
-        "Conversa não autorizada. Vincule novamente pela web.",
-      );
+      throw new CommandError("Conversa não autorizada.");
     this.app.assertConversationAvailable(id);
   }
   creationAuthority(owner: TelegramOwner) {
     this.connection(owner);
-    if (this.app.options.telegramOnly) {
-      const id = this.selection(owner);
-      if (id) this.authorize(id, owner);
-      return id ?? "";
-    }
-    if (
-      !this.app.store.get("SELECT 1 FROM meta WHERE key='telegram:connection'")
-    )
-      return this.binding(owner);
-    const selected = this.selection(owner);
-    const rows = this.app.store.all<{ id: string }>(
-      `SELECT c.id FROM conversations c JOIN telegram_grants g ON g.conversationId=c.id
-       WHERE g.chat=? AND g.user=? AND c.id NOT IN
-       (SELECT conversationId FROM conversation_lifecycle WHERE deletedAt IS NOT NULL)
-       ORDER BY CASE WHEN c.id=? THEN 0 WHEN c.id IN
-       (SELECT conversationId FROM telegram_conversations WHERE chat=? AND user=?) THEN 1 ELSE 2 END, c.rowid DESC`,
-      owner.chat,
-      owner.user,
-      selected ?? null,
-      owner.chat,
-      owner.user,
-    );
-    if (!rows.length)
-      throw new CommandError(
-        "Conversa não autorizada. Vincule novamente pela web.",
-      );
-    this.assertCreationAuthority(rows[0].id, owner);
-    return rows[0].id;
+    const id = this.selection(owner);
+    if (id) this.authorize(id, owner);
+    return id ?? "";
   }
   owns(id: string, owner: TelegramOwner) {
     return !!this.app.store.get(
@@ -129,7 +91,7 @@ export class TelegramChats {
     this.connection(owner);
     if (!this.owns(id, owner))
       throw new CommandError(
-        "Conversa Telegram indisponível para este usuário. Use /topics para listar suas conversas.",
+        "Conversa Telegram indisponível para este usuário.",
       );
     this.app.assertConversationAvailable(id);
   }
@@ -155,7 +117,7 @@ export class TelegramChats {
     // Revocation cannot silently send the next input back to the shared web history.
     if (!this.owns(id, owner))
       throw new CommandError(
-        "Conversa não autorizada. Use /topics new TÍTULO para criar outra conversa Telegram.",
+        "Conversa não autorizada. Use /new para criar outra conversa neste tópico.",
       );
     this.app.assertConversationAvailable(id);
     return id;
@@ -170,16 +132,73 @@ export class TelegramChats {
       ...(owner.messageThreadId === undefined ? [] : [owner.messageThreadId]),
     )?.conversationId;
   }
-  /**
-   * Forget which conversation this chat/topic uses, so the next message starts a new one.
-   * The old conversation keeps its history; it is simply no longer the selected one.
-   */
-  /** Reloading keeps the conversation: clear what blocks it instead of abandoning the
-   * history. `uncertain` MCP results are the flag that stops every later action. */
+  /** Clear uncertain MCP results for the selected conversation. History stays. */
   reload(owner: TelegramOwner) {
     this.connection(owner);
     const id = this.selected(owner);
     return id ? this.app.mcpCalls.clearUncertain(id) : 0;
+  }
+  /**
+   * Another conversation in this same chat or topic. The previous one stays on disk.
+   * Does not delete Telegram messages and does not clear uncertain MCP (`/reload`).
+   * A stuck native-topic receipt is superseded, or the next `ensure` throws again.
+   */
+  async startFresh(owner: TelegramOwner) {
+    this.connection(owner);
+    const route = this.configuredOwner(owner);
+    const known =
+      owner.messageThreadId === undefined
+        ? undefined
+        : this.app.store.get<{ name: string | null }>(
+            "SELECT name FROM telegram_known_topics WHERE chat=? AND user=? AND messageThreadId=?",
+            owner.chat,
+            owner.user,
+            owner.messageThreadId,
+          );
+    const title =
+      known?.name ||
+      (owner.messageThreadId === undefined
+        ? "Conversa Telegram"
+        : `Tópico Telegram ${owner.messageThreadId}`);
+    const id = await this.app.create(title, owner);
+    const receiptKey =
+      route && owner.messageThreadId !== undefined
+        ? `telegram:native-topic-create:${route.botId}:${owner.chat}:${owner.user}:${owner.messageThreadId}`
+        : undefined;
+    this.app.store.savepoint("telegram_new_conversation", () => {
+      this.select(id, owner);
+      if (receiptKey)
+        this.app.store.run(
+          "INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+          receiptKey,
+          JSON.stringify({
+            state: "done",
+            route,
+            authorityId: id,
+            conversationId: id,
+          }),
+        );
+      if (route && owner.messageThreadId !== undefined)
+        this.app.store.run(
+          `DELETE FROM meta WHERE key GLOB 'telegram:topic-create:*'
+           AND json_valid(value)
+           AND json_extract(value,'$.route.botId')=?
+           AND json_extract(value,'$.route.chat')=?
+           AND json_extract(value,'$.route.user')=?
+           AND (
+             json_extract(value,'$.messageThreadId')=?
+             OR (
+               json_extract(value,'$.state') IN ('uncertain','cancelled','failed')
+               AND json_extract(value,'$.messageThreadId') IS NULL
+             )
+           )`,
+          route.botId,
+          owner.chat,
+          owner.user,
+          owner.messageThreadId,
+        );
+    });
+    return id;
   }
 
   select(id: string, owner: TelegramOwner) {
@@ -232,7 +251,7 @@ export class TelegramChats {
       )
     )
       throw new CommandError(
-        "Este tópico tem uma criação pendente ou um vínculo revogado. Verifique na web; use /new para criar outra conversa explicitamente.",
+        "Este tópico tem uma criação pendente ou um vínculo revogado. Use /new para criar outra conversa neste tópico.",
       );
     const known =
       owner.messageThreadId === undefined
@@ -273,7 +292,7 @@ export class TelegramChats {
           return receipt.conversationId;
         }
         throw new CommandError(
-          "A criação deste tópico teve resultado incerto. Verifique na web; use /new para criar outra conversa explicitamente.",
+          "A criação deste tópico teve resultado incerto. Use /new para criar outra conversa neste tópico.",
         );
       }
       this.app.store.run(
@@ -292,7 +311,7 @@ export class TelegramChats {
         )?.value !== nativeReceipt
       )
         throw new CommandError(
-          "Autorização Telegram mudou durante a criação. Use /new explicitamente para continuar.",
+          "Autorização Telegram mudou durante a criação. Use /new para criar outra conversa neste tópico.",
         );
       // An explicit /topics selection made during creation takes precedence.
       const current = this.selected(owner);

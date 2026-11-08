@@ -17,26 +17,15 @@ faux.setResponses([
 ]);
 const models = createModels();
 models.setProvider(faux.provider);
-const gateway = {
-  call: async (
-    _s: string,
-    _t: string,
-    _args: Record<string, unknown>,
-    kind: "read" | "action",
-  ) => {
-    if (kind === "read") return { content: [] };
-    appendFileSync(`${dir}/effects.log`, "write\n");
-    console.log("ACTION_PENDING");
-    await new Promise(() => {});
-    return {};
-  },
-};
+const gateway = { catalog: async () => [] };
 const app = await Runtime.open({ dir, gateway, models });
 const id = await app.create();
 await app.submit(id, "crash-request", "resume me");
-await app.actions.read(id, "mock", "read", {});
-const action = app.actions.propose(id, 999, "mock", "write", {});
-void app.actions.decide(id, action.id, "approve");
+app.store.run(
+  "INSERT INTO actions(id,conversationId,server,tool,args,state) VALUES ('a',?,'mock','write','{}','running')",
+  id,
+);
+console.log("ACTION_PENDING");
 app.store.run(
   "INSERT INTO deliveries(id,chat,text) VALUES ('crash-delivery','100','hello')",
 );

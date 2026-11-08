@@ -780,7 +780,7 @@ export function queueMcpUncertainNotices(app: Runtime) {
       deliveryId,
       owner,
       call.conversationId,
-      `${call.server} / ${call.tool}: resultado MCP incerto. Verifique no serviço externo. Toque em Registrar verificação externa abaixo, ou envie /destravar para dispensar sem apagar o histórico.`,
+      `${call.server} / ${call.tool}: resultado MCP incerto. Verifique no serviço externo. Toque em Registrar verificação externa abaixo, ou envie /reload para dispensar sem apagar o histórico (/destravar também).`,
       {
         inline_keyboard: [
           [{ text: "Registrar verificação externa…", callback_data: token }],

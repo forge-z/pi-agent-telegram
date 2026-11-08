@@ -103,9 +103,8 @@ test("closing the bootstrap store breaks OAuth checkAuth until Runtime shares th
     dir,
     store: live,
     models: rebound,
-    gateway: { call: async () => ({}) },
+    gateway: { catalog: async () => [] },
     mode: "live",
-    telegramOnly: true,
   });
   try {
     assert.ok(await app.models.checkAuth("openai"));

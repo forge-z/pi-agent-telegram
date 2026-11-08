@@ -52,7 +52,7 @@ async function fixture(
   const options = {
     dir,
     models,
-    gateway: { call: async () => ({ content: [] }) },
+    gateway: { catalog: async () => [] },
   };
   let app = await Runtime.open(options);
   let now = epoch;
@@ -85,7 +85,7 @@ async function fixture(
     schedule: "* * * * *",
     timezone: "UTC",
     conversationId: id,
-    delivery: linked ? "web_telegram" : "web",
+    ...(linked ? { delivery: "web_telegram" as const } : {}),
   });
   const task = tasks.get(createdTask.id)!;
   const sent: Array<{
@@ -233,7 +233,7 @@ test("completed cron queues one Telegram result and retry/restart never duplicat
 test("web-only tasks keep a durable web decision and never queue Telegram deliveries", async () => {
   const f = await fixture();
   try {
-    f.tasks.setDelivery(f.task.id, "web");
+    f.tasks.update(f.task.id, { delivery: "web" });
     const run = await f.run();
     assert.equal(run.state, "done");
     assert.equal(
@@ -262,7 +262,7 @@ test("web-only tasks keep a durable web decision and never queue Telegram delive
 test("web plus Telegram sends one copy only after the explicit task selection", async () => {
   const f = await fixture();
   try {
-    f.tasks.setDelivery(f.task.id, "web_telegram");
+    f.tasks.update(f.task.id, { delivery: "web_telegram" });
     const run = await f.run();
     assert.equal(run.state, "done");
     assert.equal(f.app.store.all("SELECT * FROM deliveries").length, 1);
@@ -879,7 +879,7 @@ test("a scheduled run that does not call notify sends nothing and logs the final
       lines.push(parts.map(String).join(" "));
     };
     try {
-      f.tasks.setDelivery(f.task.id, "web_telegram");
+      f.tasks.update(f.task.id, { delivery: "web_telegram" });
       const run = await f.run();
       await f.engine().flush();
       assert.equal(f.sent.length, 0, `nada enviado: ${JSON.stringify(answer)}`);
@@ -1041,7 +1041,7 @@ test("notify with invisible text is refused and sends nothing", async () => {
       ),
       fauxAssistantMessage("\u200b"),
     ]);
-    f.tasks.setDelivery(f.task.id, "web_telegram");
+    f.tasks.update(f.task.id, { delivery: "web_telegram" });
     const run = await f.run();
     await f.engine().flush();
     assert.equal(f.sent.length, 0);

@@ -11,6 +11,11 @@ runtime, nunca argumento de build.
 
 ## 0. Checklist antes do primeiro deploy
 
+O caminho oficial é `npm run setup` (chave de API de um provedor pi-ai) ou `npm run login`
+(assinatura ChatGPT/Codex), no terminal do container, depois que ele sobe. `LLM_BASE_URL`
+e `LLM_API_KEY` não são obrigatórias. Os itens abaixo só valem para o caminho compatível
+opcional (menu "Outro").
+
 Faça isso uma vez, fora do Coolify, para não descobrir erro de configuração no boot.
 
 1. **A raiz da URL está exata?** A URL é usada literalmente: o adapter concatena
@@ -36,8 +41,8 @@ Faça isso uma vez, fora do Coolify, para não descobrir erro de configuração 
    o mesmo token (o app falha fechado se detectar webhook ou segundo consumidor).
 5. **Volume novo.** Não reuse um `pi_agent_tg_data` de outro bot: o app recusa subir com
    "Volume pertence a outro bot".
-6. Tenha em mãos: bot token, user IDs permitidos, `LLM_BASE_URL`, `LLM_API_KEY` e, se
-   houver, `EXECUTOR_MCP_URL` + `EXECUTOR_TOKEN`.
+6. Tenha em mãos: bot token, user IDs permitidos e, se houver, `EXECUTOR_MCP_URL` +
+   `EXECUTOR_TOKEN`. A chave do modelo entra depois, com `npm run setup` ou `npm run login`.
 
 ## 1. Criar o recurso
 
@@ -65,7 +70,7 @@ No `docker-compose.yml`, ambas usam a sintaxe `${VAR:?}`. De acordo com a docume
 
 Todas as demais variáveis são opcionais e **não** estão declaradas no bloco `environment:` do Compose:
 
-- `LLM_BASE_URL` e `LLM_API_KEY`: opcionais se você configurar o provedor pelo terminal via `npm run setup` (a escolha fica gravada no banco SQLite do volume persistente). Definir aqui atua como override declarativo.
+- `LLM_BASE_URL` e `LLM_API_KEY`: não fazem parte do caminho oficial. Use `npm run setup` ou `npm run login`. Essas duas variáveis só ligam o provedor compatível `llm` (menu "Outro") e não substituem um setup oficial já gravado no volume.
 - `EXECUTOR_MCP_URL` e `EXECUTOR_TOKEN`: opcionais (em par). Sem elas, o bot sobe normalmente, apenas sem ferramentas externas MCP.
 - `TELEGRAM_ALLOWED_CHATS`: opcional (IDs negativos de grupos/supergrupos; por padrão copia `TELEGRAM_ALLOWED_USERS` para DMs).
 - `TZ`: opcional (fuso do relógio do container para logs, ex.: `America/Sao_Paulo`; omitido usa UTC). Agendamentos gravam seu próprio timezone IANA.
@@ -161,7 +166,7 @@ build nem necessidade de **Source commit availability → Available during build
 - **Upgrade para o Pi 1.4.0.** O primeiro boot migra `/app/data/durable.sqlite` para o
   schema 2 do pi-durable. Essa migração não tem rollback: a imagem anterior não lê o
   schema 2. Faça backup do volume antes do deploy e, se precisar voltar, restaure o
-  backup junto com a imagem antiga.
+  backup junto com a imagem antiga. Esta release não adiciona outra migração.
 
 ## 5. Hardening e possíveis atritos
 
@@ -184,9 +189,10 @@ costuma ser só isso.
 - No terminal do serviço (Coolify): `node scripts/diagnose-tg-runtime.mjs` ou
   `npm run diagnose`.
 - Defina o modelo padrão (opcional, mas recomendado para quem não vai usar `/model`):
-  `npm run setup-model -- --list` e então
-  `npm run setup-model -- --model llm/<id> --effort high`. Sem isso, o primeiro item do
-  catálogo é usado e o bot avisa uma vez por conversa.
+  `npm run setup -- --list`. `npm run setup` é o assistente completo (visão e áudio inclusive);
+  `npm run login` é só OAuth. Os dois gravam no volume. Um setup oficial não é trocado por
+  `LLM_BASE_URL`/`LLM_API_KEY` (isso só vale no caminho compatível). Sem modelo escolhido, o
+  primeiro item do catálogo é usado e o bot avisa uma vez por conversa. `/model` troca.
 - No host, via SSH: `bash scripts/diagnose-tg-deploy.sh .`.
 - No Telegram: envie `/status` dentro de um tópico existente.
 
@@ -208,8 +214,8 @@ imagem.
   `SOURCE_COMMIT=$(git rev-parse HEAD) docker compose up -d --build`.
 - Rollback: selecione um commit anterior no Coolify e redeploy. Restaure o backup do
   volume junto — o ledger SQLite é a única fonte de verdade das conversas. O primeiro
-  boot desta versão migra `durable.sqlite` para o schema 2 sem caminho de volta; a
-  imagem anterior não abre esse arquivo.
+  boot que levou o volume ao Pi 1.4 migrou `durable.sqlite` para o schema 2 sem caminho
+  de volta; a imagem anterior não abre esse arquivo. Esta release permanece no schema 2.
 
 ## 9. Quando algo falha
 

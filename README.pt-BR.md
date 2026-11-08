@@ -28,7 +28,7 @@ O repositório e o container mantêm o nome `pi-agent-tg` para não quebrar volu
 3. Opcional, para grupo: adicione o bot e, no **@BotFather**, `/setprivacy` → **Disable**; sem isso o Telegram só entrega comandos e menções. O id negativo do grupo vai em `TELEGRAM_ALLOWED_CHATS`.
 4. Opcional, para uma conversa por tópico: transforme o grupo em **fórum** (configurações do grupo → Tópicos). Cada tópico fica com histórico, modelo e esforço próprios, sem configuração extra.
 
-O menu de comandos (`/model`, `/thinking`, `/crons`, `/stop`, `/status`, `/reload`, `/retomar`, `/help`) é registrado pelo próprio app ao subir e de novo no `/status` — não há `/setcommands` para fazer.
+O menu de comandos (`/model`, `/thinking`, `/crons`, `/stop`, `/status`, `/reload`, `/new`, `/resume`, `/help`) é registrado pelo próprio app ao subir e de novo no `/status` — não há `/setcommands` para fazer. `/retomar` continua retomando uma tarefa estacionada, e `/destravar` continua dispensando um MCP incerto; nenhum dos dois aparece no menu.
 
 ## Instalação
 
@@ -41,6 +41,25 @@ docker compose up -d --build
 
 Obrigatórias: `TELEGRAM_BOT_TOKEN` e `TELEGRAM_ALLOWED_USERS`. Para ter ferramentas, acrescente `EXECUTOR_MCP_URL` + `EXECUTOR_TOKEN`. O resto é opcional e está em [.env.example](.env.example).
 
+Esse par registra um servidor **direct** (o padrão, também quando `mode` é omitido). As ferramentas do Executor — search, describe, call, execute, resume, skills — continuam no prompt com o schema completo, e uma chamada com efeito continua parando no cartão "Aprovação MCP pendente". Um MCP grande ao lado pode usar `"mode": "deferred"`: os schemas ficam ocultos até o modelo chamar `tool_search`. Nomes em `alwaysLoad` continuam direct. `allowedTools` e `deniedTools` valem nos dois modos. O Executor permanece direct:
+
+```json
+[
+  {
+    "name": "executor",
+    "url": "https://executor.example/mcp",
+    "tokenEnv": "EXECUTOR_TOKEN"
+  },
+  {
+    "name": "github",
+    "url": "https://github.example/mcp",
+    "tokenEnv": "GH_TOKEN",
+    "mode": "deferred",
+    "alwaysLoad": ["search_code"]
+  }
+]
+```
+
 ## Configuração única
 
 ```sh
@@ -51,8 +70,9 @@ docker exec -it <container> npm run setup
 
 ```
 [0] ChatGPT (assinatura Plus/Pro — OAuth, sem chave de API)
-[1] DeepSeek  [2] Gemini  [3] OpenAI  [4] OpenCode Zen
-[5] OpenCode Go  [6] OpenRouter  [7] Outro (OpenAI-compatible)
+[1] Anthropic — catálogo oficial
+…
+[n] Outro (OpenAI-compatible) — reserva opcional
 Provedor [1]: 0
 Assinatura [1] Sign in with ChatGPT (openai) [2] Codex legado (openai-codex) [1]: 1
 Siga o login OAuth abaixo (código de dispositivo ou cole a URL de redirect se pedido).
@@ -60,43 +80,37 @@ Siga o login OAuth abaixo (código de dispositivo ou cole a URL de redirect se p
 openai/gpt-5  —  esforços: off low high
 Modelo (número ou id): 1
 Esforço: high
-Configuração gravada no volume (openai, authMode=chatgpt) — defina LLM_AUTH=chatgpt no deploy ou use só o registro do volume.
+Configuração gravada no volume (openai, authMode=chatgpt) — o registro do volume basta.
 ```
 
-Ou escolha **`[3] OpenAI`** (ou outro) para o fluxo clássico com chave de API:
+Ou escolha um provedor oficial (Anthropic, Google, OpenAI, Groq, …) para chave de API:
 
 ```
-Provedor [1]: 2
-Chave de API (não aparece): █                  ← oculta; valida na hora
-  ✔ chave válida — 63 modelos listados
-Modelo (número ou id): 12
+Provedor [1]: anthropic
+Chave de API (não aparece): █                  ← oculta; não vai para o histórico
+  ✔ chave guardada para anthropic — catálogo oficial
+Modelo (número ou id): 3
 Esforço: high
-Modelo do chat: lê imagens                     ← o modelo é sondado, não presumido
-IMAGEM — Enter mantém o do chat, "-" desativa
-Modelo de visão [usa o do chat]:               ← ou "o" para outro provedor
-ÁUDIO — Enter desativa
-  [1] OpenAI — whisper-1  [2] Groq  [3] Gemini  [4] Outro
-Transcrição [desativada]: 1
-Idioma [auto]: pt
-Gravar? [y/N] y
-Configuração gravada no volume (gemini) — as variáveis LLM_* deixam de ser necessárias.
+Modelo do chat: lê imagens (catálogo pi-ai)
+…
+Configuração gravada no volume (anthropic) — chave em credentials com esse id.
 ```
 
-1. **Provedor** — **`[0] ChatGPT`** (OAuth, sem `LLM_API_KEY`) ou número/id/URL de um provedor com chave. No ChatGPT, escolha Sign in with ChatGPT (`openai`) ou Codex legado (`openai-codex`); o login é o mesmo do `npm run login`.
-2. **Chave** — só no modo chave de API; nunca aparece na tela, e é validada em `GET /models` antes de seguir.
-3. **Modelo e esforço** — a lista usa o provedor pi-ai correto (`llm` com chave, ou `openai` / `openai-codex` na assinatura). O padrão global fica em `meta` com o mesmo `provider` que o `/model` espera.
-4. **Imagem** — o modelo do chat é sondado; se lê imagens, Enter mantém. `o` abre a lista de provedores de novo (visão no Gemini com chat na DeepSeek), `-` desativa.
+1. **Provedor** — **`[0] ChatGPT`** (OAuth, o mesmo login do `npm run login`) ou um id nativo do pi-ai. O último item, **Outro**, é a reserva OpenAI-compatible e não é o caminho oficial.
+2. **Chave** — só no modo chave de API; nunca aparece na tela. No provedor oficial ela fica em `credentials` com o id do provedor (`anthropic`, `google`, `openai`, …). `GET /models` só roda na reserva compatível.
+3. **Modelo e esforço** — catálogo oficial: API nativa, janela de contexto, níveis de raciocínio e preços. O `/model` lista `provedor/modelId` e só troca o modelo; não pede chave nem login.
+4. **Imagem** — no provedor oficial vem do catálogo. `o` ainda pode apontar a visão para outro endpoint compatível, `-` desativa.
 5. **Áudio** — endpoint de transcrição, porque endpoint de chat não transcreve; avisa que o modelo precisa aceitar OGG/Opus.
-6. **Confirmar** — a escolha vai para `meta`, as chaves para `credentials`, e o bot começa a responder em até dez segundos. Sem restart.
+6. **Confirmar** — a escolha vai para `meta`, a chave para `credentials`, e o bot começa a responder em até dez segundos. Sem restart. `LLM_BASE_URL` e `LLM_API_KEY` não são necessárias.
 
-Qualquer passo depois do primeiro pode ser pulado com Enter, e o `npm run setup` pode ser rodado de novo: mostra os valores atuais e mantém o que você não mudar. Variáveis de ambiente continuam valendo e **vencem** o registro.
+O `npm run setup` pode ser rodado de novo. Um setup oficial completo **não** é substituído por `LLM_BASE_URL` / `LLM_API_KEY` deixadas no ambiente. Essas duas variáveis só valem na reserva compatível, e só quando não há setup oficial no volume.
 
 ## Assinatura ChatGPT (sem chave de API)
 
-Para usar a **assinatura ChatGPT Plus/Pro** (Sign in with ChatGPT ou Codex legado) em vez de `LLM_API_KEY`:
+Para usar a **assinatura ChatGPT Plus/Pro** (Sign in with ChatGPT ou Codex legado):
 
-1. No `.env` ou no painel do deploy, defina `LLM_AUTH=chatgpt` (sem `LLM_API_KEY`).
-2. Suba o container — ele fica aguardando login, saudável, como no wizard inicial.
+1. Suba o container. `LLM_AUTH=chatgpt` é opcional; o registro no volume basta. Não defina `LLM_API_KEY`.
+2. Sem login, ele fica aguardando, saudável, como no wizard inicial.
 3. No terminal do container (precisa de TTY para colar a URL de retorno):
 
    ```sh
@@ -119,21 +133,23 @@ Logout: `npm run login -- --logout openai`.
 
 **Por que não há `/login` no Telegram:** o Sign in with ChatGPT exige callback OAuth em `localhost` ou colar a URL de redirecionamento completa — não há fluxo só “abrir link e pronto” confiável sem interação no terminal. O Codex aceita device code, mas ainda exige digitar o código no site; o CLI no container é o caminho suportado.
 
-Modo **chave de API** (`LLM_*` ou `npm run setup` com `[1]`–`[7]`) continua igual. Assinatura ChatGPT pode ser configurada **no próprio `npm run setup` (`[0]`)** ou com `npm run login`; os provedores `openai` / `openai-codex` aparecem no `/model` depois do OAuth.
+A Anthropic neste bot é chave de API, não login de assinatura Claude. A assinatura ChatGPT pode ser configurada **no próprio `npm run setup` (`[0]`)** ou com `npm run login`; os provedores `openai` / `openai-codex` aparecem no `/model` depois do OAuth.
 
-## Provedores que ele já conhece
+`npm run setup` é o assistente completo, inclusive visão e áudio. `npm run login` é só OAuth (e o device-code do Codex sem TTY). Os dois gravam no volume. Não há terceiro comando. Quando o login não encontra modelo, grava o primeiro do catálogo; `/model` troca.
 
-| Provedor     | Endpoint                                                  | Observação                                               |
-| ------------ | --------------------------------------------------------- | -------------------------------------------------------- |
-| DeepSeek     | `https://api.deepseek.com`                                | `deepseek-flash` lê imagens; limites e níveis conhecidos |
-| Gemini       | `https://generativelanguage.googleapis.com/v1beta/openai` | superfície OpenAI-compatible; tem free tier              |
-| OpenAI       | `https://api.openai.com/v1`                               | também é o caminho de áudio (`/audio/transcriptions`)    |
-| OpenCode Zen | `https://opencode.ai/zen/v1`                              | catálogo separado do Go                                  |
-| OpenCode Go  | `https://opencode.ai/zen/go/v1`                           | a chave pode não valer nos dois                          |
-| OpenRouter   | `https://openrouter.ai/api/v1`                            | muitos modelos, inclusive variantes `:free`              |
-| Outro        | qualquer URL raiz                                         | qualquer endpoint que fale a API de completion da OpenAI |
+## Provedores
+
+O menu lista cada provedor do pi-ai que aceita uma chave só (Anthropic, OpenAI, Google, Groq, xAI, DeepSeek, Mistral, OpenRouter, OpenCode Zen, OpenCode Go e o resto desse catálogo). Cada um usa a API nativa, a janela de contexto, os níveis de raciocínio e os preços da biblioteca. A lista sai do catálogo instalado, não de uma segunda tabela neste repositório.
+
+| Caminho         | O que é                                                                    |
+| --------------- | -------------------------------------------------------------------------- |
+| Chave oficial   | `npm run setup`; a chave fica em `credentials.provider = <id do pi-ai>`    |
+| ChatGPT / Codex | `npm run login` ou `[0]` no setup; provedores `openai` e `openai-codex`    |
+| Outro           | reserva OpenAI-compatible (`llm`), para proxy ou host que o pi-ai não traz |
 
 Áudio é configurado à parte, porque endpoint de chat não transcreve: OpenAI, Groq e Gemini aparecem com o modelo padrão de cada um.
+
+Um volume antigo com `credentials.provider = 'llm'` continua de pé. No próximo start, se `LLM_BASE_URL` / `LLM_API_KEY` estiverem vazias e o modelo salvo existir no catálogo nativo, a chave é copiada para esse provedor. Se o modelo não estiver no catálogo, o bot segue no endpoint compatível.
 
 ## Existe uma API ou um MCP para isso
 
@@ -163,7 +179,7 @@ Mais ou menos na ordem em que um assistente pessoal precisa: e-mail, web, voz, d
 - **Fuso do container** — `TZ` (ex.: `America/Sao_Paulo`) muda só o horário dos logs; agendamentos guardam o próprio timezone IANA e não se movem.
 - **Versão do Executor** — a suportada é a **v2 da nuvem** (`https://mcp.executor.sh/mcp`); cada integração é um app do Executor. Jobs são manifestos (`ASYNC_JOB_MANIFESTS`) ou os embutidos do TinyFish e do Instabox. A conta da leitura vem da chamada. `ASYNC_JOB_TOOLS` e `EXECUTOR_ACCOUNT_ID` não são lidas.
 - **Jobs assíncronos por manifesto** — cada job é descrito em `ASYNC_JOB_MANIFESTS` (disparo, como observar, vocabulário de status, caminhos de id/resultado). O núcleo só conhece estado, fila, dedupe e entrega, então integrar outro provedor é escrever manifesto, não patch. Tarefas de código na sandbox Instabox (`instabox_code_task`) rodam em segundo plano e entregam o resultado (incluindo link de PR) via poller de status. O caminho oficial do Executor v2 já vem pronto, sem configuração. Referência completa em [docs/jobs.md](docs/jobs.md).
-- **Resultado MCP incerto** — quando o provedor perde o retorno de uma chamada, a conversa para de executar ações até alguém verificar. **Leituras continuam funcionando** (incluindo `execute` só de consulta no Executor), uma leitura bem-sucedida já dispensa a pendência, o tópico recebe um aviso com botão de registro, e `/destravar` (ou `/reload`) limpa o flag **sem apagar o histórico**. Detalhes em [docs/mcp-uncertain.md](docs/mcp-uncertain.md).
+- **Resultado MCP incerto** — quando o provedor perde o retorno de uma chamada, a conversa para de executar ações até alguém verificar. **Leituras continuam funcionando** (incluindo `execute` só de consulta no Executor), uma leitura bem-sucedida já dispensa a pendência, o tópico recebe um aviso com botão de registro, e `/reload` (atalho `/destravar`) limpa o flag **sem apagar o histórico**. Detalhes em [docs/mcp-uncertain.md](docs/mcp-uncertain.md).
 - **Agendamento fala só por `notify`** — o texto final de um run que não é um turno do usuário (agenda, disparo manual, job) **não é entregue**. Para avisar, o modelo chama `notify`, que posta no chat e no tópico daquele agendamento e pode ser chamada mais de uma vez. Texto que fica vazio depois de tirar espaços e caracteres invisíveis é recusado e nada sai. `replyTo` é o `message_id` de uma mensagem já vista neste mesmo chat; se não der para confirmar, o reply é ignorado e o aviso sai no tópico mesmo assim. Os ids recentes entram no contexto do run. Se não houver o que relatar, o modelo não chama nada: o run fica `silencioso` e o texto final vai para o log, com o id da rotina. Falha do runner (exceção, timeout, erro de provedor, tarefa estacionada, erro de job) continua sendo avisada pelo sistema, com a causa, e não depende do modelo. `delivery: none` continua sem envio.
 - **Resposta no Telegram** — quando a mensagem responde outra (e quando traz uma citação), o turno recebe o id, o autor (bot ou usuário) e o texto ou a legenda, truncados se forem longos.
 - **Agendamentos** — crie um cron pelo chat; execuções agendadas nunca aprovam nada e nunca criam novos agendamentos. Qualquer agendamento pode ser disparado na hora — **Rodar agora** no `/crons`, ou `tasks_run_now` para o modelo — pelo mesmo pipeline e com a mesma entrega, sem mexer no próximo horário.
@@ -171,25 +187,25 @@ Mais ou menos na ordem em que um assistente pessoal precisa: e-mail, web, voz, d
 
 ## Comandos
 
-| Comando      | O que faz                                                                      |
-| ------------ | ------------------------------------------------------------------------------ |
-| `/status`    | os três modelos em uso, esforço, MCPs e versão                                 |
-| `/reload`    | recarregar esta conversa e dispensar resultado MCP incerto (histórico mantido) |
-| `/destravar` | o mesmo que `/reload` quando a conversa está travada por MCP incerto           |
-| `/retomar`   | executar de novo uma tarefa estacionada depois de quedas seguidas              |
-| `/model`     | provedor e modelo desta conversa                                               |
-| `/thinking`  | esforço desta conversa                                                         |
-| `/crons`     | criar e gerenciar agendamentos                                                 |
-| `/stop`      | interromper o que está rodando neste tópico                                    |
-| `/help`      | a mesma lista, no chat                                                         |
+| Comando     | O que faz                                                                                    |
+| ----------- | -------------------------------------------------------------------------------------------- |
+| `/status`   | os três modelos em uso, esforço, MCPs (erro, quantidade e nomes) e versão                    |
+| `/reload`   | dispensar resultado MCP incerto desta conversa (histórico intacto). `/destravar` faz o mesmo |
+| `/new`      | outra conversa neste tópico; a anterior permanece no volume. `/nova` faz o mesmo             |
+| `/resume`   | executar de novo uma tarefa estacionada depois de quedas seguidas. `/retomar` faz o mesmo    |
+| `/model`    | provedor e modelo desta conversa                                                             |
+| `/thinking` | esforço desta conversa                                                                       |
+| `/crons`    | criar e gerenciar agendamentos                                                               |
+| `/stop`     | interromper o que está rodando neste tópico                                                  |
+| `/help`     | a mesma lista, no chat                                                                       |
 
 ## Limites que vale saber
 
 - **O modelo de transcrição precisa aceitar OGG/Opus** — é o único formato que o Telegram manda num recado de voz. `whisper-1`, Gemini e Groq aceitam; a família `gpt-4o-transcribe` não lista ogg.
-- **A descoberta informa só ids.** Sem `LLM_MODELS`, todo modelo declara não ter raciocínio e o `/thinking` oferece apenas `off`.
+- **A reserva compatível informa só ids.** Sem `LLM_MODELS`, um modelo do provedor `llm` declara não ter raciocínio e o `/thinking` oferece apenas `off`. Provedores oficiais já declaram os níveis.
 - **Compactação** resume turnos antigos automaticamente, para a conversa não crescer sem fim.
 - Histórico, credenciais e registro são tão privados quanto o volume e o host: proteja o volume e os backups.
-- **Upgrade a partir do Pi 1.3.** O primeiro boot migra o `durable.sqlite` para o schema 2, e essa migração não tem rollback. Faça backup do volume antes do deploy. Voltar a imagem sem restaurar esse backup deixa o ledger num schema que o release anterior não lê.
+- **Upgrade a partir do Pi 1.3.** O primeiro boot migra o `durable.sqlite` para o schema 2, e essa migração não tem rollback. Faça backup do volume antes do deploy. Voltar a imagem sem restaurar esse backup deixa o ledger num schema que o release anterior não lê. Esta release não adiciona outra migração.
 
 ## Projetos
 

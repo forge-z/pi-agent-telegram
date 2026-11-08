@@ -1,17 +1,23 @@
 import { join, resolve } from "node:path";
-import { rmSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { Runtime } from "./runtime.js";
 import { McpGateway } from "./mcp.js";
 import {
   readConfig,
   bootstrapModels,
   LLM_PROVIDER_ID,
+  preferredVolumeSelection,
   secretRedactor,
   SetupRequiredError,
   startupErrorMessage,
   telegramAllowlistMisconfiguration,
 } from "./config.js";
-import { readStoredSetup, type StoredSetup } from "./setup.js";
+import {
+  migrateLegacyOfficialSetup,
+  readStoredSetup,
+  type StoredSetup,
+} from "./setup.js";
 import { Store, SqlCredentials } from "./store.js";
 
 /**
@@ -19,8 +25,26 @@ import { Store, SqlCredentials } from "./store.js";
  * terminal needed to run the wizard. Wait instead, re-reading the volume: `npm run
  * setup` finishes and the bot starts on its own a few seconds later.
  */
+function migrateVolume(dir: string) {
+  const file = join(dir, "app.sqlite");
+  if (!existsSync(file)) return;
+  const db = new DatabaseSync(file);
+  try {
+    const migrated = migrateLegacyOfficialSetup(db, process.env);
+    if (migrated)
+      console.info(
+        `Volume: chave compatível reaproveitada em ${migrated.providerId}/${migrated.modelId}.`,
+      );
+  } catch {
+    /* A volume that cannot be migrated keeps the compat path. */
+  } finally {
+    db.close();
+  }
+}
+
 async function modelsOrWait(dir: string) {
   for (let attempt = 0; ; attempt += 1) {
+    migrateVolume(dir);
     const stored = readStoredSetup(dir);
     const store = new Store(dir);
     try {
@@ -76,17 +100,31 @@ try {
     store: Store;
   } = await modelsOrWait(dir);
   // Safe deploy hint: endpoint and catalog only, never credentials.
+  const selection = await preferredVolumeSelection(
+    models,
+    new SqlCredentials(bootstrapStore),
+    stored,
+  );
   const llm = models.getProvider(LLM_PROVIDER_ID);
-  const llmCatalog = models.getModels(LLM_PROVIDER_ID);
-  const oauthProviders = models
-    .getProviders()
-    .filter(
-      (provider) => provider.id === "openai" || provider.id === "openai-codex",
-    );
+  const llmCatalog = llm ? models.getModels(LLM_PROVIDER_ID) : [];
+  const active = selection?.provider;
+  const activeProvider = active ? models.getProvider(active) : undefined;
+  const activeCatalog = active ? models.getModels(active) : [];
   console.info(
-    llm
-      ? `Pi-Agent: provedor ${LLM_PROVIDER_ID} (${llm.baseUrl ?? "sem endpoint"}) — ${llmCatalog.length} modelo(s), reasoning habilitado em ${llmCatalog.filter((model) => model.reasoning).length}.`
-      : `Pi-Agent: sem provedor LLM_*; assinatura ChatGPT via ${oauthProviders.map((p) => p.id).join(", ") || "openai"}.`,
+    active && active !== LLM_PROVIDER_ID && activeProvider
+      ? `Pi-Agent: provedor ${active} (${activeProvider.baseUrl ?? "catálogo oficial"}) — ${activeCatalog.length} modelo(s) do catálogo pi-ai, reasoning habilitado em ${activeCatalog.filter((model) => model.reasoning).length}.`
+      : llm
+        ? `Pi-Agent: provedor compatível ${LLM_PROVIDER_ID} (${llm.baseUrl ?? "sem endpoint"}) — ${llmCatalog.length} modelo(s), reasoning habilitado em ${llmCatalog.filter((model) => model.reasoning).length}.`
+        : `Pi-Agent: assinatura ChatGPT via ${
+            models
+              .getProviders()
+              .filter(
+                (provider) =>
+                  provider.id === "openai" || provider.id === "openai-codex",
+              )
+              .map((provider) => provider.id)
+              .join(", ") || "openai"
+          }.`,
   );
   const api = new TelegramBotApi(config.token);
   const bot = (await api.call("getMe")) as { id: number; username?: string };
@@ -100,14 +138,13 @@ try {
     gateway,
     models,
     mode: "live",
-    telegramOnly: true,
     // Bootstrap only: the choice from `npm run setup` seeds the default once;
     // /model and /thinking own it afterwards.
-    ...(stored.record
+    ...(selection
       ? {
-          provider: stored.record.providerId,
-          modelId: stored.record.modelId,
-          effort: stored.record.effort,
+          provider: selection.provider,
+          modelId: selection.modelId,
+          effort: selection.effort,
         }
       : {}),
     redact: secretRedactor(process.env, config.mcp),

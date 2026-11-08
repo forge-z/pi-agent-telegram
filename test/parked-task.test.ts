@@ -68,8 +68,7 @@ test(
       app = await Runtime.open({
         dir,
         models,
-        gateway: { call: async () => ({}) },
-        telegramOnly: true,
+        gateway: { catalog: async () => [] },
         initialize: (store) =>
           configureTelegram(store, config, { id: 123, username: "test_bot" }),
       });
@@ -97,6 +96,7 @@ test(
       assert.equal(notice.messageThreadId, 11);
       assert.match(notice.text, /pi\.generation/);
       assert.match(notice.text, /5 vezes seguidas/);
+      assert.match(notice.text, /\/resume/);
       assert.match(notice.text, /\/retomar/);
 
       const sent: { chat: string; text: string; thread?: number }[] = [];

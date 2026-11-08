@@ -27,10 +27,26 @@ function linkChat(
 
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-sidebar-"));
-  const options = { dir, gateway: { call: async () => ({}) } };
+  const options = { dir, gateway: { catalog: async () => [] } };
   let app = await Runtime.open(options);
   const webId = await app.create("Legacy web history");
   linkChat(app, "42", "7", webId);
+  app.store.run(
+    "INSERT INTO credentials VALUES ('telegram:bot',?)",
+    JSON.stringify({ token: "123:synthetic-fixture", botId: 123 }),
+  );
+  app.store.run(
+    "INSERT INTO meta VALUES ('telegram:connection',?)",
+    JSON.stringify({
+      enabled: true,
+      bot: { id: 123 },
+      userId: "7",
+      chatId: "42",
+      allowedUsers: ["7", "99"],
+      allowedChats: ["42", "100"],
+      conversationId: webId,
+    }),
+  );
   const dedicatedId = await app.create("Dedicated Telegram conversation", {
     chat: "42",
     user: "7",
@@ -73,21 +89,18 @@ test("sidebar includes dedicated Telegram chats and marks origin rather than leg
       kind: "once",
       schedule: "2099-01-01T00:00:00Z",
       timezone: "Etc/UTC",
-      delivery: "web",
     });
     f.app.store.run(
-      "INSERT INTO meta VALUES ('telegram:connection',?)",
+      "INSERT INTO meta VALUES ('telegram:connection',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
       JSON.stringify({
         enabled: true,
         bot: { id: 123 },
         userId: "7",
         chatId: "42",
+        allowedUsers: ["7", "99"],
+        allowedChats: ["42", "100"],
         conversationId: f.webId,
       }),
-    );
-    f.app.store.run(
-      "INSERT INTO credentials VALUES ('telegram:bot',?)",
-      JSON.stringify({ token: "123:synthetic-fixture", botId: 123 }),
     );
     assert.deepEqual(channels(f.app), [
       { id: titledId, channel: "web", telegramLinked: false },
@@ -157,7 +170,7 @@ test("all Telegram origins remain visible across selection, disconnect, revoke a
     f.app.telegramChats.select(secondId, { chat: "42", user: "7" });
     assert.deepEqual(channels(f.app), before);
     f.app.store.run(
-      "INSERT INTO meta VALUES ('telegram:connection',?)",
+      "INSERT INTO meta VALUES ('telegram:connection',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
       JSON.stringify({
         enabled: false,
         bot: { id: 123 },

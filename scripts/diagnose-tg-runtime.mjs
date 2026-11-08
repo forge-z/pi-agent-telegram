@@ -16,6 +16,11 @@ import {
   startupErrorMessage,
   telegramAllowlistMisconfiguration,
 } from "../dist/src/config.js";
+import {
+  describeVolumeProvider,
+  formatWaiting,
+  readVolumeSetupFacts,
+} from "../dist/src/diagnose-volume.js";
 import { readAppInfo } from "../dist/src/app-info.js";
 import { spawnSync } from "node:child_process";
 
@@ -113,31 +118,57 @@ try {
   console.log(`readConfig: FALHOU — ${startupErrorMessage(error)}`);
 }
 
-section("Provedor de modelo (LLM_*)");
-try {
-  const models = await environmentModels();
-  const catalog = models.getModels(LLM_PROVIDER_ID);
+const dataDir = process.env.DATA_DIR?.trim() || "/app/data";
+
+section("Provedor de modelo");
+const volumeFacts = readVolumeSetupFacts(dataDir, process.env);
+for (const line of describeVolumeProvider(volumeFacts)) console.log(line);
+if (volumeFacts.source === "env") {
+  try {
+    const models = await environmentModels();
+    const catalog = models.getModels(LLM_PROVIDER_ID);
+    console.log(
+      `environmentModels: OK (${models
+        .getProviders()
+        .map((p) => p.id)
+        .join(", ")}) — ${catalog.length} modelo(s)`,
+    );
+    const reasoning = catalog.filter((m) => m.reasoning).map((m) => m.id);
+    console.log(
+      `reasoning habilitado (${reasoning.length}): ${reasoning.join(", ") || "nenhum — /thinking fica em off; declare LLM_MODELS com reasoning=true"}`,
+    );
+    for (const model of catalog.slice(0, 20))
+      console.log(`  ${LLM_PROVIDER_ID}/${model.id}`);
+    if (catalog.length > 20) console.log(`  … +${catalog.length - 20}`);
+    console.log(
+      `padrão global: ${globalDefault() ?? "nenhum escolhido (implícito: primeiro do catálogo)"}`,
+    );
+    console.log(
+      "Estado do registro: npm run setup -- --list. OAuth: npm run login.",
+    );
+  } catch (error) {
+    console.log(`environmentModels: FALHOU — ${startupErrorMessage(error)}`);
+  }
+} else if (volumeFacts.source === "volume") {
   console.log(
-    `environmentModels: OK (${models
-      .getProviders()
-      .map((p) => p.id)
-      .join(", ")}) — ${catalog.length} modelo(s)`,
+    "environmentModels: não consultado (a chave fica no volume; diagnose não a lê nem a imprime).",
   );
-  const reasoning = catalog.filter((m) => m.reasoning).map((m) => m.id);
-  console.log(
-    `reasoning habilitado (${reasoning.length}): ${reasoning.join(", ") || "nenhum — /thinking fica em off; declare LLM_MODELS com reasoning=true"}`,
-  );
-  for (const model of catalog.slice(0, 20))
-    console.log(`  ${LLM_PROVIDER_ID}/${model.id}`);
-  if (catalog.length > 20) console.log(`  … +${catalog.length - 20}`);
   console.log(
     `padrão global: ${globalDefault() ?? "nenhum escolhido (implícito: primeiro do catálogo)"}`,
   );
   console.log(
-    "Defina o padrão com: npm run setup-model -- --list | --model <id> [--effort <level>]",
+    "Estado do registro: npm run setup -- --list. OAuth: npm run login.",
   );
-} catch (error) {
-  console.log(`environmentModels: FALHOU — ${startupErrorMessage(error)}`);
+} else {
+  try {
+    await environmentModels();
+    console.log("environmentModels: OK, mas nenhum registro foi encontrado.");
+  } catch (error) {
+    console.log(`environmentModels: FALHOU — ${startupErrorMessage(error)}`);
+  }
+  console.log(
+    "Sem provedor no ambiente nem no volume. Rode npm run setup ou npm run login.",
+  );
 }
 
 if (process.argv.includes("--probe")) {
@@ -183,7 +214,6 @@ try {
 }
 
 section("Heartbeat / DATA_DIR");
-const dataDir = process.env.DATA_DIR?.trim() || "/app/data";
 console.log(`DATA_DIR=${dataDir}`);
 const healthPath = join(dataDir, "health.json");
 if (!existsSync(healthPath)) {
@@ -197,6 +227,8 @@ if (!existsSync(healthPath)) {
     console.log(
       `health.json: presente (idade ~${Math.round(ageMs / 1000)}s${ageMs > 90_000 ? ", possivelmente stale" : ""})`,
     );
+    const waiting = formatWaiting(health.waiting);
+    if (waiting) console.log(waiting);
   } catch {
     console.log("health.json: ilegível");
   }

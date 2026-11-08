@@ -11,6 +11,7 @@ import {
 } from "./telegram-controls.js";
 import type { TelegramTransport } from "./telegram.js";
 import { hash } from "./store.js";
+import { LLM_PROVIDER_ID } from "./config.js";
 
 const PAGE_SIZE = 8;
 const guidance =
@@ -139,9 +140,11 @@ function render(
       !current ||
       current.efforts.filter((effort) => effort !== "off").length === 0;
     return {
-      text: `Esforço ativo: ${menu.current.effort}\nModelo: ${menu.current.modelId}\n${
+      text: `Esforço ativo: ${menu.current.effort}\nModelo: ${menu.current.provider}/${menu.current.modelId}\n${
         noReasoning
-          ? "Este modelo não declara níveis de raciocínio, então só existe `off`. Para habilitar low/medium/high, declare o catálogo em LLM_MODELS com `reasoning=true` ou a lista de níveis (ex.: deepseek-flash|1000000|384000|off+low+high+max).\n"
+          ? menu.current.provider === LLM_PROVIDER_ID
+            ? "Este modelo não declara níveis de raciocínio, então só existe `off`. Para habilitar low/medium/high, declare o catálogo em LLM_MODELS com `reasoning=true` ou a lista de níveis (ex.: deepseek-flash|1000000|384000|off+low+high+max).\n"
+            : "Este modelo não declara níveis de raciocínio no catálogo oficial, então só existe `off`.\n"
           : ""
       }${guidance}`,
       markup,
@@ -150,7 +153,7 @@ function render(
   const currentProvider =
     app.models.getProvider(menu.current.provider)?.name ??
     menu.current.provider;
-  let text = `Configuração de modelo\nAtual: ${menu.current.modelId}\nProvedor: ${currentProvider}\n\n`;
+  let text = `Configuração de modelo\nAtual: ${menu.current.provider}/${menu.current.modelId}\nProvedor: ${currentProvider}\n\n`;
   const provider =
     action.action === "models"
       ? available.find((p) => p.id === action.provider)

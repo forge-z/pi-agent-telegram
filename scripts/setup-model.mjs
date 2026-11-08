@@ -9,7 +9,8 @@
  * (/model), because a second writer there is not supported.
  *
  * Usage: npm run setup-model -- [--list] [--model <id>] [--effort <level>] [--dry-run]
- * Reads DATA_DIR, LLM_BASE_URL, LLM_API_KEY, LLM_API_KEY_FILE and LLM_MODELS.
+ * Official path: a pi-ai provider id and a key stored under that id.
+ * LLM_BASE_URL / LLM_API_KEY remain only for the compat reserve ("Outro").
  * Needs the build output: run `npm run build` first outside the container (the
  * runtime image already ships dist/).
  */
@@ -25,12 +26,18 @@ import {
   LLM_PROVIDER_ID,
   bootstrapModels,
   environmentModels,
+  officialModels,
   operatorSecret,
   SetupRequiredError,
 } from "../dist/src/config.js";
 import { PROVIDERS } from "../dist/src/providers.js";
+import {
+  resolveSetupChoice,
+  setupChoices,
+} from "../dist/src/native-providers.js";
 import { probeImageSupport } from "../dist/src/vision.js";
 import {
+  migrateLegacyOfficialSetup,
   readStoredSetup,
   setupKey,
   writeStoredSetup,
@@ -51,13 +58,16 @@ const MODE = "live";
 const usage = `Uso: npm run setup -- [opções]
 
   Primeira execução (sem nada configurado): sem argumentos, num terminal, o menu
-  pergunta provedor, chave, modelo, esforço, visão e áudio.
+  pergunta o provedor oficial, a chave, o modelo, o esforço, a visão e o áudio.
 
   --list                      mostra o estado atual
-  --provider <id|url>         chatgpt | openai-codex | deepseek | gemini | openai |
-                              opencode-zen | opencode-go | openrouter | custom | URL
+  --provider <id|url>         chatgpt | openai-codex | id nativo do pi-ai
+                              (anthropic, openai, google, groq, openrouter, xai,
+                              deepseek, opencode, opencode-go, …)
+                              | gemini (alias de google) | opencode-zen (alias de opencode)
+                              | custom | URL
   --key-stdin                 lê a chave do stdin (evita histórico e \`ps\`)
-  --model <id>                id do modelo
+  --model <id>                id do modelo no catálogo desse provedor
   --effort <level>            off|minimal|low|medium|high|xhigh|max
   --vision <id|none>          modelo de visão (none desativa; vazio = do chat)
   --audio <id|none>           modelo de transcrição (none desativa)
@@ -65,8 +75,11 @@ const usage = `Uso: npm run setup -- [opções]
   --audio-language <code>     idioma da transcrição (vazio = detectar)
   --dry-run                   mostra o que seria gravado, sem escrever
 
-A chave vem de LLM_API_KEY, de --key-stdin, ou do menu (entrada oculta). Sem terminal
-(pipe, CI, docker exec sem -it) use as flags e a variável.`;
+A chave oficial entra por --key-stdin ou pelo menu (entrada oculta) e fica em
+credentials com o id do provedor. LLM_API_KEY ainda alimenta o caminho compatível
+("Outro") e pode ser lida por --provider quando --key-stdin não vem. LLM_BASE_URL
+e LLM_API_KEY não são obrigatórias e não substituem um setup oficial já gravado.
+Sem terminal (pipe, CI, docker exec sem -it) use as flags.`;
 
 function fail(message, code = 1) {
   if (code === 0) console.log(message);
@@ -262,14 +275,14 @@ const resolved = {
   providerId: "custom",
   audioKey: "",
   mode: "api",
-  /** pi-ai provider id for defaults (/model): `llm` or `openai-codex` / `openai`. */
+  /** `native` uses the pi-ai catalog; `compat` is the generic `llm` reserve. */
+  kind: "compat",
+  /** pi-ai provider id for defaults (/model). */
   piProviderId: LLM_PROVIDER_ID,
 };
 
 function activeProviderId() {
-  return resolved.mode === "subscription"
-    ? resolved.piProviderId
-    : LLM_PROVIDER_ID;
+  return resolved.piProviderId;
 }
 
 function isSubscriptionChoice(raw) {
@@ -381,14 +394,50 @@ async function loadCatalog(baseUrl, apiKey) {
       efforts: getSupportedThinkingLevels(model),
     }));
   resolved.mode = "api";
+  resolved.kind = "compat";
   resolved.piProviderId = LLM_PROVIDER_ID;
   if (!catalog.length)
     fail("Nenhum modelo de chat no catálogo. Confira o provedor e a chave.");
 }
 
+/** Official catalog is static: no GET /models, and the key is not required to list it. */
+function loadNativeCatalog(providerId) {
+  const store = new Store(dir);
+  try {
+    models = officialModels(new SqlCredentials(store));
+  } finally {
+    store.close();
+  }
+  const provider = models.getProvider(providerId);
+  if (!provider) fail(`Provedor nativo desconhecido: ${providerId}.`);
+  resolved.mode = "api";
+  resolved.kind = "native";
+  resolved.piProviderId = providerId;
+  resolved.providerId = providerId;
+  resolved.baseUrl = provider.baseUrl ?? "";
+  catalog = models
+    .getModels(providerId)
+    .filter((model) => !NOT_CHAT.test(model.id))
+    .map((model) => ({
+      id: model.id.replace(/^models\//, ""),
+      efforts: getSupportedThinkingLevels(model),
+    }));
+  if (!catalog.length)
+    fail("Nenhum modelo de chat no catálogo oficial desse provedor.");
+  if (!resolved.baseUrl) {
+    const sample = models.getModel(providerId, catalog[0].id);
+    resolved.baseUrl = sample?.baseUrl ?? "";
+  }
+}
+
 mkdirSync(dir, { recursive: true, mode: 0o700 });
 const db = new DatabaseSync(join(dir, "app.sqlite"));
 db.exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)");
+const migrated = migrateLegacyOfficialSetup(db, process.env, MODE);
+if (migrated)
+  console.log(
+    `Volume migrado para o provedor oficial ${migrated.providerId}/${migrated.modelId}.`,
+  );
 const defaultsKey = modelDefaultsKey(MODE);
 const confirmedKey = modelDefaultsConfirmedKey(MODE);
 const setupMetaKey = setupKey(MODE);
@@ -497,7 +546,9 @@ function printState(baseUrl) {
   console.log(
     resolved.mode === "subscription"
       ? "Autenticação: assinatura ChatGPT (OAuth no volume; equivalente a LLM_AUTH=chatgpt)"
-      : `Endereço: ${baseUrl || process.env.LLM_BASE_URL?.trim() || "(não definido)"}`,
+      : resolved.kind === "native"
+        ? `Endereço: catálogo oficial${resolved.baseUrl ? ` (${resolved.baseUrl})` : ""}`
+        : `Endereço: ${baseUrl || process.env.LLM_BASE_URL?.trim() || "(não definido)"} (caminho compatível)`,
   );
   console.log(`Padrão global: ${label(current())}`);
   console.log(`Funções: ${functionLabel(effectiveFunctions())}`);
@@ -592,13 +643,18 @@ function commitSubscription(entry, effort, functions = currentFunctions()) {
 function commit(entry, effort, functions = currentFunctions()) {
   if (resolved.mode === "subscription")
     return commitSubscription(entry, effort, functions);
-  const settings = { provider: LLM_PROVIDER_ID, modelId: entry.id, effort };
-  const baseUrl = resolved.baseUrl.replace(/\/+$/, "");
+  const provider = activeProviderId();
+  const registered = models.getModel(provider, entry.id);
+  const baseUrl = (registered?.baseUrl || resolved.baseUrl || "").replace(
+    /\/+$/,
+    "",
+  );
   const apiKey = resolved.apiKey || undefined;
-  if (!baseUrl || !apiKey)
+  if (!apiKey || !baseUrl)
     fail("Provedor ou chave ausente: o registro não seria utilizável.");
+  const settings = { provider, modelId: entry.id, effort };
   const record = {
-    providerId: resolved.providerId,
+    providerId: resolved.kind === "native" ? provider : resolved.providerId,
     baseUrl,
     modelId: entry.id,
     effort,
@@ -659,7 +715,9 @@ function commit(entry, effort, functions = currentFunctions()) {
   );
   console.log(`Padrão global: ${label(settings)}`);
   console.log(
-    `Configuração gravada no volume (${record.providerId}) — as variáveis LLM_* deixam de ser necessárias.`,
+    resolved.kind === "native"
+      ? `Configuração gravada no volume (${record.providerId}) — chave em credentials com esse id. LLM_* não é necessário.`
+      : `Configuração gravada no volume (${record.providerId}, caminho compatível) — as variáveis LLM_* deixam de ser necessárias.`,
   );
   console.log(`Banco: ${join(dir, "app.sqlite")}`);
   console.log(
@@ -688,7 +746,7 @@ async function runModelWizard(readline) {
   const effort = effortFor(entry, await readline.question("Esforço: "));
   const prefill = effectiveFunctions();
   const stored = currentFunctions();
-  if (resolved.mode === "subscription") {
+  if (resolved.mode === "subscription" || resolved.kind === "native") {
     resolved.chatVision = inferChatVision(entry);
     console.log(
       `\nModelo do chat: ${
@@ -896,19 +954,31 @@ async function interactive() {
     let apiKey = operatorSecret(process.env, "LLM_API_KEY") ?? before.apiKey;
 
     console.log(
+      "Provedores oficiais do pi-ai. A chave fica no volume, no id do provedor.",
+    );
+    console.log(
       "  [0] ChatGPT (assinatura Plus/Pro — OAuth, sem chave de API)",
     );
-    PROVIDERS.forEach((entry, index) =>
+    const menu = setupChoices();
+    menu.forEach((entry, index) =>
       console.log(
         `  [${index + 1}] ${entry.name}${entry.hint ? ` — ${entry.hint}` : ""}`,
       ),
     );
+    const storedNative =
+      before.record &&
+      before.record.authMode !== "chatgpt" &&
+      resolveSetupChoice(before.record.providerId)?.kind === "native"
+        ? resolveSetupChoice(before.record.providerId)
+        : undefined;
     const defaultHint =
       before.record?.authMode === "chatgpt"
         ? "0"
-        : baseUrl
-          ? `atual: ${baseUrl}`
-          : "1";
+        : storedNative
+          ? storedNative.id
+          : baseUrl
+            ? `atual: ${baseUrl}`
+            : "1";
     const providerAnswer = (
       await readline.question(`\nProvedor [${defaultHint}]: `)
     ).trim();
@@ -959,10 +1029,34 @@ async function interactive() {
       return;
     }
 
-    if (providerAnswer) {
-      const picked = providerFromAnswer(providerAnswer);
-      if (!picked)
-        return fail("Provedor inválido: use o número, o id ou a URL raiz.");
+    const picked = providerAnswer
+      ? resolveSetupChoice(providerAnswer)
+      : storedNative;
+    if (providerAnswer && !picked)
+      return fail("Provedor inválido: use o número, o id ou a URL raiz.");
+    if (!picked && !baseUrl)
+      return fail("Informe o provedor (número, id ou URL).");
+
+    if (picked?.kind === "native") {
+      const same =
+        resolveSetupChoice(before.record?.providerId ?? "")?.id === picked.id;
+      apiKey = same ? (before.apiKey ?? apiKey) : undefined;
+      if (!apiKey) {
+        readline.pause();
+        apiKey = await hidden("Chave de API (não aparece): ");
+        readline.resume();
+      }
+      if (!apiKey) return fail("Chave ausente.");
+      resolved.apiKey = apiKey;
+      loadNativeCatalog(picked.id);
+      console.log(
+        `  ✔ chave guardada para ${picked.id} — ${catalog.length} modelos no catálogo oficial`,
+      );
+      await runModelWizard(readline);
+      return;
+    }
+
+    if (picked?.kind === "compat") {
       let pickedUrl = picked.baseUrl;
       if (!pickedUrl)
         pickedUrl = (
@@ -1053,7 +1147,7 @@ try {
   if (!hasFlags) {
     if (!process.stdin.isTTY)
       fail(
-        `Sem terminal interativo. Use --provider, a chave em LLM_API_KEY (ou --key-stdin) e --model.\n\n${usage}`,
+        `Sem terminal interativo. Use --provider, --key-stdin (ou LLM_API_KEY no caminho compatível) e --model.\n\n${usage}`,
         2,
       );
     await interactive();
@@ -1068,24 +1162,51 @@ try {
       await loadSubscriptionCatalog(undefined, piProviderId);
     } else {
       const picked = options.provider
-        ? providerFromAnswer(options.provider)
-        : undefined;
-      const baseUrl =
-        picked?.baseUrl ??
-        process.env.LLM_BASE_URL?.trim() ??
-        stored.record?.baseUrl;
-      const apiKey = options.keyStdin
+        ? resolveSetupChoice(options.provider)
+        : stored.record?.providerId
+          ? resolveSetupChoice(stored.record.providerId)
+          : undefined;
+      const stdinKey = options.keyStdin
         ? (await readStdin()).trim()
-        : (operatorSecret(process.env, "LLM_API_KEY") ?? stored.apiKey);
-      if (baseUrl && apiKey) {
-        resolved.baseUrl = baseUrl;
-        resolved.apiKey = apiKey;
-        resolved.providerId = providerIdFor(baseUrl);
-        await loadCatalog(baseUrl, apiKey);
-      } else if (writes && !subscriptionFlags)
-        fail(
-          "Falta provedor ou chave: use --provider e LLM_API_KEY (ou --key-stdin), ou --provider chatgpt|openai-codex após login.",
-        );
+        : undefined;
+      const envKey = operatorSecret(process.env, "LLM_API_KEY");
+      const sameNative =
+        picked?.kind === "native" &&
+        resolveSetupChoice(stored.record?.providerId ?? "")?.id === picked.id;
+      // A stored official key beats a leftover LLM_API_KEY. --key-stdin still wins.
+      const apiKey =
+        stdinKey ||
+        (sameNative ? stored.apiKey : undefined) ||
+        envKey ||
+        (picked?.kind === "native" ? undefined : stored.apiKey);
+      if (options.provider && !picked)
+        fail(`Provedor inválido: ${options.provider}\n\n${usage}`, 2);
+      else if (picked?.kind === "native") {
+        if (!apiKey && writes)
+          fail(
+            "Falta a chave: use --key-stdin (ou LLM_API_KEY só nesta execução do setup).",
+          );
+        if (apiKey) {
+          resolved.apiKey = apiKey;
+          loadNativeCatalog(picked.id);
+        }
+      } else {
+        const baseUrl =
+          (picked?.kind === "compat" ? picked.baseUrl : undefined) ||
+          process.env.LLM_BASE_URL?.trim() ||
+          (stored.record?.authMode === "chatgpt"
+            ? undefined
+            : stored.record?.baseUrl);
+        if (baseUrl && apiKey) {
+          resolved.baseUrl = baseUrl;
+          resolved.apiKey = apiKey;
+          resolved.providerId = providerIdFor(baseUrl);
+          await loadCatalog(baseUrl, apiKey);
+        } else if (writes && !subscriptionFlags && options.provider)
+          fail(
+            "Falta provedor ou chave: use --provider e --key-stdin, ou --provider chatgpt|openai-codex após login.",
+          );
+      }
     }
     const baseUrl =
       resolved.baseUrl ||
@@ -1120,7 +1241,7 @@ try {
         ? selectionFromFlags()
         : currentFunctions();
       if (resolved.chatVision === undefined) {
-        if (resolved.mode === "subscription") {
+        if (resolved.mode === "subscription" || resolved.kind === "native") {
           resolved.chatVision = inferChatVision(entry);
           console.log(
             `Modelo do chat: ${resolved.chatVision ? "lê imagens (catálogo)" : "NÃO lê imagens (catálogo)"}`,

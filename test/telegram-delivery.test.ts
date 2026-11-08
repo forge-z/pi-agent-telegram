@@ -65,7 +65,7 @@ test("HTML delivery errors never trigger plain-text fallback or resend after res
   let app = await Runtime.open({
     dir,
     mode: "demo",
-    gateway: { call: async () => ({}) },
+    gateway: { catalog: async () => [] },
   });
   const sent: { text: string; mode: unknown }[] = [];
   const transport = {
@@ -100,7 +100,7 @@ test("HTML delivery errors never trigger plain-text fallback or resend after res
     app = await Runtime.open({
       dir,
       mode: "demo",
-      gateway: { call: async () => ({}) },
+      gateway: { catalog: async () => [] },
     });
     telegram = new Telegram(app, transport, ["42"], ["42"]);
     await telegram.flush();

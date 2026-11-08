@@ -10,7 +10,6 @@ import { readAppInfo } from "./app-info.js";
 import {
   credentialBinding,
   observeTopic,
-  syncTopicTitle,
   queueControl,
   type TelegramButton,
   type TelegramReplyMarkup,
@@ -39,6 +38,7 @@ import { describeImage } from "./vision.js";
 import { hash, type Delivery } from "./store.js";
 import { imageVerdict, type OutboundMedia } from "./outbound.js";
 import { CommandError } from "./commands.js";
+import { formatMcpStatus, MCP_DISCOVERY_UNANSWERED } from "./mcp.js";
 import { SettingsError } from "./settings.js";
 import { TaskError } from "./tasks.js";
 import {
@@ -55,13 +55,6 @@ interface ControlRoute extends TelegramOwner {
   botId: number;
   credentialBinding: string;
 }
-type TopicTitleReceipt =
-  | {
-      route: ControlRoute;
-      name: string;
-      state: "pending" | "done" | "cancelled" | "uncertain";
-    }
-  | { state: "cancelled" };
 function unavailableConversation(error: unknown) {
   // Settings/deletion inspections are temporary; storage failures must retry too.
   return (
@@ -382,6 +375,18 @@ export class TelegramSendRefused extends Error {
     super(`Telegram recusou o envio (código ${code}).`);
   }
 }
+const CLEAN_HELP = [
+  "/model — provedor e modelo",
+  "/thinking — esforço",
+  "/crons — criar e gerenciar agendamentos",
+  "/stop — interromper este tópico",
+  "/status — estado",
+  "/reload — dispensar resultado MCP incerto desta conversa (histórico intacto; /destravar também)",
+  "/new — outra conversa neste tópico (a anterior permanece)",
+  "/resume — executar de novo uma tarefa estacionada por quedas (/retomar também)",
+  "/help — ajuda",
+  "Cada tópico nativo tem histórico próprio. Crie tópicos no Telegram. Escolhas de modelo persistem após reinício. Compactação automática usa o modelo e esforço ativos.",
+].join("\n");
 export class Telegram {
   private closing = false;
   private sendAfter = 0;
@@ -415,189 +420,32 @@ export class Telegram {
     if (!start.startsWith("/") || start.startsWith("//")) return raw;
     const text = raw.trim();
     const addressed = /^\/[a-z]+@([a-z0-9_]+)(?=\s|$)/i.exec(text);
-    if (!addressed) return this.newAlias(text);
+    if (!addressed) return text;
     // Never execute a command intended for another bot or guess our identity.
     if (addressed[1].toLowerCase() !== this.botUsername?.toLowerCase())
       return undefined;
-    return this.newAlias(text.replace(/^(\/[a-z]+)@[a-z0-9_]+/i, "$1"));
-  }
-  private newAlias(text: string) {
-    if (this.app.options.telegramOnly) return text;
-    const match = /^\/new(?:\s+([\s\S]*))?$/.exec(text);
-    return match
-      ? `/topics new${match[1]?.trim() ? ` ${match[1].trim()}` : ""}`
-      : text;
-  }
-  private queueImplicitTopicTitle(
-    update: TelegramUpdate,
-    owner: TelegramOwner,
-    eventBot: string,
-  ) {
-    if (this.app.options.telegramOnly) return;
-    const created = update.message?.forum_topic_created;
-    if (
-      !this.transport.editTopicName ||
-      owner.messageThreadId === undefined ||
-      created?.is_name_implicit !== true ||
-      typeof created.name !== "string" ||
-      created.name.length > 128 ||
-      /[\u0000-\u001f\u007f-\u009f]/.test(created.name) ||
-      !/^\/new(?:@[a-zA-Z0-9_]+)?(?:\s|$)/.test(created.name.trim())
-    )
-      return;
-    const command = this.commandText(created.name);
-    const match = /^\/topics new(?:\s+([\s\S]*))?$/.exec(command ?? "");
-    if (!match) return;
-    // Quotes and punctuation belong to the supplied name, not to this parser.
-    const name = match[1]?.trim() || "Conversa Telegram";
-    if (name.length > 100) return;
-    const route = this.controlRoute(owner);
-    if (!route) return;
-    this.app.store.run(
-      "INSERT OR IGNORE INTO meta VALUES (?,?)",
-      `telegram:topic-title:${eventBot}:${update.update_id}`,
-      JSON.stringify({
-        route,
-        name,
-        state: "pending",
-      } satisfies TopicTitleReceipt),
-    );
-  }
-  private async editImplicitTopicTitle(updateId: number, eventBot: string) {
-    const key = `telegram:topic-title:${eventBot}:${updateId}`;
-    const saved = this.app.store.get<{ value: string }>(
-      "SELECT value FROM meta WHERE key=?",
-      key,
-    );
-    if (!saved || !this.transport.editTopicName) return;
-    const receipt = JSON.parse(saved.value) as TopicTitleReceipt;
-    if (receipt.state !== "pending") return;
-    const save = (state: TopicTitleReceipt["state"]) =>
-      this.app.store.run(
-        "UPDATE meta SET value=? WHERE key=? AND value=?",
-        JSON.stringify({ ...receipt, state }),
-        key,
-        state === "done"
-          ? JSON.stringify({ ...receipt, state: "uncertain" })
-          : saved.value,
-      );
-    const route = this.controlRoute(receipt.route);
-    const topic = this.app.store.get<{
-      closed: number | null;
-      nameUpdateId: number;
-      nameBotId: string;
-    }>(
-      "SELECT closed,nameUpdateId,nameBotId FROM telegram_known_topics WHERE chat=? AND user=? AND messageThreadId=?",
-      receipt.route.chat,
-      receipt.route.user,
-      receipt.route.messageThreadId!,
-    );
-    if (
-      this.closing ||
-      !route ||
-      JSON.stringify(route) !== JSON.stringify(receipt.route) ||
-      !topic ||
-      topic.closed === 1 ||
-      topic.nameUpdateId !== updateId ||
-      topic.nameBotId !== eventBot
-    ) {
-      save("cancelled");
-      return;
-    }
-    try {
-      const selected = this.app.telegramChats.selection(receipt.route);
-      if (selected) this.app.telegramChats.authorize(selected, receipt.route);
-      else this.app.telegramChats.creationAuthority(receipt.route);
-    } catch (error) {
-      if (!unavailableConversation(error)) throw error;
-      save("cancelled");
-      return;
-    }
-    // Commit uncertainty before an external mutation. Replays never repeat a
-    // possibly applied title edit over a later name chosen by the user.
-    if (!save("uncertain").changes) return;
-    let result: unknown;
-    try {
-      result = await this.transport.editTopicName(
-        receipt.route.chat,
-        receipt.route.messageThreadId!,
-        receipt.name,
-      );
-    } catch {
-      return;
-    }
-    if (result !== true) return;
-    this.app.store.savepoint("telegram_topic_title_result", () => {
-      // Permanent purge may scrub this receipt while the API call is in flight.
-      if (!save("done").changes) return;
-      this.app.store.run(
-        "UPDATE telegram_known_topics SET name=? WHERE chat=? AND user=? AND messageThreadId=? AND nameUpdateId=? AND nameBotId=?",
-        receipt.name,
-        receipt.route.chat,
-        receipt.route.user,
-        receipt.route.messageThreadId!,
-        updateId,
-        eventBot,
-      );
-      syncTopicTitle(this.app, receipt.route);
-    });
+    return text.replace(/^(\/[a-z]+)@[a-z0-9_]+/i, "$1");
   }
   /** Control replies identify the configured private owner, never grant history access. */
   private controlRoute(owner: TelegramOwner): ControlRoute | undefined {
     if (
-      (!this.privateDm && !this.app.options.telegramOnly) ||
       !this.botId ||
       !this.users.includes(owner.user) ||
       !this.chats.includes(owner.chat)
     )
       return;
-    if (this.app.options.telegramOnly) {
-      const identity = telegramIdentity(this.app.store, owner);
-      if (
-        !identity ||
-        identity.botId !== this.botId ||
-        identity.credentialBinding !== this.credentialBinding
-      )
-        return;
-      return {
-        ...owner,
-        botId: identity.botId,
-        credentialBinding: identity.credentialBinding,
-      };
-    }
-    const saved = this.app.store.get<{ value: string }>(
-      "SELECT value FROM meta WHERE key='telegram:connection'",
-    );
-    if (!saved) return;
-    try {
-      const config = JSON.parse(saved.value);
-      if (
-        config.enabled !== true ||
-        config.bot?.id !== this.botId ||
-        config.userId !== owner.user ||
-        config.chatId !== owner.chat
-      )
-        return;
-      const credential = this.app.store.get<{ value: string }>(
-        "SELECT value FROM credentials WHERE provider='telegram:bot'",
-      );
-      if (!credential) return;
-      const identity = JSON.parse(credential.value);
-      if (
-        identity.botId !== this.botId ||
-        typeof identity.token !== "string" ||
-        !identity.token.trim()
-      )
-        return;
-      if (hash(credential?.value ?? "") !== this.credentialBinding) return;
-      return {
-        ...owner,
-        botId: this.botId,
-        credentialBinding: hash(credential?.value ?? ""),
-      };
-    } catch {
+    const identity = telegramIdentity(this.app.store, owner);
+    if (
+      !identity ||
+      identity.botId !== this.botId ||
+      identity.credentialBinding !== this.credentialBinding
+    )
       return;
-    }
+    return {
+      ...owner,
+      botId: identity.botId,
+      credentialBinding: identity.credentialBinding,
+    };
   }
   private updateIdentity(update: TelegramUpdate) {
     const bot = String(
@@ -653,7 +501,6 @@ export class Telegram {
       (message.message_thread_id !== undefined &&
         (!Number.isSafeInteger(message.message_thread_id) ||
           message.message_thread_id <= 0)) ||
-      (!this.app.options.telegramOnly && message.chat.type !== "private") ||
       query.from.is_bot ||
       !/^pi:[a-f0-9]{32}$/.test(query.data ?? "")
     )
@@ -819,10 +666,7 @@ export class Telegram {
     const messageThreadId = message.message_thread_id;
     if (
       (messageThreadId !== undefined &&
-        (!Number.isSafeInteger(messageThreadId) ||
-          messageThreadId <= 0 ||
-          (!this.app.options.telegramOnly &&
-            message.chat.type !== "private"))) ||
+        (!Number.isSafeInteger(messageThreadId) || messageThreadId <= 0)) ||
       (message.is_topic_message && messageThreadId === undefined)
     )
       return { ignored: true };
@@ -835,11 +679,9 @@ export class Telegram {
       !this.users.includes(user) ||
       !this.chats.includes(chat) ||
       (this.privateDm && message.chat.type !== "private") ||
-      (this.app.options.telegramOnly &&
-        !["private", "group", "supergroup"].includes(message.chat.type))
+      !["private", "group", "supergroup"].includes(message.chat.type)
     ) {
       if (
-        this.app.options.telegramOnly &&
         typeof message.text === "string" &&
         message.text.trimStart().startsWith("/")
       )
@@ -884,25 +726,7 @@ export class Telegram {
           );
         return { ignored: true };
       }
-      if (identity.seen) {
-        if (
-          !this.app.options.telegramOnly &&
-          message.forum_topic_created &&
-          messageThreadId !== undefined
-        ) {
-          try {
-            await this.app.telegramChats.ensure(
-              owner,
-              undefined,
-              message.forum_topic_created.name,
-            );
-          } catch (error) {
-            if (!unavailableConversation(error)) throw error;
-          }
-        }
-        await this.editImplicitTopicTitle(update.update_id, eventBot);
-        return { observed: true };
-      }
+      if (identity.seen) return { observed: true };
       if (
         this.app.store.get(
           "SELECT 1 FROM telegram_updates WHERE id=?",
@@ -927,29 +751,12 @@ export class Telegram {
           eventBot,
           message.date ?? 0,
         );
-        this.queueImplicitTopicTitle(update, owner, eventBot);
         this.app.store.run(
           "INSERT INTO meta VALUES (?,?)",
           identity.key,
           identity.fingerprint,
         );
       });
-      if (
-        !this.app.options.telegramOnly &&
-        message.forum_topic_created &&
-        messageThreadId !== undefined
-      ) {
-        try {
-          await this.app.telegramChats.ensure(
-            owner,
-            undefined,
-            message.forum_topic_created.name,
-          );
-        } catch (error) {
-          if (!unavailableConversation(error)) throw error;
-        }
-      }
-      await this.editImplicitTopicTitle(update.update_id, eventBot);
       return { observed: true };
     }
     const command =
@@ -1052,21 +859,6 @@ export class Telegram {
       // topic, re-executing a command, or moving its history/outbox destination.
       if (recovered) return { recovered: true };
     }
-    const linked = this.app.options.telegramOnly
-      ? undefined
-      : this.app.store.get<{ conversationId: string; user: string }>(
-          "SELECT * FROM telegram WHERE chat=?",
-          chat,
-        );
-    if (
-      !this.app.options.telegramOnly &&
-      !/^\/(link|start)(?:\s|$)/.test(text) &&
-      (!linked || linked.user !== user) &&
-      !this.controlRoute({ chat, user })
-    )
-      throw new TelegramInputError(
-        "Conversa não vinculada a este usuário; use /link CODIGO pela web",
-      );
     const inFlight = this.receives.get(update.update_id);
     if (inFlight) return inFlight;
     const tracked = {
@@ -1088,8 +880,7 @@ export class Telegram {
               return false;
             this.app.telegramChats.creationAuthority(owner);
             const selected = this.app.telegramChats.selected(owner);
-            const id =
-              tracked.conversationId ?? selected ?? linked?.conversationId;
+            const id = tracked.conversationId ?? selected;
             if (!id || (tracked.conversationId && selected && selected !== id))
               return false;
             if (
@@ -1287,6 +1078,34 @@ export class Telegram {
     voice?: VoiceRef,
     incoming?: TelegramUpdate["message"],
   ) {
+    // /new has to run before ensure(): a stuck topic receipt throws there, which is
+    // the case this command exists to leave behind. It does not rewrite into /topics.
+    if (/^\/(?:new|nova)(?:\s|$)/.test(text)) {
+      try {
+        const created = await this.app.telegramChats.startFresh(owner);
+        queueControl(
+          this.app,
+          `telegram:clean:${updateId}`,
+          owner,
+          created,
+          "Conversa nova neste tópico. A anterior permanece no volume e o histórico não foi apagado. Resultados MCP incertos não foram dispensados; use /reload para isso.",
+        );
+        return { conversationId: created, control: true };
+      } catch (error) {
+        if (error instanceof CommandError) {
+          this.app.store.queueTelegram(
+            `telegram:clean:${updateId}`,
+            owner.chat,
+            error.message,
+            3500,
+            undefined,
+            owner.messageThreadId,
+          );
+          return { control: true, error: error.message };
+        }
+        throw error;
+      }
+    }
     let id: string;
     try {
       id = await this.app.telegramChats.ensure(owner);
@@ -1307,19 +1126,23 @@ export class Telegram {
     const reply = (message: string) =>
       queueControl(this.app, `telegram:clean:${updateId}`, owner, id, message);
     try {
-      if (text === "/model" || text === "/thinking") {
+      const command = /^\/([a-z]+)(?:\s|$)/.exec(text)?.[1];
+      if (command === "model" || command === "thinking") {
         await openModelMenu(
           this.app,
           owner,
           id,
           updateId,
-          text === "/thinking",
+          command === "thinking",
         );
       } else if (text === "/crons") openCronMenu(this.app, owner, id, updateId);
       else if (text === "/status") {
-        // Both are set once per deployment, so this is the only way to pick up a
-        // new MCP catalog or a changed command menu without a restart.
-        await this.app.refreshMcpTools();
+        // The command menu is registered once per deployment; this reloads it.
+        // MCP rediscovery must not delay the reply: print the last snapshot and,
+        // when that snapshot is stale or already failed, refresh behind it.
+        const mcp = this.app.mcpStatusSnapshot();
+        const mcps = formatMcpStatus(mcp.servers);
+        const discoveryUnanswered = mcp.unanswered;
         await this.onReload?.(owner.chat);
         const settings = await this.app.settings.conversation(id);
         const active = await this.app.commands.active({
@@ -1327,12 +1150,6 @@ export class Telegram {
           ...owner,
         });
         const info = readAppInfo();
-        const mcps =
-          this.app.mcpStatus
-            .map(
-              (s) => `${s.server}: ${s.error ? "indisponível" : "conectado"}`,
-            )
-            .join("\n") || "Nenhum";
         const calls =
           this.app.mcpCalls
             ?.list(id)
@@ -1372,6 +1189,7 @@ export class Telegram {
             "",
             "MCPs:",
             mcps,
+            ...(discoveryUnanswered ? [MCP_DISCOVERY_UNANSWERED] : []),
             "",
             this.app.pendingJobs.healthLine(),
             "",
@@ -1380,7 +1198,7 @@ export class Telegram {
           ].join("\n"),
         );
         queueMcpChecks(this.app, owner, id, updateId);
-      } else if (text === "/retomar") {
+      } else if (text === "/resume" || text === "/retomar") {
         const resumed = await this.app.resumeParked(id);
         reply(
           resumed.length
@@ -1388,26 +1206,22 @@ export class Telegram {
             : "Nenhuma tarefa estacionada nesta conversa.",
         );
       } else if (text === "/reload" || text === "/destravar") {
-        // Reloading keeps the conversation: what blocks it is the pending decision,
-        // not the history.
+        // Clears uncertain MCP results only. It does not start a conversation.
         const cleared = this.app.telegramChats.reload(owner);
         reply(
           cleared
-            ? `Conversa recarregada: ${cleared} resultado(s) MCP incerto(s) dispensado(s). O histórico continua.`
-            : "Conversa recarregada. Nenhum resultado MCP incerto pendente.",
+            ? `${cleared} resultado(s) MCP incerto(s) desta conversa dispensado(s). O histórico não foi alterado.`
+            : "Nenhum resultado MCP incerto pendente. Nada foi apagado.",
         );
-      } else if (text === "/help" || text === "/start")
-        reply(
-          "/model — provedor e modelo\n/thinking — esforço\n/crons — criar e gerenciar agendamentos\n/stop — interromper este tópico\n/status — estado\n/reload — recarregar esta conversa e dispensar resultado MCP incerto\n/destravar — o mesmo, quando a conversa está travada\n/retomar — executar de novo uma tarefa estacionada por quedas seguidas\n/help — ajuda\nCada tópico nativo tem histórico próprio. Crie tópicos no Telegram. Escolhas de modelo persistem após reinício. Compactação automática usa o modelo e esforço ativos.",
-        );
+      } else if (text === "/help" || text === "/start") reply(CLEAN_HELP);
       else if (
         text.startsWith("/") &&
         !text.startsWith("//") &&
-        !/^\/(stop|thinking|model)(?:\s|$)/.test(text)
+        command !== "stop"
       )
         reply("Comando desconhecido. Use /help.");
       else {
-        if (text === "/stop") this.app.mcpCalls?.cancelConversation(id);
+        if (command === "stop") this.app.mcpCalls?.cancelConversation(id);
         const notice = this.app.settings.pendingModelNotice(id);
         if (notice) {
           this.app.settings.markModelNoticeShown(id);

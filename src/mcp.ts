@@ -20,7 +20,7 @@ import {
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 
-/** Discovery runs before every call, in the SDK and here; compile each distinct schema once. */
+/** Compile each distinct output schema once across catalog probes. */
 class CachedSchemaValidator implements jsonSchemaValidator {
   private compiled = new Map<string, JsonSchemaValidator<unknown>>();
   private ajv = new AjvJsonSchemaValidator();
@@ -42,16 +42,69 @@ class CachedSchemaValidator implements jsonSchemaValidator {
   }
 }
 
+export type McpServerMode = "direct" | "deferred";
 export interface McpConfig {
   name: string;
   url: string;
-  mode?: "direct" | "legacy";
+  /**
+   * `direct` (default, also when omitted) registers every tool with its schema.
+   * `deferred` hides schemas until `tool_search` loads them. Any other mode is rejected.
+   */
+  mode?: McpServerMode;
+  /** Tool names that stay direct when `mode` is `deferred`. */
+  alwaysLoad?: string[];
+  /** Kept so existing config objects load. Direct mode does not consult these lists. */
   readTools: string[];
   actionTools: string[];
   allowedTools?: string[];
   deniedTools?: string[];
   tokenFile?: string;
   token?: string;
+}
+/** Omitted mode is direct, including the default Executor server. */
+export function mcpServerMode(mode: McpConfig["mode"]): McpServerMode {
+  return mode === "deferred" ? "deferred" : "direct";
+}
+export function supportedMcpMode(mode: McpConfig["mode"]): boolean {
+  return mode === undefined || mode === "direct" || mode === "deferred";
+}
+/**
+ * A deferred server hides this tool until `tool_search` loads it.
+ * Names in `alwaysLoad` stay direct. Any other mode, including omitted, stays direct.
+ */
+export function mcpToolDeferred(
+  config: Pick<McpConfig, "mode" | "alwaysLoad"> | undefined,
+  toolName: string,
+): boolean {
+  return config?.mode === "deferred" && !config.alwaysLoad?.includes(toolName);
+}
+/**
+ * Stamp `deferred` from server config. When every server is direct (the default
+ * Executor setup, including an omitted mode), the catalog array is returned as-is.
+ */
+export function projectDeferredCatalog(
+  catalog: readonly McpCatalog[],
+  configs: readonly Pick<McpConfig, "name" | "mode" | "alwaysLoad">[],
+): McpCatalog[] {
+  if (!configs.some((config) => config.mode === "deferred"))
+    return catalog as McpCatalog[];
+  return catalog.map((server) => {
+    const config = configs.find((item) => item.name === server.server);
+    if (config?.mode !== "deferred") return server;
+    return {
+      ...server,
+      mode: "deferred",
+      tools: server.tools.map((tool) => {
+        if (!mcpToolDeferred(config, tool.name)) {
+          if (!tool.deferred) return tool;
+          const copy = { ...tool };
+          delete copy.deferred;
+          return copy;
+        }
+        return tool.deferred ? tool : { ...tool, deferred: true as const };
+      }),
+    };
+  });
 }
 export class PolicyError extends Error {}
 export class McpError extends Error {}
@@ -65,6 +118,12 @@ export function mcpCallTimeoutMs(
   const value = Number(env.MCP_CALL_TIMEOUT_MS);
   return Number.isFinite(value) && value > 0 ? value : 60000;
 }
+/**
+ * How long a session that just answered may skip the full catalog probe.
+ * Sequential hops inside this window go straight to callTool. A quiet
+ * session is listed again so idle expiry is still discovered before dispatch.
+ */
+export const MCP_SESSION_PROBE_TTL_MS = 45_000;
 export function validateMcpUrlElicitation(
   value: unknown,
 ): ElicitRequestURLParams {
@@ -134,15 +193,7 @@ export class McpUrlElicitationRequiredError extends McpError {
   }
 }
 export interface ToolGateway {
-  assertAllowed?(server: string, tool: string, kind: "read" | "action"): void;
   catalog?(): Promise<unknown>;
-  call(
-    server: string,
-    tool: string,
-    args: Record<string, unknown>,
-    kind: "read" | "action",
-    signal?: AbortSignal,
-  ): Promise<unknown>;
 }
 interface McpCallOptions {
   signal?: AbortSignal;
@@ -154,10 +205,98 @@ interface McpCallOptions {
 }
 export interface McpCatalog {
   server: string;
-  mode: "direct" | "legacy";
-  tools: (Tool & { operation: "direct" | "read" | "action" })[];
+  mode: McpServerMode;
+  tools: (Tool & { operation: "direct"; deferred?: true })[];
   error?: string;
   instructions?: string;
+  /** This attempt timed out. A later status may keep the previous snapshot. */
+  timedOut?: boolean;
+}
+/** Sanitized discovery/call timeout. Upstream text is never copied into it. */
+export const MCP_TIMEOUT_ERROR =
+  "Tempo de resposta MCP excedido. O resultado da chamada pode ser incerto.";
+/** One `/status` line when a background rediscovery does not answer. */
+export const MCP_DISCOVERY_UNANSWERED = "A descoberta não respondeu.";
+/**
+ * True when discovery itself did not answer: the SDK timeout, our fetch abort,
+ * or the sanitized timeout sentence. Other failures stay ordinary catalog errors.
+ */
+export function mcpDiscoveryTimedOut(error: unknown, depth = 0): boolean {
+  if (!error || typeof error !== "object" || depth > 3) return false;
+  if (error instanceof McpError)
+    return error.message.startsWith("Tempo de resposta MCP excedido");
+  const record = error as {
+    name?: unknown;
+    code?: unknown;
+    message?: unknown;
+    cause?: unknown;
+  };
+  if (
+    record.code === -32001 ||
+    record.name === "TimeoutError" ||
+    record.name === "AbortError"
+  )
+    return true;
+  if (
+    typeof record.message === "string" &&
+    /timed out|timeout/i.test(record.message)
+  )
+    return true;
+  return mcpDiscoveryTimedOut(record.cause, depth + 1);
+}
+export function mcpCatalogTimedOut(server: {
+  timedOut?: boolean;
+  error?: string;
+}): boolean {
+  return (
+    server.timedOut === true ||
+    server.error?.startsWith("Tempo de resposta MCP excedido") === true
+  );
+}
+/**
+ * Background rediscovery keeps a server's previous snapshot when that server
+ * times out, and replaces it when the server actually answers.
+ */
+export function mergeMcpDiscovery(
+  previous: readonly McpCatalog[],
+  next: readonly McpCatalog[],
+): { catalog: McpCatalog[]; unanswered: boolean; changed: boolean } {
+  let unanswered = false;
+  const catalog = next.map((server) => {
+    if (!mcpCatalogTimedOut(server)) return server;
+    const prior = previous.find((item) => item.server === server.server);
+    if (!prior) return server;
+    unanswered = true;
+    return prior;
+  });
+  const changed =
+    catalog.length !== previous.length ||
+    catalog.some((server, index) => server !== previous[index]);
+  return { catalog, unanswered, changed };
+}
+/**
+ * One status line per server: sanitized error, tool count, and the original MCP
+ * names. Catalog errors are already collapsed; this does not read URLs or tokens.
+ */
+export function formatMcpStatus(servers: McpCatalog[]): string {
+  if (!servers.length) return "Nenhum";
+  return servers
+    .map((server) => {
+      if (server.error) {
+        const error = server.error.replace(/\s+/g, " ").trim().slice(0, 400);
+        return `${server.server}: indisponível — ${error}`;
+      }
+      const names = server.tools.map((tool) =>
+        tool.name.replace(/\s+/g, " ").trim().slice(0, 80),
+      );
+      const shown = names.slice(0, 30);
+      const extra = names.length - shown.length;
+      const list = shown.join(", ");
+      return `${server.server}: conectado — ${names.length} ferramenta(s)${
+        list ? ` (${list}${extra > 0 ? `, +${extra}` : ""})` : ""
+      }`;
+    })
+    .join("\n");
 }
 export function mcpToolName(server: string, tool: string) {
   const hash = createHash("sha256")
@@ -203,10 +342,7 @@ function safeError(error: unknown): McpError {
     return new McpError(
       `Endpoint MCP incompatível ou não encontrado (HTTP ${code}). Confira o endpoint MCP completo.`,
     );
-  if (code === -32001)
-    return new McpError(
-      "Tempo de resposta MCP excedido. O resultado da chamada pode ser incerto.",
-    );
+  if (code === -32001) return new McpError(MCP_TIMEOUT_ERROR);
   return new McpError(
     "Falha na conexão ou operação MCP. Confira endpoint, transporte e disponibilidade do servidor.",
   );
@@ -219,6 +355,7 @@ const configKeys = new Set([
   "actionTools",
   "allowedTools",
   "deniedTools",
+  "alwaysLoad",
   "tokenFile",
   "token",
   // Legacy key: still accepted so stored configs keep loading; ignored.
@@ -252,6 +389,7 @@ function validateEntry(item: McpConfig) {
     item.actionTools,
     item.allowedTools ?? [],
     item.deniedTools ?? [],
+    item.alwaysLoad ?? [],
   ];
   if (
     !/^[a-zA-Z0-9_-]+$/.test(item.name) ||
@@ -262,7 +400,7 @@ function validateEntry(item: McpConfig) {
         list.length > 200 ||
         list.some((t) => typeof t !== "string" || !t || t.length > 200),
     ) ||
-    (item.mode !== undefined && !["direct", "legacy"].includes(item.mode))
+    !supportedMcpMode(item.mode)
   )
     throw new PolicyError(
       "Configuração MCP inválida: confira nome, modo e listas de ferramentas",
@@ -427,6 +565,8 @@ export class McpGateway implements ToolGateway {
   private bindings = new WeakMap<Client, string>();
   private secrets = new WeakMap<Client, string>();
   private expired = new WeakSet<Client>();
+  /** Absolute time until which this client can skip a catalog probe. */
+  private liveUntil = new WeakMap<Client, number>();
   private metadata = new WeakMap<
     Client,
     Map<
@@ -493,38 +633,15 @@ export class McpGateway implements ToolGateway {
       this.bindings.get(await this.client(server))!,
     );
   }
-  assertAllowed(server: string, tool: string, kind: "read" | "action") {
-    const config = this.config.find((c) => c.name === server);
-    // Direct connections cannot be reached through the legacy replay-safe read wrapper.
-    if (
-      !config ||
-      config.mode === "direct" ||
-      !(kind === "read" ? config.readTools : config.actionTools).includes(
-        tool,
-      ) ||
-      config.deniedTools?.includes(tool)
-    )
-      throw new PolicyError("Ferramenta MCP não autorizada para esta operação");
-  }
   assertDirect(server: string, tool: string) {
     const config = this.config.find((c) => c.name === server);
     if (
       !config ||
-      config.mode !== "direct" ||
+      !supportedMcpMode(config.mode) ||
       config.deniedTools?.includes(tool) ||
       (config.allowedTools !== undefined && !config.allowedTools.includes(tool))
     )
       throw new PolicyError("Ferramenta MCP fora das restrições configuradas");
-  }
-  async call(
-    server: string,
-    tool: string,
-    args: Record<string, unknown>,
-    kind: "read" | "action",
-    signal?: AbortSignal,
-  ) {
-    this.assertAllowed(server, tool, kind);
-    return this.invoke(server, tool, args, { signal }, kind === "read");
   }
   /** Drops a wedged session so the next call can open another one. */
   async releaseSession(server: string) {
@@ -628,7 +745,27 @@ export class McpGateway implements ToolGateway {
         ]),
       ),
     );
+    this.noteLive(client);
     return [...tools.values()];
+  }
+  private sessionFresh(client: Client) {
+    return (this.liveUntil.get(client) ?? 0) > Date.now();
+  }
+  private noteLive(client: Client) {
+    if (this.expired.has(client)) return;
+    this.liveUntil.set(client, Date.now() + MCP_SESSION_PROBE_TTL_MS);
+  }
+  /**
+   * Skip the paginated catalog only when this client already has metadata and
+   * is not expired, and either another call is in flight or a recent listTools
+   * or callTool proved the session is alive. A new session, a session marked
+   * expired, a discovery error (noteLive is not called), or a quiet window
+   * still runs the full probe under the exclusive lock.
+   */
+  private canSkipCatalogProbe(server: string, client: Client) {
+    if (!this.metadata.has(client) || this.expired.has(client)) return false;
+    if ((this.active.get(server)?.size ?? 0) > 0) return true;
+    return this.sessionFresh(client);
   }
   private async ensureLiveClient(
     server: string,
@@ -636,13 +773,7 @@ export class McpGateway implements ToolGateway {
   ): Promise<Client> {
     const existing = this.clients.get(server);
     const cached = existing ? await existing.catch(() => undefined) : undefined;
-    const hasMetadata = cached ? this.metadata.has(cached) : false;
-    const isExpired = cached ? this.expired.has(cached) : false;
-    const isBusy = (this.active.get(server)?.size ?? 0) > 0;
-
-    if (cached && hasMetadata && !isExpired && isBusy) {
-      return cached;
-    }
+    if (cached && this.canSkipCatalogProbe(server, cached)) return cached;
 
     return this.withLock(
       server,
@@ -658,10 +789,12 @@ export class McpGateway implements ToolGateway {
       if (signal?.aborted)
         throw new McpNotSentError("Chamada MCP cancelada antes do envio.");
       const client = await this.client(server);
+      // Another waiter may have just finished the full probe.
+      if (this.canSkipCatalogProbe(server, client)) return client;
       try {
-        // Probe before sending any tool. Discovery is safe to retry when an
-        // idle session expires. Refresh every page so output validation and
-        // task restrictions also survive a replacement.
+        // Full pagination, same 30s-per-page timeout as discovery. Safe to
+        // retry when an idle session expires. Refresh every page so output
+        // validation and task restrictions also survive a replacement.
         await this.listClientTools(client, signal);
         return client;
       } catch (error) {
@@ -672,17 +805,6 @@ export class McpGateway implements ToolGateway {
             "A sessão MCP expirou novamente antes do envio. Verifique a disponibilidade do servidor.",
           );
         }
-        // Legacy configurations historically allow tools/call without discovery.
-        // Preserve that only for an explicit JSON-RPC method-not-found response.
-        if (
-          this.config.find((config) => config.name === server)?.mode !==
-            "direct" &&
-          error &&
-          typeof error === "object" &&
-          "code" in error &&
-          error.code === -32601
-        )
-          return client;
         throw error;
       }
     }
@@ -692,7 +814,6 @@ export class McpGateway implements ToolGateway {
     tool: string,
     args: Record<string, unknown>,
     options: McpCallOptions = {},
-    retryRead = false,
   ) {
     for (let attempt = 0; ; attempt++) {
       this.dispatchGuard?.(server);
@@ -729,8 +850,8 @@ export class McpGateway implements ToolGateway {
       }
       set.add(options);
       try {
-        // A session can still end after the probe. Once callTool starts,
-        // any failure remains uncertain and effects must never be replayed.
+        // A session can still end after the probe or a trusted hop. Once
+        // callTool starts, any failure remains uncertain and must not be replayed.
         const result = await this.withLock(
           server,
           "shared",
@@ -746,6 +867,7 @@ export class McpGateway implements ToolGateway {
         const parsed = CallToolResultSchema.parse(
           "toolResult" in result ? result.toolResult : result,
         );
+        this.noteLive(client);
         if (
           metadata?.validateOutput &&
           ((!parsed.structuredContent && !parsed.isError) ||
@@ -769,9 +891,7 @@ export class McpGateway implements ToolGateway {
           await this.withLock(server, "exclusive", async () => {
             await this.discard(server, client);
           });
-          // Direct tools can execute arbitrary effects, including tools with
-          // readOnlyHint. Only an explicit local read policy permits replay.
-          if (retryRead && attempt === 0 && !options.signal?.aborted) continue;
+          // A lost session after dispatch is not replayed. The result stays uncertain.
           throw new McpSessionError(
             "A sessão MCP expirou ou foi encerrada (HTTP 404). A chamada não foi reenviada; verifique o resultado no serviço. A próxima operação abrirá uma nova sessão.",
           );
@@ -924,60 +1044,56 @@ export class McpGateway implements ToolGateway {
     }
     return pending;
   }
-  async catalog(onlyDirect = false): Promise<McpCatalog[]> {
+  async catalog(): Promise<McpCatalog[]> {
     return Promise.all(
-      this.config
-        .filter((c) => !onlyDirect || c.mode === "direct")
-        .map(async (config) => {
-          try {
-            const discovered = await this.discover(config.name);
-            const client = await this.clients.get(config.name);
-            let instructions =
-              config.mode === "direct" ? client?.getInstructions() : undefined;
-            if (instructions) {
-              const secret = client ? this.secrets.get(client) : undefined;
-              if (secret)
-                instructions = instructions.split(secret).join("[redacted]");
-              instructions = instructions
-                .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
-                .slice(0, 4000);
-            }
-            return {
-              server: config.name,
-              mode: config.mode ?? "legacy",
-              ...(instructions ? { instructions } : {}),
-              tools: discovered
-                .filter((tool) =>
-                  config.mode === "direct"
-                    ? !config.deniedTools?.includes(tool.name) &&
-                      (config.allowedTools === undefined ||
-                        config.allowedTools.includes(tool.name))
-                    : !config.deniedTools?.includes(tool.name) &&
-                      (config.readTools.includes(tool.name) ||
-                        config.actionTools.includes(tool.name)),
-                )
-                .map((tool) => ({
-                  ...tool,
-                  operation:
-                    config.mode === "direct"
-                      ? ("direct" as const)
-                      : config.readTools.includes(tool.name)
-                        ? ("read" as const)
-                        : ("action" as const),
-                })),
-            };
-          } catch (error) {
-            return {
-              server: config.name,
-              mode: config.mode ?? "legacy",
-              tools: [],
-              error:
-                error instanceof McpError
-                  ? error.message
-                  : "Não foi possível descobrir ferramentas MCP",
-            };
+      this.config.map(async (config) => {
+        const mode = mcpServerMode(config.mode);
+        try {
+          const discovered = await this.discover(config.name);
+          const client = await this.clients.get(config.name);
+          let instructions = client?.getInstructions();
+          if (instructions) {
+            const secret = client ? this.secrets.get(client) : undefined;
+            if (secret)
+              instructions = instructions.split(secret).join("[redacted]");
+            instructions = instructions
+              .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
+              .slice(0, 4000);
           }
-        }),
+          return {
+            server: config.name,
+            mode,
+            ...(instructions ? { instructions } : {}),
+            tools: discovered
+              .filter(
+                (tool) =>
+                  !config.deniedTools?.includes(tool.name) &&
+                  (config.allowedTools === undefined ||
+                    config.allowedTools.includes(tool.name)),
+              )
+              .map((tool) => ({
+                ...tool,
+                operation: "direct" as const,
+                ...(mcpToolDeferred(config, tool.name)
+                  ? { deferred: true as const }
+                  : {}),
+              })),
+          };
+        } catch (error) {
+          const timedOut = mcpDiscoveryTimedOut(error);
+          return {
+            server: config.name,
+            mode,
+            tools: [],
+            ...(timedOut ? { timedOut: true } : {}),
+            error: timedOut
+              ? MCP_TIMEOUT_ERROR
+              : error instanceof McpError
+                ? error.message
+                : "Não foi possível descobrir ferramentas MCP",
+          };
+        }
+      }),
     );
   }
   async discover(server: string): Promise<Tool[]> {
@@ -995,6 +1111,8 @@ export class McpGateway implements ToolGateway {
               "A sessão MCP expirou novamente durante a descoberta. Verifique a disponibilidade do servidor.",
             );
           }
+          if (mcpDiscoveryTimedOut(error))
+            throw new McpError(MCP_TIMEOUT_ERROR);
           throw error instanceof McpError || error instanceof PolicyError
             ? error
             : safeError(error);

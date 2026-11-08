@@ -43,8 +43,7 @@ test("a tool that asks for a file reaches the delivery row", async () => {
   const app = await Runtime.open({
     dir,
     models,
-    gateway: { call: async () => ({}) },
-    telegramOnly: true,
+    gateway: { catalog: async () => [] },
     initialize: (store) =>
       configureTelegram(store, config, { id: 123, username: "test_bot" }),
   });

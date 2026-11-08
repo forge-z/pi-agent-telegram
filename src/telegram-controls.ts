@@ -77,21 +77,19 @@ export function queueControl(
       "SELECT id FROM deliveries WHERE id>=? AND id<? ORDER BY rowid",
       ...childIds(prefix),
     );
-    if (app.options.telegramOnly) {
-      const identity = telegramIdentity(app.store, owner);
-      if (identity) {
-        const route = JSON.stringify({
-          ...owner,
-          botId: identity.botId,
-          credentialBinding: identity.credentialBinding,
-        });
-        for (const part of parts) {
-          app.store.run(
-            "INSERT OR IGNORE INTO meta VALUES (?,?)",
-            `telegram:control-route:${part.id}`,
-            route,
-          );
-        }
+    const identity = telegramIdentity(app.store, owner);
+    if (identity) {
+      const route = JSON.stringify({
+        ...owner,
+        botId: identity.botId,
+        credentialBinding: identity.credentialBinding,
+      });
+      for (const part of parts) {
+        app.store.run(
+          "INSERT OR IGNORE INTO meta VALUES (?,?)",
+          `telegram:control-route:${part.id}`,
+          route,
+        );
       }
     }
     const last = parts.at(-1);

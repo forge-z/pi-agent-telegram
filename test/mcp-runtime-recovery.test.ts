@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -10,10 +10,14 @@ import {
   fauxAssistantMessage,
   fauxProvider,
 } from "@earendil-works/pi-ai/providers/faux";
-import { McpGateway, mcpToolName } from "../src/mcp.js";
+import {
+  MCP_SESSION_PROBE_TTL_MS,
+  McpGateway,
+  mcpToolName,
+} from "../src/mcp.js";
 import { Runtime } from "../src/runtime.js";
 
-test("Durable registered MCP tools recover after idle expiry without manual refresh or duplicate effects", async () => {
+test("Durable registered MCP tools recover after idle expiry without manual refresh or duplicate effects", async (t: TestContext) => {
   let session = "";
   let initializes = 0;
   let writes = 0;
@@ -104,6 +108,10 @@ test("Durable registered MCP tools recover after idle expiry without manual refr
     await conversation.waitForIdle(context);
     assert.equal(writes, 1);
     session = "expired";
+    // Inside the trust window a hop does not list. Idle expiry is the quiet
+    // session past that window, which must still be probed before dispatch.
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    t.mock.timers.tick(MCP_SESSION_PROBE_TTL_MS);
     await app.submit(
       conversationId,
       "after-expiry",
@@ -150,6 +158,7 @@ test("Durable registered MCP tools recover after idle expiry without manual refr
       /private expired-session|runtime-session-/,
     );
   } finally {
+    t.mock.timers.reset();
     await app?.close();
     await gateway.close();
     server.closeAllConnections();

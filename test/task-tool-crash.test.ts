@@ -47,7 +47,7 @@ test(
       child.kill("SIGKILL");
       await exited;
       await new Promise((resolve) => setTimeout(resolve, 31000));
-      app = await Runtime.open({ dir, gateway: { call: async () => ({}) } });
+      app = await Runtime.open({ dir, gateway: { catalog: async () => [] } });
       await (await app.conversation(task.conversationId)).waitForIdle(context);
       assert.deepEqual(app.tasks.list(), [task]);
       assert.equal(app.store.all("SELECT * FROM task_creations").length, 1);

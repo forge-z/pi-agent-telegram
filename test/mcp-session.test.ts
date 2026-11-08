@@ -1,14 +1,17 @@
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { ServerResponse } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { McpGateway, McpNotSentError } from "../src/mcp.js";
+import {
+  MCP_SESSION_PROBE_TTL_MS,
+  McpGateway,
+  McpNotSentError,
+} from "../src/mcp.js";
 import { McpCalls, mcpCallIsReadOnly } from "../src/mcp-calls.js";
 import { Store } from "../src/store.js";
-import { Actions } from "../src/actions.js";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
 
 async function fixture(legacySse = false) {
@@ -26,6 +29,7 @@ async function fixture(legacySse = false) {
   let gets = 0;
   let paginate = false;
   let losePage = false;
+  let listFailures = 0;
   let metadata: "output" | "required" | undefined;
   let recoveredMetadataOnly = false;
   let waitWrite: Promise<void> | undefined;
@@ -87,6 +91,17 @@ async function fixture(legacySse = false) {
     } else if (body.method === "tools/list") {
       startedList?.();
       await waitList;
+      if (listFailures > 0) {
+        listFailures--;
+        res.writeHead(200, { "Content-Type": "application/json" }).end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: body.id,
+            error: { code: -32000, message: "temporary catalog failure" },
+          }),
+        );
+        return;
+      }
       if (missingLists || (missingListPage && body.params?.cursor)) {
         res.writeHead(200, { "Content-Type": "application/json" }).end(
           JSON.stringify({
@@ -231,6 +246,12 @@ async function fixture(legacySse = false) {
       paginate = true;
       losePage = true;
     },
+    paginate() {
+      paginate = true;
+    },
+    failNextList() {
+      listFailures++;
+    },
     paginateMetadata(kind: "output" | "required") {
       paginate = true;
       metadata = kind;
@@ -269,17 +290,271 @@ async function fixture(legacySse = false) {
       }),
   };
 }
-function gateway(url: string, direct = false) {
+function gateway(url: string) {
   return new McpGateway([
     {
       name: "mock",
       url,
-      mode: direct ? "direct" : "legacy",
+      mode: "direct",
       readTools: ["lookup"],
       actionTools: ["execute"],
     },
   ]);
 }
+function rpcMethods(mock: { requests: { method: string }[] }) {
+  return mock.requests
+    .map((request) => request.method)
+    .filter(
+      (method) =>
+        method === "initialize" ||
+        method === "tools/list" ||
+        method === "tools/call",
+    );
+}
+/** Moves the clock past the trust window so the next call must probe again. */
+function agePastProbeWindow(t: TestContext) {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  t.mock.timers.tick(MCP_SESSION_PROBE_TTL_MS);
+}
+
+test("sequential hops on a live session do not re-list the catalog", async () => {
+  const mock = await fixture();
+  const mcp = gateway(mock.url);
+  try {
+    await mcp.callDirect("mock", "lookup", {});
+    await mcp.callDirect("mock", "execute", {});
+    await mcp.callDirect("mock", "lookup", {});
+    assert.deepEqual(rpcMethods(mock), [
+      "initialize",
+      "tools/list",
+      "tools/call",
+      "tools/call",
+      "tools/call",
+    ]);
+    assert.equal(mock.initializes, 1);
+    assert.equal(mock.reads, 2);
+    assert.equal(mock.writes, 1);
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});
+
+test("the first hop lists every catalog page and later hops do not", async () => {
+  const mock = await fixture();
+  const mcp = gateway(mock.url);
+  try {
+    mock.paginate();
+    await mcp.callDirect("mock", "lookup", {});
+    await mcp.callDirect("mock", "lookup", {});
+    assert.deepEqual(rpcMethods(mock), [
+      "initialize",
+      "tools/list",
+      "tools/list",
+      "tools/call",
+      "tools/call",
+    ]);
+    assert.equal(mock.initializes, 1);
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});
+
+test("cached catalog metadata still validates output without another list", async () => {
+  const mock = await fixture();
+  const mcp = gateway(mock.url);
+  try {
+    mock.paginateMetadata("output");
+    await mcp.discover("mock");
+    const listsAfterDiscover = rpcMethods(mock).filter(
+      (method) => method === "tools/list",
+    ).length;
+    // The SDK only keeps the last page. lookup is the earlier page, so this
+    // rejection is our preserved output schema, not a fresh catalog fetch.
+    await assert.rejects(
+      mcp.callDirect("mock", "lookup", {}),
+      /schema de saída/,
+    );
+    await assert.rejects(mcp.callDirect("mock", "execute", {}), (error) => {
+      assert.ok(!(error instanceof McpNotSentError));
+      return true;
+    });
+    assert.equal(
+      rpcMethods(mock).filter((method) => method === "tools/list").length,
+      listsAfterDiscover,
+    );
+    assert.equal(
+      rpcMethods(mock).filter((method) => method === "tools/call").length,
+      2,
+    );
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});
+
+test("cached taskRequired metadata blocks a later hop before dispatch", async () => {
+  const mock = await fixture();
+  const mcp = gateway(mock.url);
+  try {
+    mock.paginateMetadata("required");
+    await mcp.discover("mock");
+    const listsAfterDiscover = rpcMethods(mock).filter(
+      (method) => method === "tools/list",
+    ).length;
+    await assert.rejects(mcp.callDirect("mock", "lookup", {}), McpNotSentError);
+    await assert.rejects(
+      mcp.callDirect("mock", "execute", {}),
+      McpNotSentError,
+    );
+    assert.equal(
+      rpcMethods(mock).filter((method) => method === "tools/list").length,
+      listsAfterDiscover,
+    );
+    assert.equal(
+      rpcMethods(mock).filter((method) => method === "tools/call").length,
+      0,
+    );
+    assert.equal(mock.writes, 0);
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});
+
+test("a failed catalog probe is not liveness and the next call lists the full catalog", async () => {
+  const mock = await fixture();
+  const mcp = gateway(mock.url);
+  try {
+    mock.failNextList();
+    await assert.rejects(
+      mcp.callDirect("mock", "execute", {}),
+      McpNotSentError,
+    );
+    assert.equal(mock.writes, 0);
+    assert.equal(
+      rpcMethods(mock).filter((method) => method === "tools/call").length,
+      0,
+    );
+    mock.paginateMetadata("required");
+    await assert.rejects(mcp.callDirect("mock", "lookup", {}), McpNotSentError);
+    await assert.rejects(
+      mcp.callDirect("mock", "execute", {}),
+      McpNotSentError,
+    );
+    assert.deepEqual(rpcMethods(mock), [
+      "initialize",
+      "tools/list",
+      "tools/list",
+      "tools/list",
+    ]);
+    assert.equal(mock.writes, 0);
+    assert.equal(mock.initializes, 1);
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});
+
+test("an expired session past the probe window is fully rediscovered before dispatch", async (t) => {
+  const mock = await fixture();
+  const mcp = gateway(mock.url);
+  try {
+    mock.paginateMetadata("required");
+    await mcp.discover("mock");
+    mock.expire();
+    agePastProbeWindow(t);
+    await assert.rejects(
+      mcp.callDirect("mock", "execute", {}),
+      McpNotSentError,
+    );
+    // The stale probe's first page dies with the old session, then both pages
+    // of the new session refresh taskRequired before any tool is sent.
+    assert.deepEqual(rpcMethods(mock), [
+      "initialize",
+      "tools/list",
+      "tools/list",
+      "tools/list",
+      "initialize",
+      "tools/list",
+      "tools/list",
+    ]);
+    assert.equal(mock.initializes, 2);
+    assert.equal(mock.writes, 0);
+  } finally {
+    t.mock.timers.reset();
+    await mcp.close();
+    await mock.close();
+  }
+});
+
+test("session loss after dispatch on a trusted session is not replayed", async () => {
+  const mock = await fixture();
+  const mcp = gateway(mock.url);
+  try {
+    await mcp.callDirect("mock", "lookup", {});
+    const lists = rpcMethods(mock).filter(
+      (method) => method === "tools/list",
+    ).length;
+    mock.loseWrite();
+    await assert.rejects(
+      mcp.callDirect("mock", "execute", {}),
+      /não foi reenviada/,
+    );
+    assert.equal(
+      rpcMethods(mock).filter((method) => method === "tools/list").length,
+      lists,
+    );
+    assert.equal(mock.writes, 1);
+    assert.equal(
+      rpcMethods(mock).filter((method) => method === "tools/call").length,
+      2,
+    );
+    await mcp.callDirect("mock", "lookup", {});
+    assert.equal(mock.writes, 1);
+    assert.equal(mock.initializes, 2);
+    assert.equal(
+      rpcMethods(mock).filter((method) => method === "tools/call").length,
+      3,
+    );
+    assert.ok(
+      rpcMethods(mock).filter((method) => method === "tools/list").length >
+        lists,
+    );
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});
+
+test("an in-flight call still shares the session without another catalog probe", async () => {
+  const mock = await fixture();
+  const mcp = gateway(mock.url);
+  try {
+    await mcp.callDirect("mock", "lookup", {});
+    const started = mock.holdWrite();
+    const write = mcp.callDirect("mock", "execute", {});
+    await started;
+    const lists = rpcMethods(mock).filter(
+      (method) => method === "tools/list",
+    ).length;
+    await mcp.callDirect("mock", "lookup", {});
+    assert.equal(
+      rpcMethods(mock).filter((method) => method === "tools/list").length,
+      lists,
+    );
+    assert.equal(mock.reads, 2);
+    mock.releaseWrite();
+    assert.match(JSON.stringify(await write), /done/);
+    assert.equal(mock.writes, 1);
+    assert.equal(mock.initializes, 1);
+  } finally {
+    mock.releaseWrite();
+    await mcp.close();
+    await mock.close();
+  }
+});
 
 test("expired MCP sessions recover once during concurrent discovery and keep the new session", async () => {
   const mock = await fixture();
@@ -297,72 +572,8 @@ test("expired MCP sessions recover once during concurrent discovery and keep the
       mock.requests.filter((r) => r.method === "initialize").length,
       2,
     );
-    await mcp.call("mock", "lookup", {}, "read");
+    await mcp.callDirect("mock", "lookup", {});
     assert.equal(mock.initializes, 2);
-  } finally {
-    await mcp.close();
-    await mock.close();
-  }
-});
-
-test("only explicitly classified reads retry after a lost session", async () => {
-  const mock = await fixture();
-  const mcp = gateway(mock.url);
-  try {
-    await mcp.discover("mock");
-    mock.loseRead();
-    assert.match(
-      JSON.stringify(await mcp.call("mock", "lookup", {}, "read")),
-      /done/,
-    );
-    assert.equal(mock.reads, 1);
-    assert.equal(mock.initializes, 2);
-  } finally {
-    await mcp.close();
-    await mock.close();
-  }
-});
-
-test("a legacy read retry refreshes required-task metadata before dispatching into the replacement session", async () => {
-  const mock = await fixture();
-  const mcp = gateway(mock.url);
-  try {
-    mock.metadataAfterRecovery("required");
-    await mcp.discover("mock");
-    mock.loseRead();
-    await assert.rejects(
-      mcp.call("mock", "lookup", {}, "read"),
-      McpNotSentError,
-    );
-    assert.equal(mock.initializes, 2);
-    assert.equal(mock.reads, 0);
-    assert.equal(
-      mock.requests.filter((request) => request.method === "tools/call").length,
-      1,
-    );
-  } finally {
-    await mcp.close();
-    await mock.close();
-  }
-});
-
-test("a legacy read retry validates output against the replacement session's schema", async () => {
-  const mock = await fixture();
-  const mcp = gateway(mock.url);
-  try {
-    mock.metadataAfterRecovery("output");
-    await mcp.discover("mock");
-    mock.loseRead();
-    await assert.rejects(
-      mcp.call("mock", "lookup", {}, "read"),
-      /schema de saída/,
-    );
-    assert.equal(mock.initializes, 2);
-    assert.equal(mock.reads, 1);
-    assert.equal(
-      mock.requests.filter((request) => request.method === "tools/call").length,
-      2,
-    );
   } finally {
     await mcp.close();
     await mock.close();
@@ -385,14 +596,18 @@ test("legacy SSE discovery replaces an expired POST endpoint even without a sess
 });
 
 for (const legacySse of [false, true]) {
-  test(`an idle ${legacySse ? "SSE" : "Streamable HTTP"} session recovers before a legacy action is sent`, async () => {
+  test(`an idle ${legacySse ? "SSE" : "Streamable HTTP"} session recovers before a direct call is sent`, async (t) => {
     const mock = await fixture(legacySse);
     const mcp = gateway(mock.url);
     try {
       await mcp.discover("mock");
-      await mcp.call("mock", "execute", {}, "action");
+      await mcp.callDirect("mock", "execute", {});
       mock.expire();
-      await mcp.call("mock", "execute", {}, "action");
+      // A hop inside the trust window does not probe. Once the window has
+      // passed, idle expiry is still discovered by a full catalog list
+      // before the tool is sent.
+      agePastProbeWindow(t);
+      await mcp.callDirect("mock", "execute", {});
       assert.equal(mock.initializes, 2);
       assert.equal(mock.writes, 2);
       assert.equal(
@@ -401,25 +616,12 @@ for (const legacySse of [false, true]) {
         2,
       );
     } finally {
+      t.mock.timers.reset();
       await mcp.close();
       await mock.close();
     }
   });
 }
-
-test("legacy tools/call compatibility only bypasses an explicit missing discovery method", async () => {
-  const mock = await fixture();
-  const mcp = gateway(mock.url);
-  try {
-    mock.omitListMethod();
-    await mcp.call("mock", "execute", {}, "action");
-    assert.equal(mock.writes, 1);
-    assert.equal(mock.initializes, 1);
-  } finally {
-    await mcp.close();
-    await mock.close();
-  }
-});
 
 test("legacy compatibility cannot bypass a missing discovery method on a later catalog page", async () => {
   const mock = await fixture();
@@ -428,7 +630,7 @@ test("legacy compatibility cannot bypass a missing discovery method on a later c
     mock.paginateMetadata("required");
     mock.omitSecondListPage();
     await assert.rejects(
-      mcp.call("mock", "execute", {}, "action"),
+      mcp.callDirect("mock", "execute", {}),
       McpNotSentError,
     );
     assert.equal(mock.initializes, 1);
@@ -445,7 +647,7 @@ test("legacy compatibility cannot bypass a missing discovery method on a later c
 
 test("direct tools require a successful discovery probe before dispatch", async () => {
   const mock = await fixture();
-  const mcp = gateway(mock.url, true);
+  const mcp = gateway(mock.url);
   try {
     mock.omitListMethod();
     await assert.rejects(
@@ -460,12 +662,13 @@ test("direct tools require a successful discovery probe before dispatch", async 
   }
 });
 
-test("repeated session expiry during the probe is bounded and definitely unsent", async () => {
+test("repeated session expiry during the probe is bounded and definitely unsent", async (t) => {
   const mock = await fixture();
-  const mcp = gateway(mock.url, true);
+  const mcp = gateway(mock.url);
   try {
     await mcp.discover("mock");
     mock.rejectLists();
+    agePastProbeWindow(t);
     await assert.rejects(mcp.callDirect("mock", "execute", {}), (error) => {
       assert.ok(error instanceof McpNotSentError);
       assert.match(error.message, /expirou novamente antes do envio/);
@@ -474,17 +677,19 @@ test("repeated session expiry during the probe is bounded and definitely unsent"
     assert.equal(mock.initializes, 2);
     assert.equal(mock.writes, 0);
   } finally {
+    t.mock.timers.reset();
     await mcp.close();
     await mock.close();
   }
 });
 
-test("a removed endpoint after session admission fails before any tool is sent", async () => {
+test("a removed endpoint after session admission fails before any tool is sent", async (t) => {
   const mock = await fixture();
-  const mcp = gateway(mock.url, true);
+  const mcp = gateway(mock.url);
   try {
     await mcp.discover("mock");
     mock.failEndpoint();
+    agePastProbeWindow(t);
     await assert.rejects(mcp.callDirect("mock", "execute", {}), (error) => {
       assert.ok(error instanceof McpNotSentError);
       assert.match(error.message, /Endpoint MCP.*404.*Nenhuma chamada/);
@@ -496,17 +701,19 @@ test("a removed endpoint after session admission fails before any tool is sent",
       2,
     );
   } finally {
+    t.mock.timers.reset();
     await mcp.close();
     await mock.close();
   }
 });
 
-test("concurrent direct calls and discovery share one recovered session without replaying effects", async () => {
+test("concurrent direct calls and discovery share one recovered session without replaying effects", async (t) => {
   const mock = await fixture();
-  const mcp = gateway(mock.url, true);
+  const mcp = gateway(mock.url);
   try {
     await mcp.discover("mock");
     mock.expire();
+    agePastProbeWindow(t);
     await Promise.all([
       ...Array.from({ length: 6 }, () => mcp.callDirect("mock", "execute", {})),
       mcp.discover("mock"),
@@ -518,18 +725,20 @@ test("concurrent direct calls and discovery share one recovered session without 
       6,
     );
   } finally {
+    t.mock.timers.reset();
     await mcp.close();
     await mock.close();
   }
 });
 
-test("cancelling a discovery probe leaves the tool definitely unsent", async () => {
+test("cancelling a discovery probe leaves the tool definitely unsent", async (t) => {
   const mock = await fixture();
-  const mcp = gateway(mock.url, true);
+  const mcp = gateway(mock.url);
   try {
     await mcp.discover("mock");
     const controller = new AbortController();
     const started = mock.holdList();
+    agePastProbeWindow(t);
     const call = mcp.callDirect(
       "mock",
       "execute",
@@ -544,6 +753,7 @@ test("cancelling a discovery probe leaves the tool definitely unsent", async () 
     await mcp.discover("mock");
     assert.equal(mock.writes, 0);
   } finally {
+    t.mock.timers.reset();
     mock.releaseList();
     await mcp.close();
     await mock.close();
@@ -552,7 +762,7 @@ test("cancelling a discovery probe leaves the tool definitely unsent", async () 
 
 test("a dispatched SSE tool returning 404 is not replayed and the next operation reconnects", async () => {
   const mock = await fixture(true);
-  const mcp = gateway(mock.url, true);
+  const mcp = gateway(mock.url);
   try {
     await mcp.discover("mock");
     mock.loseWrite();
@@ -572,7 +782,7 @@ test("a dispatched SSE tool returning 404 is not replayed and the next operation
 
 test("a tools/call response can take longer than the discovery timeout without being aborted or replayed", async (context) => {
   const mock = await fixture();
-  const mcp = gateway(mock.url, true);
+  const mcp = gateway(mock.url);
   let call: Promise<unknown> | undefined;
   try {
     await mcp.discover("mock");
@@ -599,9 +809,9 @@ test("a tools/call response can take longer than the discovery timeout without b
   }
 });
 
-test("a direct call checks an idle session before dispatch and recovers without creating an uncertain effect", async () => {
+test("a direct call checks an idle session before dispatch and recovers without creating an uncertain effect", async (t) => {
   const mock = await fixture();
-  const mcp = gateway(mock.url, true);
+  const mcp = gateway(mock.url);
   const dir = await mkdtemp(join(tmpdir(), "mcp-idle-session-"));
   const store = new Store(dir);
   const calls = new McpCalls(store, mcp);
@@ -610,6 +820,7 @@ test("a direct call checks an idle session before dispatch and recovers without 
     await calls.execute("conversation", 1, "mock", "execute", {});
     assert.equal(mock.writes, 1);
     mock.expire();
+    agePastProbeWindow(t);
     await calls.execute("conversation", 2, "mock", "execute", {});
     assert.equal(mock.initializes, 2);
     assert.equal(mock.writes, 2);
@@ -633,6 +844,7 @@ test("a direct call checks an idle session before dispatch and recovers without 
       2,
     );
   } finally {
+    t.mock.timers.reset();
     await calls.close();
     await mcp.close();
     store.close();
@@ -643,9 +855,9 @@ test("a direct call checks an idle session before dispatch and recovers without 
 
 for (const recovery of ["automatic", "manual"] as const) {
   for (const tool of ["lookup", "execute"]) {
-    test(`${recovery} session recovery preserves the output schema from the ${tool === "lookup" ? "first" : "second"} catalog page`, async () => {
+    test(`${recovery} session recovery preserves the output schema from the ${tool === "lookup" ? "first" : "second"} catalog page`, async (t) => {
       const mock = await fixture();
-      const mcp = gateway(mock.url, true);
+      const mcp = gateway(mock.url);
       const dir = await mkdtemp(join(tmpdir(), "mcp-output-metadata-"));
       const store = new Store(dir);
       const calls = new McpCalls(store, mcp);
@@ -654,6 +866,7 @@ for (const recovery of ["automatic", "manual"] as const) {
         await mcp.discover("mock");
         mock.expire();
         if (recovery === "manual") await mcp.discover("mock");
+        else agePastProbeWindow(t);
         await assert.rejects(
           calls.execute("conversation", 1, "mock", tool, {}),
         );
@@ -665,6 +878,7 @@ for (const recovery of ["automatic", "manual"] as const) {
           1,
         );
       } finally {
+        t.mock.timers.reset();
         await calls.close();
         await mcp.close();
         store.close();
@@ -673,14 +887,15 @@ for (const recovery of ["automatic", "manual"] as const) {
       }
     });
 
-    test(`${recovery} session recovery preserves required task execution from the ${tool === "lookup" ? "first" : "second"} catalog page`, async () => {
+    test(`${recovery} session recovery preserves required task execution from the ${tool === "lookup" ? "first" : "second"} catalog page`, async (t) => {
       const mock = await fixture();
-      const mcp = gateway(mock.url, true);
+      const mcp = gateway(mock.url);
       try {
         mock.paginateMetadata("required");
         await mcp.discover("mock");
         mock.expire();
         if (recovery === "manual") await mcp.discover("mock");
+        else agePastProbeWindow(t);
         await assert.rejects(mcp.callDirect("mock", tool, {}), McpNotSentError);
         assert.equal(mock.initializes, 2);
         assert.equal(
@@ -689,6 +904,7 @@ for (const recovery of ["automatic", "manual"] as const) {
           0,
         );
       } finally {
+        t.mock.timers.reset();
         await mcp.close();
         await mock.close();
       }
@@ -715,7 +931,7 @@ test("initial endpoint 404 is distinct from session expiry and does not loop ini
 
 test("direct tools are not resent after 404 and the durable call remains uncertain", async () => {
   const mock = await fixture();
-  const mcp = gateway(mock.url, true);
+  const mcp = gateway(mock.url);
   const dir = await mkdtemp(join(tmpdir(), "mcp-session-"));
   const store = new Store(dir);
   const calls = new McpCalls(store, mcp);
@@ -767,7 +983,7 @@ test("session recovery is bounded when the server expires every catalog request"
 
 test("discovery does not replace a client while a direct write is still running", async () => {
   const mock = await fixture();
-  const mcp = gateway(mock.url, true);
+  const mcp = gateway(mock.url);
   try {
     await mcp.discover("mock");
     const started = mock.holdWrite();
@@ -788,14 +1004,14 @@ test("discovery does not replace a client while a direct write is still running"
   }
 });
 
-test("a legacy action rejected with a session 404 is not automatically replayed", async () => {
+test("a direct call rejected with a session 404 is not automatically replayed", async () => {
   const mock = await fixture();
   const mcp = gateway(mock.url);
   try {
     await mcp.discover("mock");
     mock.loseWrite();
     await assert.rejects(
-      mcp.call("mock", "execute", {}, "action"),
+      mcp.callDirect("mock", "execute", {}),
       /sessão MCP.*não foi reenviada/,
     );
     assert.equal(mock.writes, 1);
@@ -845,7 +1061,7 @@ test("discovery restarts pagination without keeping tools from the expired sessi
 
 test("a reconnect failure before tools/call is failed, not uncertain, and an explicit retry can succeed", async () => {
   const mock = await fixture();
-  const mcp = gateway(mock.url, true);
+  const mcp = gateway(mock.url);
   const dir = await mkdtemp(join(tmpdir(), "mcp-unsent-"));
   const store = new Store(dir);
   const calls = new McpCalls(store, mcp);
@@ -899,7 +1115,7 @@ test("a reconnect failure before tools/call is failed, not uncertain, and an exp
 
 test("an initial initialize 404 creates no uncertain call or reconciliation requirement", async () => {
   const mock = await fixture();
-  const mcp = gateway(mock.url, true);
+  const mcp = gateway(mock.url);
   const dir = await mkdtemp(join(tmpdir(), "mcp-init-failed-"));
   const store = new Store(dir);
   const calls = new McpCalls(store, mcp);
@@ -926,7 +1142,7 @@ test("an initial initialize 404 creates no uncertain call or reconciliation requ
 
 test("a direct call cancelled before dispatch sends no tool and is definitely unsent", async () => {
   const mock = await fixture();
-  const mcp = gateway(mock.url, true);
+  const mcp = gateway(mock.url);
   try {
     const controller = new AbortController();
     controller.abort();
@@ -942,14 +1158,19 @@ test("a direct call cancelled before dispatch sends no tool and is definitely un
   }
 });
 
-test("legacy action cancellation releases the caller without replaying an already dispatched effect", async () => {
+test("cancellation releases the caller without replaying an already dispatched effect", async () => {
   const mock = await fixture();
   const mcp = gateway(mock.url);
   try {
     await mcp.discover("mock");
     const controller = new AbortController();
     const started = mock.holdWrite();
-    const action = mcp.call("mock", "execute", {}, "action", controller.signal);
+    const action = mcp.callDirect(
+      "mock",
+      "execute",
+      {},
+      { signal: controller.signal },
+    );
     await started;
     controller.abort();
     await assert.rejects(action, (error) => {
@@ -972,14 +1193,14 @@ test("legacy action cancellation releases the caller without replaying an alread
   }
 });
 
-test("legacy action cancelled before dispatch performs no initialization or effect", async () => {
+test("a call cancelled before dispatch performs no initialization or effect", async () => {
   const mock = await fixture();
   const mcp = gateway(mock.url);
   try {
     const controller = new AbortController();
     controller.abort();
     await assert.rejects(
-      mcp.call("mock", "execute", {}, "action", controller.signal),
+      mcp.callDirect("mock", "execute", {}, { signal: controller.signal }),
       McpNotSentError,
     );
     assert.equal(mock.writes, 0);
@@ -998,10 +1219,15 @@ test("a cancelled queued call settles promptly without interrupting the active M
   try {
     await mcp.discover("mock");
     const started = mock.holdWrite();
-    running = mcp.call("mock", "execute", {}, "action");
+    running = mcp.callDirect("mock", "execute", {});
     await started;
     const controller = new AbortController();
-    const queued = mcp.call("mock", "execute", {}, "action", controller.signal);
+    const queued = mcp.callDirect(
+      "mock",
+      "execute",
+      {},
+      { signal: controller.signal },
+    );
     controller.abort();
     const deadline = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(
@@ -1033,47 +1259,6 @@ test("a cancelled queued call settles promptly without interrupting the active M
   }
 });
 
-test("legacy approval with predispatch initialize 404 is failed and a duplicate approval never resends", async () => {
-  const mock = await fixture();
-  const mcp = gateway(mock.url);
-  const dir = await mkdtemp(join(tmpdir(), "mcp-action-unsent-"));
-  const store = new Store(dir);
-  const actions = new Actions(store, mcp);
-  try {
-    await actions.read("conversation", "mock", "lookup", {});
-    const proposed = actions.propose("conversation", 1, "mock", "execute", {});
-    await mcp.replace([...mcp.config]);
-    mock.failEndpoint();
-    const result = await actions.decide("conversation", proposed.id, "approve");
-    assert.equal(result.state, "failed");
-    assert.match(result.result!, /não foi enviada/);
-    assert.equal(mock.writes, 0);
-    assert.equal(
-      mock.requests.filter((r) => r.method === "tools/call").length,
-      1,
-    ); // evidence read only
-    mock.restoreEndpoint();
-    const duplicate = await actions.decide(
-      "conversation",
-      proposed.id,
-      "approve",
-    );
-    assert.equal(duplicate.state, "failed");
-    assert.equal(mock.writes, 0);
-    const retry = actions.propose("conversation", 2, "mock", "execute", {});
-    assert.equal(
-      (await actions.decide("conversation", retry.id, "approve")).state,
-      "done",
-    );
-    assert.equal(mock.writes, 1);
-  } finally {
-    await mcp.close();
-    store.close();
-    await mock.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
 test("output validators are compiled once per schema and still enforced on later calls", async () => {
   const mock = await fixture();
   const mcp = gateway(mock.url);
@@ -1091,7 +1276,7 @@ test("output validators are compiled once per schema and still enforced on later
     await mcp.discover("mock");
     for (let attempt = 0; attempt < 2; attempt++)
       await assert.rejects(
-        mcp.call("mock", "lookup", {}, "read"),
+        mcp.callDirect("mock", "lookup", {}),
         /schema de saída/,
       );
     assert.equal(compiled, 1);
@@ -1147,7 +1332,7 @@ test("mcpCallIsReadOnly treats Executor call and execute sandbox reads as read-o
 
 test("an uncertain result blocks actions but never reads", async () => {
   const mock = await fixture(true);
-  const mcp = gateway(mock.url, true);
+  const mcp = gateway(mock.url);
   const dir = await mkdtemp(join(tmpdir(), "mcp-uncertain-"));
   const store = new Store(dir);
   const calls = new McpCalls(store, mcp);
@@ -1224,7 +1409,7 @@ test("an uncertain result blocks actions but never reads", async () => {
 
 test("a pending approval block names the requestId and still allows reads", async () => {
   const mock = await fixture(true);
-  const mcp = gateway(mock.url, true);
+  const mcp = gateway(mock.url);
   const dir = await mkdtemp(join(tmpdir(), "mcp-pending-apr-"));
   const store = new Store(dir);
   const calls = new McpCalls(store, mcp);

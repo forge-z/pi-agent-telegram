@@ -13,7 +13,7 @@ Quando o Pi-Agent perde o retorno de uma chamada MCP com efeito (timeout, queda 
 1. **Verificar no serviço externo** (Executor, Gmail, etc.) se a ação rodou ou não.
 2. Em seguida, escolha uma opção:
    - **Registrar verificação externa** no cartão (via `/status` ou o aviso automático) → “Verifiquei: ação concluída” ou “não executada”.
-   - **`/destravar`** ou **`/reload`** no mesmo tópico → dispensa todos os resultados incertos **sem apagar o histórico** (o registro passa a `skipped` e aparece no log do processo).
+   - **`/reload`** (atalho **`/destravar`**) no mesmo tópico → dispensa todos os resultados incertos **sem apagar o histórico** (o registro passa a `skipped` e aparece no log do processo).
 
 `/stop` encerra esperas locais e aprovações pendentes; **não** remove um resultado incerto já gravado.
 

@@ -476,49 +476,6 @@ export class Tasks {
   setEnabled(id: string, enabled: boolean): Task {
     return this.update(id, { enabled });
   }
-  setDelivery(
-    id: string,
-    delivery: unknown,
-    changeKey?: string,
-    origin?: TaskOrigin,
-  ): Task {
-    if (this.runtime.options?.telegramOnly)
-      throw new TaskError("O destino do agendamento é imutável.");
-    if (origin) {
-      if (this.creationDelivery(undefined, origin, true) !== delivery)
-        throw new TaskError(
-          "A alteração deve respeitar a escolha explícita de destino do usuário.",
-        );
-    }
-    if (changeKey === undefined) return this.update(id, { delivery });
-    if (this.closing) throw new TaskError("Agendador encerrando");
-    if (!REQUEST_ID.test(changeKey))
-      throw new TaskError("Chave de alteração inválida");
-    const store = this.runtime.store;
-    const receipt = store.get<{
-      taskId: string;
-      delivery: string;
-      result: string;
-    }>("SELECT * FROM task_delivery_changes WHERE changeKey=?", changeKey);
-    if (receipt) {
-      if (receipt.taskId !== id || receipt.delivery !== delivery)
-        throw new TaskError(
-          "Chave de alteração já utilizada com conteúdo diferente",
-        );
-      return JSON.parse(receipt.result) as Task;
-    }
-    return store.savepoint("task_delivery_change", () => {
-      const result = this.update(id, { delivery });
-      store.run(
-        "INSERT INTO task_delivery_changes VALUES (?,?,?,?)",
-        changeKey,
-        id,
-        result.delivery,
-        JSON.stringify(result),
-      );
-      return result;
-    });
-  }
   telegramAvailability(conversationId: string) {
     return taskTelegramAvailable(this.runtime.store, conversationId);
   }
@@ -655,142 +612,26 @@ export class Tasks {
   private creationDelivery(
     requested: TaskDelivery | undefined,
     origin?: TaskOrigin,
-    requireExplicit = false,
   ): TaskDelivery {
-    if (this.runtime.options?.telegramOnly) {
-      if (requested && requested !== "web_telegram")
-        throw new TaskError("O destino é fixo no chat/tópico de origem.");
-      if (!origin || origin.source !== "telegram")
+    // A captured human request always freezes the originating Telegram topic.
+    // Delivery "web" is only a stored value for rows that already exist.
+    if (requested === "web" || origin?.source === "web")
+      throw new TaskError("O destino é fixo no chat/tópico de origem.");
+    if (origin) {
+      if (origin.source !== "telegram")
         throw new TaskError(
           "Agendamentos exigem uma solicitação humana neste tópico.",
         );
+      if (requested && requested !== "web_telegram")
+        throw new TaskError("O destino é fixo no chat/tópico de origem.");
       return "web_telegram";
     }
-    if (!origin) return requested ?? "web"; // Authenticated task UI selection.
-    const request = this.runtime.store.get<{ text: string; source: string }>(
-      "SELECT text,source FROM requests WHERE conversationId=? AND requestId=?",
-      origin.conversationId,
-      origin.requestId,
-    );
-    if (request && request.source !== origin.source)
-      throw new TaskError("Origem da tarefa não corresponde à solicitação");
-    // Only these explicit PT-BR/EN choices in the persisted human input can
-    // suppress the canonical Telegram copy. A model's delivery argument is not proof.
-    const choice =
-      /\b(?:somente na web|so na web|apenas (?:na )?web|web[ -]only|only on the web|only (?:stays|remains) in (?:the )?web conversation)\b/i;
-    const noTelegram =
-      /\b(?:(?:do not|don['’]t|never)\s+(?:send|deliver|post|copy|publish)(?:\s+(?:it|results|the results))?\s+(?:to|on|in|via)\s+telegram|(?:nao|nunca)\s+(?:envie|mande|entregue|publique|copie)(?:\s+(?:isso|resultados|os resultados))?\s+(?:para|no|pelo|via)(?:\s+o)?\s+telegram|(?:without|sem)\s+telegram)\b/i;
-    const negativeTelegram =
-      /\b(?:not|never|don['’]t|nao|nunca|without|sem)\b[^.!?;\n]{0,100}\btelegram\b/i;
-    const humanText =
-      request?.text.normalize("NFD").replace(/\p{M}/gu, "") ?? "";
-    // Only direct destination directives authorize a tool-driven change. A task's
-    // origin ("created on Telegram") is context, never a delivery instruction.
-    const changeDestination = String.raw`\b(?:mude|altere|troque|mudar|alterar|trocar|change|switch|update|set)\s+(?:(?:a|o|the|this|that)\s+)?(?:entrega|destino|canal|delivery|destination|channel|task|tarefa|agenda)\s+`;
-    const sendResults = String.raw`\b(?:envie|mande|entregue|send|deliver)\s+(?:(?:(?:the|os|o|a|this|that|essa|esta)\s+)?(?:resultados|resultado|results|result|resumo|summary|task|tarefa|it|isso)\s+)?`;
-    const directiveStart = String.raw`^\s*(?:(?:please|por favor)[,\s]+)?`;
-    const noTelegramDirective = new RegExp(
-      `${directiveStart}${noTelegram.source}\\s*$`,
-      "i",
-    );
-    const telegramDirective = new RegExp(
-      `${directiveStart}(?:${changeDestination}(?:para|to)|${sendResults}(?:para|no|pelo|via|to|on|in))\\s+(?:(?:o|the)\\s+)?telegram\\s*$`,
-      "i",
-    );
-    const webDirective = new RegExp(
-      `${directiveStart}(?:${changeDestination}(?:(?:para|to|so it)\\s+)?|${sendResults})(?:${choice.source}|${noTelegram.source})\\s*$`,
-      "i",
-    );
-    const ambiguity =
-      "Destino ambíguo. Selecione explicitamente web ou Telegram na interface, ou envie uma nova solicitação sem alternativas contraditórias.";
-    if (
-      (choice.test(humanText) ||
-        negativeTelegram.test(humanText) ||
-        (requireExplicit && /\btelegram\b/i.test(humanText))) &&
-      (/["“”]/.test(humanText) ||
-        /(?:^|\n)[ \t]*['‘’][ \t]*(?:\n|$)/.test(humanText))
-    )
-      throw new TaskError(ambiguity);
-    // Preserve Markdown quotation context across lines; reminder content is
-    // never evidence of a human destination selection.
-    let fence: string | undefined;
-    let blockquote = false;
-    for (const line of humanText.split(/\r?\n/)) {
-      const marker = /^\s*(?:>\s*)?(```|~~~)/.exec(line)?.[1];
-      if (marker) {
-        fence = fence === marker ? undefined : marker;
-        continue;
-      }
-      if (/^\s*>/.test(line)) blockquote = true;
-      else if (!line.trim()) blockquote = false;
-      if (
-        (fence || blockquote || /^(?: {4}|\t)/.test(line)) &&
-        (choice.test(line) ||
-          negativeTelegram.test(line) ||
-          (requireExplicit && /\btelegram\b/i.test(line)))
-      )
-        throw new TaskError(ambiguity);
-    }
-    if (choice.test(humanText) || noTelegram.test(humanText)) {
-      const withoutDirective = (value: string) =>
-        value.replace(new RegExp(noTelegram.source, "gi"), "");
-      const clauses = humanText
-        .split(/[.!?;\n]/)
-        .filter((clause) => choice.test(clause) || noTelegram.test(clause));
-      const conflicting = withoutDirective(humanText).replace(
-        /\b(?:not|never|without|nao|sem)\s+(?:(?:on|in|no|pelo|via)\s+)?telegram\b/gi,
-        "",
-      );
-      if (
-        clauses.some((clause) =>
-          /["'`“”]|\b(?:not|never|nao|nunca|maybe|perhaps|talvez|prompt|title|titulo)\b/i.test(
-            withoutDirective(clause),
-          ),
-        ) ||
-        /\btelegram\b/i.test(conflicting)
-      )
-        throw new TaskError(ambiguity);
-      if (
-        requireExplicit &&
-        !clauses.some(
-          (clause) =>
-            webDirective.test(clause) ||
-            (/^\s*(?:(?:please|por favor)[,\s]+)?(?:do not|don['’]t|never|nao|nunca)\s+(?:send|deliver|post|copy|publish|envie|mande|entregue|publique|copie)\b/i.test(
-              clause,
-            ) &&
-              noTelegramDirective.test(clause)),
-        )
-      )
-        throw new TaskError(
-          "Alterar destino requer um pedido explícito de alteração e escolha do canal.",
-        );
-      return "web";
-    }
-    // Unrecognized negative channel wording requires clarification rather than
-    // silently applying the Telegram default.
-    if (negativeTelegram.test(humanText)) throw new TaskError(ambiguity);
-    if (
-      requireExplicit &&
-      (!humanText
-        .split(/[.!?;\n]/)
-        .some((clause) => telegramDirective.test(clause)) ||
-        /[\x60]|\b(?:maybe|perhaps|talvez|should|could|would|devo|poderia|prompt|title|titulo)\b/i.test(
-          humanText,
-        ))
-    )
-      throw new TaskError(
-        "Alterar destino requer uma escolha explícita de canal no pedido humano.",
-      );
-    const captured = this.runtime.store.get(
-      "SELECT 1 FROM request_telegram_routes WHERE conversationId=? AND requestId=?",
-      origin.conversationId,
-      origin.requestId,
-    );
-    const hasTopic =
-      this.runtime.store.telegramThread(origin.conversationId) !== undefined;
-    return captured || hasTopic || origin.source === "telegram"
-      ? "web_telegram"
-      : (requested ?? "web");
+    // Scheduler calls with no human request keep a local row. They do not
+    // invent a Telegram destination. Production tools always pass an origin.
+    if (requested === "web_telegram" || requested === "none") return requested;
+    if (requested)
+      throw new TaskError("O destino é fixo no chat/tópico de origem.");
+    return "web";
   }
   private destination(
     delivery: TaskDelivery,

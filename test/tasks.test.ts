@@ -25,7 +25,7 @@ import {
   telegramConversationRoute,
 } from "../src/task-telegram.js";
 
-const gateway = { call: async () => ({ content: [] }) };
+const gateway = { catalog: async () => [] };
 const epoch = Date.parse("2026-10-07T12:00:00Z");
 const once = {
   title: "Lembrete",
@@ -147,44 +147,6 @@ test("creation receipts deduplicate concurrent calls and survive restart even af
   }
 });
 
-test("delivery tool receipts survive restart and cannot reapply an old destination or reuse a key", async () => {
-  const f = await fixture();
-  let reopened: Tasks | undefined;
-  try {
-    const task = await f.tasks.create(cron);
-    f.store.run("UPDATE tasks SET delivery='legacy' WHERE id=?", task.id);
-    const first = f.tasks.setDelivery(task.id, "web", "chat:1:delivery");
-    f.store.run("UPDATE tasks SET delivery='legacy' WHERE id=?", task.id);
-    await f.tasks.close();
-    reopened = new Tasks(f.runtime as unknown as Runtime, () => epoch);
-    assert.deepEqual(
-      reopened.setDelivery(task.id, "web", "chat:1:delivery"),
-      first,
-    );
-    assert.equal(reopened.get(task.id)?.delivery, "legacy");
-    assert.throws(
-      () => reopened!.setDelivery(task.id, "legacy", "chat:1:delivery"),
-      /conteúdo diferente/,
-    );
-    assert.throws(
-      () => reopened!.setDelivery(task.id, "web", "bad key"),
-      /Chave/,
-    );
-    f.store.db.exec(
-      "CREATE TRIGGER fail_delivery_receipt BEFORE INSERT ON task_delivery_changes BEGIN SELECT RAISE(ABORT,'mock disk failure'); END",
-    );
-    assert.throws(
-      () => reopened!.setDelivery(task.id, "web", "chat:1:failure"),
-      /mock disk failure/,
-    );
-    assert.equal(reopened.get(task.id)?.delivery, "legacy");
-    assert.equal(f.store.all("SELECT * FROM task_delivery_changes").length, 1);
-  } finally {
-    await reopened?.close();
-    await f.close();
-  }
-});
-
 test("old task rows migrate to legacy delivery and new tasks default to web", async () => {
   const f = await fixture();
   let migrated: Tasks | undefined;
@@ -219,9 +181,12 @@ test("old task rows migrate to legacy delivery and new tasks default to web", as
       conversationId,
     });
     assert.equal(created.delivery, "web");
-    assert.throws(() => migrated!.setDelivery(created.id, "legacy"), /Destino/);
+    assert.throws(
+      () => migrated!.update(created.id, { delivery: "legacy" }),
+      /Destino/,
+    );
     assert.equal(
-      migrated.setDelivery("legacy-task", "legacy").delivery,
+      migrated.update("legacy-task", { delivery: "legacy" }).delivery,
       "legacy",
     );
   } finally {
@@ -242,7 +207,7 @@ test("Telegram delivery creation and updates require the current authorized bind
       /conectado e autorizado/,
     );
     assert.throws(
-      () => f.tasks.setDelivery(task.id, "web_telegram"),
+      () => f.tasks.update(task.id, { delivery: "web_telegram" }),
       /conectado e autorizado/,
     );
     const binding = {
@@ -275,14 +240,14 @@ test("Telegram delivery creation and updates require the current authorized bind
     );
     assert.equal(f.tasks.telegramAvailability(conversationId), true);
     const originalNextRun = task.nextRun;
-    const telegramTask = f.tasks.setDelivery(task.id, "web_telegram");
+    const telegramTask = f.tasks.update(task.id, { delivery: "web_telegram" });
     assert.equal(telegramTask.delivery, "web_telegram");
     assert.equal(telegramTask.nextRun, originalNextRun);
-    assert.equal(f.tasks.setDelivery(task.id, "web").delivery, "web");
+    assert.equal(f.tasks.update(task.id, { delivery: "web" }).delivery, "web");
     f.store.run("DELETE FROM telegram_grants");
     assert.equal(f.tasks.telegramAvailability(conversationId), false);
     assert.throws(
-      () => f.tasks.setDelivery(task.id, "web_telegram"),
+      () => f.tasks.update(task.id, { delivery: "web_telegram" }),
       /conectado e autorizado/,
     );
   } finally {
@@ -1106,63 +1071,6 @@ test(
   },
 );
 
-test("scheduled prompts can propose external actions but still require explicit approval", async () => {
-  const dir = await temp();
-  let writes = 0;
-  const faux = fauxProvider();
-  faux.setResponses([
-    fauxAssistantMessage(
-      {
-        type: "toolCall",
-        id: "task-read",
-        name: "mcp_read",
-        arguments: { server: "mock", tool: "read", arguments: {} },
-      },
-      { stopReason: "toolUse" },
-    ),
-    fauxAssistantMessage(
-      {
-        type: "toolCall",
-        id: "task-propose",
-        name: "propose_action",
-        arguments: { server: "mock", tool: "write", arguments: {} },
-      },
-      { stopReason: "toolUse" },
-    ),
-    fauxAssistantMessage("Confirme a ação na conversa"),
-  ]);
-  const models = createModels();
-  models.setProvider(faux.provider);
-  const app = await Runtime.open({
-    dir,
-    models,
-    gateway: {
-      call: async (_s, _t, _args, kind) => {
-        if (kind === "action") writes++;
-        return { content: [{ type: "text", text: "Preview" }] };
-      },
-    },
-  });
-  const tasks = new Tasks(app, () => epoch);
-  try {
-    const task = await tasks.create({
-      ...cron,
-      prompt: "Prepare uma alteração externa",
-    });
-    await tasks.runNow(task.id);
-    await settle(app, task.conversationId);
-    await tasks.tick();
-    assert.equal(tasks.runs(task.id)[0].state, "done");
-    assert.equal(app.store.actions(task.conversationId)[0].state, "pending");
-    assert.equal(writes, 0);
-    assert.equal(app.store.all("SELECT * FROM deliveries").length, 0);
-  } finally {
-    await tasks.close();
-    await app.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
 function authorizeTaskConversation(
   store: Store,
   conversationId: string,
@@ -1246,20 +1154,15 @@ test("trusted Telegram origin defaults to a frozen mirror route and rejects a di
     assert.equal(task.originRequestId, "human-a");
     assert.equal(task.destinationMessageThreadId, 11);
     assert.equal(task.destinationBotId, "123");
-    f.store.run(
-      "INSERT OR REPLACE INTO requests(conversationId,requestId,text,source) VALUES (?,?,?,?)",
-      conversationId,
-      origin.requestId,
-      "Crie um resumo diário; somente na web.",
-      origin.source,
+    await assert.rejects(
+      f.tasks.create(
+        { ...cron, conversationId, delivery: "web" },
+        undefined,
+        origin,
+      ),
+      /destino é fixo/i,
     );
-    const web = await f.tasks.create(
-      { ...cron, conversationId, delivery: "web" },
-      undefined,
-      origin,
-    );
-    assert.equal(web.delivery, "web");
-    assert.equal(web.destinationChat, null);
+    assert.equal(f.tasks.get(task.id)?.delivery, "web_telegram");
     await assert.rejects(
       f.tasks.create(
         { ...cron, conversationId: await f.runtime.create() },
@@ -1284,7 +1187,7 @@ test("admitted occurrences keep their delivery snapshot when the task destinatio
       delivery: "web_telegram",
     });
     const first = await f.tasks.runNow(task.id, "first-frozen-run");
-    f.tasks.setDelivery(task.id, "web");
+    f.tasks.update(task.id, { delivery: "web" });
     const saved = f.tasks.runs(task.id)[0];
     assert.equal(saved.id, first.id);
     assert.equal(saved.delivery, "web_telegram");
@@ -1315,7 +1218,7 @@ test("unproven old occurrences stay blocked after a link and explicit future des
     await f.tasks.close();
     authorizeTaskConversation(f.store, conversationId);
     reopened = new Tasks(f.runtime as unknown as Runtime, () => epoch);
-    reopened.setDelivery(task.id, "web_telegram");
+    reopened.update(task.id, { delivery: "web_telegram" });
     const old = reopened.runs(task.id)[0];
     assert.equal(old.destinationChat, null);
     assert.match(old.destinationReason ?? "", /legado|origem|destino/i);
@@ -1353,7 +1256,7 @@ test("revoked frozen task destinations cannot revive after grant restoration", a
       /revogad/i,
     );
     assert.equal(
-      f.tasks.setDelivery(task.id, "web_telegram").destinationReason,
+      f.tasks.update(task.id, { delivery: "web_telegram" }).destinationReason,
       null,
     );
     assert.match(f.tasks.runs(task.id)[0].destinationReason ?? "", /revogad/i);
@@ -1381,7 +1284,7 @@ test("terminal notifications use the admitted snapshot and independently authori
       delivery: "web_telegram",
     });
     const run = await f.tasks.runNow(task.id);
-    f.tasks.setDelivery(task.id, "web");
+    f.tasks.update(task.id, { delivery: "web" });
     f.store.run(
       "INSERT INTO conversation_lifecycle VALUES (?,?)",
       anchor,
@@ -1421,7 +1324,7 @@ test("an old admitted run never gets a Telegram copy from a newly selected futur
       "old-notification",
     );
     authorizeTaskConversation(f.store, conversationId);
-    f.tasks.setDelivery(task.id, "web_telegram");
+    f.tasks.update(task.id, { delivery: "web_telegram" });
     queueTaskTelegram(
       f.store,
       conversationId,
@@ -1540,20 +1443,15 @@ test("trusted Telegram task creation rejects a missing or revoked captured origi
       );
       assert.equal(f.tasks.list().length, 0);
       assert.equal(f.store.all("SELECT * FROM task_creations").length, 0);
-      f.store.run(
-        "INSERT OR REPLACE INTO requests(conversationId,requestId,text,source) VALUES (?,?,?,?)",
-        conversationId,
-        origin.requestId,
-        "Crie um resumo diário; somente na web.",
-        origin.source,
+      await assert.rejects(
+        f.tasks.create(
+          { ...cron, conversationId, delivery: "web" },
+          undefined,
+          origin,
+        ),
+        /destino é fixo/i,
       );
-      const web = await f.tasks.create(
-        { ...cron, conversationId, delivery: "web" },
-        undefined,
-        origin,
-      );
-      assert.equal(web.delivery, "web");
-      assert.equal(web.destinationMessageThreadId, null);
+      assert.equal(f.tasks.list().length, 0);
     } finally {
       await f.close();
     }
@@ -1663,7 +1561,11 @@ test("one-time destination migration flags old implicit web intent and preserves
       "chat:old:implicit",
     );
     const explicit = await f.tasks.create(
-      { ...cron, conversationId, delivery: "web" },
+      { ...cron, conversationId },
+      "chat:old:explicit",
+    );
+    f.store.run(
+      "UPDATE task_creations SET input=json_set(input, '$.delivery', 'web') WHERE creationKey=?",
       "chat:old:explicit",
     );
     const admitted = await f.tasks.runNow(
@@ -1683,7 +1585,7 @@ test("one-time destination migration flags old implicit web intent and preserves
     assert.equal(reopened.get(explicit.id)?.nextRun, explicit.nextRun);
     assert.equal(reopened.get(explicit.id)?.destinationReason, null);
     assert.deepEqual(reopened.runs(implicit.id)[0], admitted);
-    const selected = reopened.setDelivery(implicit.id, "web");
+    const selected = reopened.update(implicit.id, { delivery: "web" });
     assert.equal(selected.destinationReason, null);
     assert.equal(selected.enabled, false);
     assert.equal(selected.nextRun, null);
@@ -1724,351 +1626,66 @@ test("a trusted-origin replay accepts a pre-origin receipt without migrating its
   }
 });
 
-test("trusted web explicit Telegram task creation rejects a revoked captured route instead of resolving the replacement topic", async () => {
-  for (const mutation of ["revoked", "changed-topic"] as const) {
-    const f = await fixture();
-    try {
-      const conversationId = await f.runtime.create();
-      authorizeTaskConversation(f.store, conversationId, 101);
-      const origin = {
-        source: "web" as const,
-        conversationId,
-        requestId: "captured-web-human",
-      };
-      f.store.run(
-        "INSERT INTO request_telegram_routes(conversationId,requestId,chat,user,botId,messageThreadId,state) VALUES (?,?,'42','42','123',101,?)",
-        conversationId,
-        origin.requestId,
-        mutation === "revoked" ? "revoked" : "authorized",
-      );
-      if (mutation === "changed-topic")
-        f.store.run(
-          "UPDATE telegram_topic_conversations SET messageThreadId=202 WHERE conversationId=?",
-          conversationId,
-        );
-      await assert.rejects(
-        f.tasks.create(
-          { ...cron, conversationId, delivery: "web_telegram" },
-          "captured-web-create",
-          origin,
-        ),
-        /origem|Origem|revogad|capturad/i,
-        mutation,
-      );
-      assert.equal(f.tasks.list().length, 0);
-      f.store.run(
-        "INSERT OR REPLACE INTO requests(conversationId,requestId,text,source) VALUES (?,?,?,?)",
-        conversationId,
-        origin.requestId,
-        "Crie um resumo diário; somente na web.",
-        origin.source,
-      );
-      const web = await f.tasks.create(
-        { ...cron, conversationId, delivery: "web" },
-        undefined,
-        origin,
-      );
-      assert.equal(web.delivery, "web");
-    } finally {
-      await f.close();
-    }
-  }
-});
-
-test("trusted web explicit Telegram task creation can select an authorized plain binding without a captured canonical route", async () => {
+test("a trusted Telegram origin freezes the captured topic and a model web delivery cannot reroute it", async () => {
   const f = await fixture();
   try {
     const conversationId = await f.runtime.create();
-    authorizeTaskConversation(f.store, conversationId);
-    f.store.run(
-      "DELETE FROM telegram_conversations WHERE conversationId=?",
-      conversationId,
-    );
-    f.store.run(
-      "DELETE FROM telegram_topic_conversations WHERE conversationId=?",
-      conversationId,
-    );
+    authorizeTaskConversation(f.store, conversationId, 101);
     const origin = {
-      source: "web" as const,
+      source: "telegram" as const,
       conversationId,
-      requestId: "plain-web-human",
+      requestId: "human-canonical",
     };
+    f.store.run(
+      "INSERT INTO requests(conversationId,requestId,text,source) VALUES (?,?,?,?)",
+      conversationId,
+      origin.requestId,
+      "Crie um resumo diário",
+      origin.source,
+    );
+    f.store.run(
+      "INSERT INTO request_telegram_routes(conversationId,requestId,chat,user,botId,messageThreadId,state) VALUES (?,?,'42','42','123',101,'authorized')",
+      conversationId,
+      origin.requestId,
+    );
     const task = await f.tasks.create(
-      { ...cron, conversationId, delivery: "web_telegram" },
-      undefined,
+      { ...cron, conversationId },
+      "canonical-default",
       origin,
     );
-    assert.equal(task.destinationMessageThreadId, null);
-    assert.equal(task.originSource, "web");
+    assert.equal(task.delivery, "web_telegram");
+    assert.equal(task.originSource, "telegram");
+    assert.equal(task.destinationMessageThreadId, 101);
+    f.store.run(
+      "UPDATE telegram_topic_conversations SET messageThreadId=202 WHERE conversationId=?",
+      conversationId,
+    );
+    const replay = await f.tasks.create(
+      { ...cron, conversationId },
+      "canonical-default",
+      origin,
+    );
+    assert.equal(replay.id, task.id);
+    assert.equal(replay.destinationMessageThreadId, 101);
+    assert.equal(f.tasks.list().length, 1);
+    await assert.rejects(
+      f.tasks.create(
+        { ...cron, conversationId, delivery: "web" },
+        undefined,
+        origin,
+      ),
+      /destino é fixo/i,
+    );
+    await assert.rejects(
+      f.tasks.create({ ...cron, conversationId }, undefined, {
+        ...origin,
+        source: "web",
+      }),
+      /destino é fixo/i,
+    );
+    assert.equal(f.tasks.list().length, 1);
   } finally {
     await f.close();
-  }
-});
-
-test("canonical task defaults use the captured topic for either human transport despite a model web argument", async () => {
-  for (const source of ["web", "telegram"] as const) {
-    for (const delivery of [undefined, "web"] as const) {
-      const f = await fixture();
-      try {
-        const conversationId = await f.runtime.create();
-        authorizeTaskConversation(f.store, conversationId, 101);
-        const origin = { source, conversationId, requestId: "human-canonical" };
-        f.store.run(
-          "INSERT INTO requests(conversationId,requestId,text,source) VALUES (?,?,?,?)",
-          conversationId,
-          origin.requestId,
-          "Crie um resumo diário",
-          source,
-        );
-        f.store.run(
-          "INSERT INTO request_telegram_routes(conversationId,requestId,chat,user,botId,messageThreadId,state) VALUES (?,?,'42','42','123',101,'authorized')",
-          conversationId,
-          origin.requestId,
-        );
-        const task = await f.tasks.create(
-          { ...cron, conversationId, ...(delivery ? { delivery } : {}) },
-          "canonical-default",
-          origin,
-        );
-        assert.equal(task.delivery, "web_telegram");
-        assert.equal(task.originSource, source);
-        assert.equal(task.destinationMessageThreadId, 101);
-        f.store.run(
-          "UPDATE telegram_topic_conversations SET messageThreadId=202 WHERE conversationId=?",
-          conversationId,
-        );
-        const replay = await f.tasks.create(
-          { ...cron, conversationId, ...(delivery ? { delivery } : {}) },
-          "canonical-default",
-          origin,
-        );
-        assert.equal(replay.id, task.id);
-        assert.equal(replay.destinationMessageThreadId, 101);
-        assert.equal(f.tasks.list().length, 1);
-      } finally {
-        await f.close();
-      }
-    }
-  }
-});
-
-test("only persisted human web-only choices can suppress a canonical task Telegram destination", async () => {
-  for (const choice of [
-    "somente na web",
-    "só na web",
-    "apenas web",
-    "web only",
-    "only on the web",
-  ]) {
-    const f = await fixture();
-    try {
-      const conversationId = await f.runtime.create();
-      authorizeTaskConversation(f.store, conversationId);
-      const origin = {
-        source: "web" as const,
-        conversationId,
-        requestId: "human-only-web",
-      };
-      f.store.run(
-        "INSERT INTO requests(conversationId,requestId,text,source) VALUES (?,?,?,'web')",
-        conversationId,
-        origin.requestId,
-        `Crie um resumo diário; ${choice}.`,
-      );
-      f.store.run(
-        "INSERT INTO request_telegram_routes(conversationId,requestId,chat,user,botId,messageThreadId,state) VALUES (?,?,'42','42','123',11,'authorized')",
-        conversationId,
-        origin.requestId,
-      );
-      const task = await f.tasks.create(
-        { ...cron, conversationId, delivery: "web_telegram" },
-        undefined,
-        origin,
-      );
-      assert.equal(task.delivery, "web");
-      assert.equal(task.destinationChat, null);
-      const direct = await f.tasks.create({
-        ...cron,
-        conversationId,
-        delivery: "web",
-      });
-      assert.equal(direct.delivery, "web");
-    } finally {
-      await f.close();
-    }
-  }
-});
-
-test("ambiguous human web-only clauses require explicit clarification", async () => {
-  for (const choice of [
-    "not only on the web",
-    "não somente na web",
-    "web only and also Telegram",
-    "somente na web e também Telegram",
-    "maybe web only",
-    "talvez só na web",
-    'Use the prompt "web only"',
-    "Do not allow Telegram delivery; keep results on the web",
-    "Não mande mensagens para Telegram; mantenha os resultados na web",
-  ]) {
-    const f = await fixture();
-    try {
-      const conversationId = await f.runtime.create();
-      authorizeTaskConversation(f.store, conversationId);
-      const origin = {
-        source: "telegram" as const,
-        conversationId,
-        requestId: "human-ambiguous",
-      };
-      f.store.run(
-        "INSERT INTO requests(conversationId,requestId,text,source) VALUES (?,?,?,'telegram')",
-        conversationId,
-        origin.requestId,
-        `Create a daily task; ${choice}.`,
-      );
-      f.store.run(
-        "INSERT INTO request_telegram_routes(conversationId,requestId,chat,user,botId,messageThreadId,state) VALUES (?,?,'42','42','123',11,'authorized')",
-        conversationId,
-        origin.requestId,
-      );
-      await assert.rejects(
-        f.tasks.create(
-          { ...cron, conversationId, delivery: "web" },
-          undefined,
-          origin,
-        ),
-        /amb[ií]gu|explicit|escolha|selecione/i,
-      );
-      assert.equal(f.tasks.list().length, 0);
-    } finally {
-      await f.close();
-    }
-  }
-});
-
-test("a model web argument cannot bypass a missing or revoked canonical origin route", async () => {
-  for (const source of ["web", "telegram"] as const) {
-    for (const state of ["missing", "revoked"] as const) {
-      const f = await fixture();
-      try {
-        const conversationId = await f.runtime.create();
-        authorizeTaskConversation(f.store, conversationId);
-        const origin = {
-          source,
-          conversationId,
-          requestId: "human-route-unavailable",
-        };
-        f.store.run(
-          "INSERT INTO requests(conversationId,requestId,text,source) VALUES (?,?,?,?)",
-          conversationId,
-          origin.requestId,
-          "Crie um resumo diário",
-          source,
-        );
-        if (state === "revoked")
-          f.store.run(
-            "INSERT INTO request_telegram_routes(conversationId,requestId,chat,user,botId,messageThreadId,state) VALUES (?,?,'42','42','123',11,'revoked')",
-            conversationId,
-            origin.requestId,
-          );
-        await assert.rejects(
-          f.tasks.create(
-            { ...cron, conversationId, delivery: "web" },
-            undefined,
-            origin,
-          ),
-          /origem|capturad|revogad/i,
-        );
-        assert.equal(f.tasks.list().length, 0);
-      } finally {
-        await f.close();
-      }
-    }
-  }
-});
-
-test("explicit PT-BR and English no-Telegram delivery instructions never default to a topic", async () => {
-  for (const text of [
-    "Schedule a daily summary. Do not send to Telegram; keep results on the web.",
-    "Crie um resumo diário. Não envie para o Telegram; mantenha os resultados na web.",
-    "Schedule a daily summary. Don't send to Telegram; keep results on the web.",
-    "Schedule a daily summary. Don’t send to Telegram; keep results on the web.",
-    "Crie um resumo diário, sem Telegram.",
-  ]) {
-    const f = await fixture();
-    try {
-      const conversationId = await f.runtime.create();
-      authorizeTaskConversation(f.store, conversationId);
-      const origin = {
-        source: "web" as const,
-        conversationId,
-        requestId: "human-no-telegram",
-      };
-      f.store.run(
-        "INSERT INTO requests(conversationId,requestId,text,source) VALUES (?,?,?,'web')",
-        conversationId,
-        origin.requestId,
-        text,
-      );
-      f.store.run(
-        "INSERT INTO request_telegram_routes(conversationId,requestId,chat,user,botId,messageThreadId,state) VALUES (?,?,'42','42','123',11,'authorized')",
-        conversationId,
-        origin.requestId,
-      );
-      const task = await f.tasks.create(
-        { ...cron, conversationId, delivery: "web_telegram" },
-        undefined,
-        origin,
-      );
-      assert.equal(task.delivery, "web");
-      assert.equal(task.destinationChat, null);
-    } finally {
-      await f.close();
-    }
-  }
-});
-
-test("multiline fenced and blockquoted reminder content cannot prove a delivery choice", async () => {
-  for (const text of [
-    "Schedule this reminder text daily:\n```\nweb only\n```",
-    "Schedule this reminder text daily:\n~~~\nweb only\n~~~",
-    "Schedule this reminder text daily:\n> web only",
-    "Schedule this reminder text daily:\n> Quoted content\nweb only",
-    "Schedule this reminder text daily:\n```\nDo not send to Telegram\n```",
-    "Schedule this reminder text daily:\n\n    web only",
-    "Schedule this reminder text daily:\n\n\tweb only",
-    'Schedule this reminder text daily:\n"\nweb only\n"',
-    "Schedule this reminder text daily:\n'\nweb only\n'",
-  ]) {
-    const f = await fixture();
-    try {
-      const conversationId = await f.runtime.create();
-      authorizeTaskConversation(f.store, conversationId);
-      const origin = {
-        source: "web" as const,
-        conversationId,
-        requestId: "human-quoted-reminder",
-      };
-      f.store.run(
-        "INSERT INTO requests(conversationId,requestId,text,source) VALUES (?,?,?,'web')",
-        conversationId,
-        origin.requestId,
-        text,
-      );
-      f.store.run(
-        "INSERT INTO request_telegram_routes(conversationId,requestId,chat,user,botId,messageThreadId,state) VALUES (?,?,'42','42','123',11,'authorized')",
-        conversationId,
-        origin.requestId,
-      );
-      await assert.rejects(
-        f.tasks.create({ ...cron, conversationId }, undefined, origin),
-        /amb[ií]gu|explicit|escolha|selecione/i,
-        text,
-      );
-      assert.equal(f.tasks.list().length, 0);
-    } finally {
-      await f.close();
-    }
   }
 });
 

@@ -157,7 +157,6 @@ async function fixture(bootstrap: { modelId?: string; effort?: string } = {}) {
     dir,
     gateway,
     models,
-    telegramOnly: true,
     initialize: (store: Runtime["store"]) =>
       configureTelegram(store, config, { id: 123, username: "test_bot" }),
   };
@@ -367,10 +366,12 @@ test("clean starts empty, supports negative group IDs, creates only on use and i
     await f.send("/status", 11, -100123, 999);
     assert.equal(f.views.length, count);
     await f.send("/new");
-    assert.match(f.views.at(-1)!.text, /desconhecido/);
-    assert.equal(f.app.store.all("SELECT * FROM conversations").length, 4);
+    assert.match(f.views.at(-1)!.text, /Conversa nova neste tópico/);
+    const fresh = f.app.telegramChats.selection(f.owner);
+    assert.notEqual(fresh, first);
+    assert.equal(f.app.store.all("SELECT * FROM conversations").length, 5);
     await f.restart();
-    assert.equal(f.app.telegramChats.selection(f.owner), first);
+    assert.equal(f.app.telegramChats.selection(f.owner), fresh);
   } finally {
     await f.close();
   }
@@ -2534,19 +2535,172 @@ test("/reload keeps the conversation and clears an uncertain MCP result", async 
       ),
     );
     await f.send("/reload", 11, -100123, 42);
-    assert.match(f.views.at(-1)!.text, /Conversa recarregada/);
+    assert.match(f.views.at(-1)!.text, /dispensado/);
+    assert.match(f.views.at(-1)!.text, /histórico não foi alterado/);
+    assert.doesNotMatch(f.views.at(-1)!.text, /Conversa recarregada/);
     // Same conversation: the history is not the problem.
     assert.equal(f.app.telegramChats.selection(f.owner), first);
     assert.equal(
       f.app.store.get("SELECT 1 FROM mcp_calls WHERE state='uncertain'"),
       undefined,
     );
+    await f.send("/destravar", 11, -100123, 42);
+    assert.match(f.views.at(-1)!.text, /Nenhum resultado MCP incerto pendente/);
+    assert.match(f.views.at(-1)!.text, /Nada foi apagado/);
+    assert.equal(f.app.telegramChats.selection(f.owner), first);
     await f.send("depois do reload", 11, -100123, 42);
     assert.equal(f.app.telegramChats.selection(f.owner), first);
     const page = await (
       await f.app.conversation(first)
     ).entries({}, 50, undefined, context);
     assert.equal(page.items.length > 0, true);
+  } finally {
+    await f.close();
+  }
+});
+
+test("recibo preso, /new e a mensagem seguinte é admitida", async () => {
+  const f = await fixture();
+  try {
+    await f.send("/status");
+    const first = f.app.telegramChats.selection(f.owner)!;
+    f.app.store.run(
+      `INSERT INTO mcp_calls(id,conversationId,server,tool,args,state,result,binding,updatedAt)
+       VALUES ('lost','${first}','executor','write','{}','uncertain','{"isError":true}','executor',0)`,
+    );
+    f.app.store.run(
+      "DELETE FROM telegram_topic_selection WHERE chat=? AND user=? AND messageThreadId=?",
+      "-100123",
+      "42",
+      11,
+    );
+    const receiptKey = "telegram:native-topic-create:123:-100123:42:11";
+    f.app.store.run(
+      "INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      receiptKey,
+      JSON.stringify({
+        state: "uncertain",
+        route: { botId: 123, chat: "-100123", user: "42" },
+      }),
+    );
+    await assert.rejects(
+      () => f.app.telegramChats.ensure(f.owner),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /resultado incerto/);
+        assert.match(error.message, /\/new/);
+        assert.doesNotMatch(error.message, /verifique na web/);
+        return true;
+      },
+    );
+    f.app.store.run(
+      "INSERT INTO meta VALUES (?,?)",
+      "telegram:topic-create:stuck",
+      JSON.stringify({
+        state: "uncertain",
+        route: { botId: 123, chat: "-100123", user: "42" },
+        messageThreadId: null,
+      }),
+    );
+    await f.send("preso");
+    const stuck = f.views.map((view) => view.text).join("\n");
+    assert.match(stuck, /criação pendente/);
+    assert.match(stuck, /\/new/);
+    assert.doesNotMatch(stuck, /verifique na web/);
+    assert.equal(
+      f.app.store.get("SELECT 1 FROM requests WHERE text='preso'"),
+      undefined,
+    );
+    await f.send("/nova");
+    assert.match(f.views.at(-1)!.text, /Conversa nova neste tópico/);
+    const next = f.app.telegramChats.selection(f.owner)!;
+    assert.notEqual(next, first);
+    assert.equal(
+      f.app.store.get<{ state: string }>(
+        "SELECT state FROM mcp_calls WHERE id='lost'",
+      )?.state,
+      "uncertain",
+    );
+    const receipt = JSON.parse(
+      f.app.store.get<{ value: string }>(
+        "SELECT value FROM meta WHERE key=?",
+        receiptKey,
+      )!.value,
+    ) as { state: string; conversationId: string };
+    assert.equal(receipt.state, "done");
+    assert.equal(receipt.conversationId, next);
+    assert.equal(
+      f.app.store.get(
+        "SELECT 1 FROM meta WHERE key='telegram:topic-create:stuck'",
+      ),
+      undefined,
+    );
+    const beforeFree = f.views.length;
+    await f.send("livre");
+    assert.equal(
+      f.app.store.get<{ conversationId: string }>(
+        "SELECT conversationId FROM requests WHERE text='livre'",
+      )?.conversationId,
+      next,
+    );
+    const afterFree = f.views
+      .slice(beforeFree)
+      .map((view) => view.text)
+      .join("\n");
+    assert.doesNotMatch(afterFree, /criação pendente|verifique na web/);
+  } finally {
+    await f.close();
+  }
+});
+
+test("autorização mudada durante a criação do tópico aponta para /new", async () => {
+  const f = await fixture();
+  try {
+    const owner = { chat: "-100123", user: "42", messageThreadId: 77 };
+    const original = f.app.create.bind(f.app);
+    f.app.create = async (...args: Parameters<Runtime["create"]>) => {
+      f.app.store.run(
+        "UPDATE meta SET value=? WHERE key GLOB 'telegram:native-topic-create:*'",
+        JSON.stringify({ state: "cancelled" }),
+      );
+      return original(...args);
+    };
+    await assert.rejects(
+      () => f.app.telegramChats.ensure(owner),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /Autorização Telegram mudou/);
+        assert.match(error.message, /\/new/);
+        assert.doesNotMatch(error.message, /verifique na web/);
+        return true;
+      },
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("/model e /thinking com texto abrem o menu; /stop com texto cancela", async () => {
+  const f = await fixture();
+  try {
+    await f.send("/model gpt");
+    assert.match(f.views.at(-1)!.text, /Configuração de modelo/);
+    await f.send("/thinking alto");
+    assert.match(f.views.at(-1)!.text, /Esforço ativo/);
+    const id = f.app.telegramChats.selection(f.owner)!;
+    f.app.store.run(
+      "INSERT INTO mcp_interactions(id,conversationId,callId,server,kind,payload,state) VALUES ('i-stop',?,'c-stop','srv','act','{}','pending')",
+      id,
+    );
+    await f.send("/stop agora");
+    assert.equal(
+      f.app.mcpCalls.interactions(id).some((item) => item.state === "pending"),
+      false,
+    );
+    await f.send("/resume");
+    assert.match(f.views.at(-1)!.text, /Nenhuma tarefa estacionada/);
+    await f.send("/retomar");
+    assert.match(f.views.at(-1)!.text, /Nenhuma tarefa estacionada/);
   } finally {
     await f.close();
   }

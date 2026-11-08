@@ -33,8 +33,7 @@ test("a reply in a topic and in a chat tells the model id, author and text", asy
   const app = await Runtime.open({
     dir,
     models,
-    gateway: { call: async () => ({ content: [] }) },
-    telegramOnly: true,
+    gateway: { catalog: async () => [] },
     initialize: (store) => configureTelegram(store, config, { id: 123 }),
   });
   const polling = new TelegramPolling(
@@ -149,8 +148,7 @@ test("system notices are not replies, and answering one names the notice", async
   const app = await Runtime.open({
     dir,
     models,
-    gateway: { call: async () => ({ content: [] }) },
-    telegramOnly: true,
+    gateway: { catalog: async () => [] },
     initialize: (store) => configureTelegram(store, config, { id: 123 }),
   });
   const polling = new TelegramPolling(

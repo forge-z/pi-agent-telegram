@@ -20,8 +20,9 @@ export const cleanCommands = [
   { command: "crons", description: "Criar e gerenciar agendamentos" },
   { command: "stop", description: "Interromper execução deste tópico" },
   { command: "status", description: "Modelo, MCPs, execução e versão" },
-  { command: "reload", description: "Começar uma conversa nova" },
-  { command: "retomar", description: "Retomar tarefa estacionada por quedas" },
+  { command: "reload", description: "Dispensar resultado MCP incerto" },
+  { command: "new", description: "Começar outra conversa neste tópico" },
+  { command: "resume", description: "Retomar tarefa estacionada por quedas" },
   { command: "help", description: "Ajuda" },
 ];
 /**
@@ -341,7 +342,6 @@ export class TelegramPolling {
                   throw error;
                 const message = value.message;
                 if (
-                  this.app.options.telegramOnly &&
                   message?.from &&
                   message.chat &&
                   typeof error.message === "string" &&

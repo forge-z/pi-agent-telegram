@@ -1,3 +1,4 @@
+import type { Credential, CredentialStore } from "@earendil-works/pi-ai";
 import type { StoredSetup } from "./setup.js";
 import { readFileSync } from "node:fs";
 import {
@@ -8,7 +9,6 @@ import {
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { knownModelRows } from "./providers.js";
 import type {
-  CredentialStore,
   ModelThinkingLevel,
   ThinkingLevelMap,
 } from "@earendil-works/pi-ai";
@@ -16,9 +16,14 @@ import type { McpConfig } from "./mcp.js";
 import {
   anySubscriptionAuthenticated,
   chatgptAuthMode,
-  registerSubscriptionProviders,
   subscriptionSetupPending,
 } from "./subscription-auth.js";
+import {
+  canonicalProviderId,
+  isApiKeyProviderId,
+  isOfficialProviderId,
+  registerOfficialProviders,
+} from "./native-providers.js";
 
 type Env = Record<string, string | undefined>;
 const secret = (env: Env, name: string) =>
@@ -31,6 +36,16 @@ export function operatorSecret(env: Env, name: string) {
   if (!raw || /^replace_with/i.test(raw)) return undefined;
   const value = raw.replace(/^Bearer\s+/i, "").trim();
   return value || undefined;
+}
+function validToolNameList(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length <= 200 &&
+    value.every(
+      (entry) =>
+        typeof entry === "string" && entry.length > 0 && entry.length <= 200,
+    )
+  );
 }
 function json(text: string, label: string): unknown {
   try {
@@ -121,12 +136,21 @@ export function readConfig(env: Env = process.env) {
       !v ||
       typeof v.name !== "string" ||
       typeof v.url !== "string" ||
-      v.mode === "legacy" ||
       v.token !== undefined
     )
       throw new Error(
-        "MCP: use name/url e tokenEnv ou tokenFile; apenas modo direct.",
+        "MCP: use name/url e tokenEnv ou tokenFile; apenas modo direct ou deferred.",
       );
+    if (v.mode !== undefined && v.mode !== "direct" && v.mode !== "deferred")
+      throw new Error(
+        "MCP: use name/url e tokenEnv ou tokenFile; apenas modo direct ou deferred.",
+      );
+    let alwaysLoad: string[] | undefined;
+    if (v.alwaysLoad !== undefined) {
+      if (!validToolNameList(v.alwaysLoad))
+        throw new Error("MCP alwaysLoad inválido.");
+      alwaysLoad = v.alwaysLoad;
+    }
     if (
       v.tokenEnv !== undefined &&
       (typeof v.tokenEnv !== "string" || !/^[A-Z][A-Z0-9_]*$/.test(v.tokenEnv))
@@ -144,11 +168,12 @@ export function readConfig(env: Env = process.env) {
     return {
       name: v.name,
       url: endpoint(v.url),
-      mode: "direct",
+      mode: v.mode === "deferred" ? "deferred" : "direct",
       readTools: [],
       actionTools: [],
       ...(tokenValue ? { token: tokenValue } : {}),
       ...(v.tokenFile ? { tokenFile: String(v.tokenFile) } : {}),
+      ...(alwaysLoad ? { alwaysLoad } : {}),
       ...(v.allowedTools ? { allowedTools: v.allowedTools as string[] } : {}),
       ...(v.deniedTools ? { deniedTools: v.deniedTools as string[] } : {}),
     };
@@ -395,7 +420,7 @@ export class SetupRequiredError extends Error {
   constructor(missing = "provedor, chave") {
     super(
       missing.includes("login")
-        ? `Configuração inicial ausente (${missing}). Rode \`npm run login\` no terminal do container (ou configure LLM_* / \`npm run setup\`).`
+        ? `Configuração inicial ausente (${missing}). Rode \`npm run login\` no terminal do container.`
         : `Configuração inicial ausente (${missing}). Rode \`npm run setup\` no terminal do container.`,
     );
   }
@@ -409,8 +434,9 @@ async function registerLlmApiKeyProvider(
     stored?: StoredSetup;
   },
 ) {
-  // Env wins, as documented everywhere else: an operator who exports LLM_* keeps
-  // control, and the stored setup covers the case where nothing is exported.
+  // Compat reserve only. A complete official CLI setup never reaches this function,
+  // so leftover LLM_* cannot put the bot back on the generic `llm` provider.
+  // Inside this reserve, env still wins over a stored compat endpoint.
   const rawBase =
     env.LLM_BASE_URL?.trim() || deps.stored?.record?.baseUrl?.trim();
   const key = operatorSecret(env, "LLM_API_KEY") || deps.stored?.apiKey;
@@ -484,9 +510,95 @@ async function registerLlmApiKeyProvider(
   );
 }
 
+function usableCredential(credential: Credential | undefined) {
+  if (!credential) return false;
+  if (credential.type === "oauth") return Boolean(credential.access);
+  return Boolean(credential.key);
+}
+
+async function readCredential(
+  credentials: CredentialStore,
+  providerId: string,
+) {
+  try {
+    return await credentials.read(canonicalProviderId(providerId));
+  } catch {
+    return undefined;
+  }
+}
+
 /**
- * Builds the runtime model registry: optional API-key `llm` provider plus, when a
- * persistent credential store is supplied, pi-ai ChatGPT/Codex subscription providers.
+ * A complete official CLI setup (native key, or ChatGPT/Codex record) wins over
+ * leftover LLM_BASE_URL / LLM_API_KEY. A compat record, or a legacy `llm` key
+ * whose model is not in the native catalog, does not.
+ */
+async function officialVolumeWins(
+  credentials: CredentialStore,
+  stored: StoredSetup | undefined,
+) {
+  const record = stored?.record;
+  if (
+    record &&
+    (record.authMode === "chatgpt" || record.providerId === "openai-codex")
+  )
+    return true;
+  if (record && isApiKeyProviderId(record.providerId)) {
+    return usableCredential(
+      await readCredential(credentials, record.providerId),
+    );
+  }
+  if (record) return false;
+  try {
+    const listed = await credentials.list();
+    return listed.some(
+      (row) =>
+        isOfficialProviderId(row.providerId) &&
+        (row.type === "api_key" || row.type === "oauth"),
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function storedOfficialReady(
+  models: MutableModels,
+  credentials: CredentialStore,
+  stored: StoredSetup | undefined,
+) {
+  const candidates: string[] = [];
+  const record = stored?.record;
+  if (record?.providerId && isOfficialProviderId(record.providerId))
+    candidates.push(canonicalProviderId(record.providerId));
+  try {
+    for (const row of await credentials.list()) {
+      if (isOfficialProviderId(row.providerId)) candidates.push(row.providerId);
+    }
+  } catch {
+    /* An unreadable store is "not configured", not a crash. */
+  }
+  for (const id of [...new Set(candidates)]) {
+    if (!usableCredential(await readCredential(credentials, id))) continue;
+    try {
+      if (await models.checkAuth(id)) return true;
+    } catch {
+      /* Provider missing or store closed — try the next credential. */
+    }
+  }
+  return false;
+}
+
+/** Catalog of official providers, with no compat `llm` registration and no startup throw. */
+export function officialModels(credentials?: CredentialStore): MutableModels {
+  const models = createModels(credentials ? { credentials } : {});
+  registerOfficialProviders(models);
+  return models;
+}
+
+/**
+ * Runtime registry. With a credential store, every built-in pi-ai provider is
+ * registered (ChatGPT/Codex OAuth included). The generic `llm` provider is
+ * registered only as a compat reserve, and never when an official CLI setup
+ * is already complete.
  */
 export async function bootstrapModels(
   credentials: CredentialStore | undefined,
@@ -497,22 +609,40 @@ export async function bootstrapModels(
   } = {},
 ): Promise<MutableModels> {
   const models = createModels(credentials ? { credentials } : {});
+  if (credentials) registerOfficialProviders(models);
+
+  const official =
+    !!credentials && (await officialVolumeWins(credentials, deps.stored));
 
   let llmRegistered = false;
-  try {
-    await registerLlmApiKeyProvider(models, env, deps);
-    llmRegistered = true;
-  } catch (error) {
-    if (!(error instanceof SetupRequiredError)) throw error;
-    if (!credentials) throw error;
+  if (!official) {
+    try {
+      await registerLlmApiKeyProvider(models, env, deps);
+      llmRegistered = true;
+    } catch (error) {
+      if (!(error instanceof SetupRequiredError)) throw error;
+      if (!credentials) throw error;
+    }
   }
-
-  if (credentials) registerSubscriptionProviders(models);
 
   if (llmRegistered) return models;
 
+  if (
+    credentials &&
+    (await storedOfficialReady(models, credentials, deps.stored))
+  )
+    return models;
+
+  const record = deps.stored?.record;
   const wantsSubscription =
-    chatgptAuthMode(env) || subscriptionSetupPending(deps.stored?.record);
+    chatgptAuthMode(env) ||
+    record?.authMode === "chatgpt" ||
+    record?.providerId === "openai-codex" ||
+    subscriptionSetupPending(
+      record?.authMode === "chatgpt" || record?.providerId === "openai-codex"
+        ? record
+        : undefined,
+    );
   if (credentials && wantsSubscription) {
     if (await anySubscriptionAuthenticated(models)) return models;
     throw new SetupRequiredError("login ChatGPT");
@@ -523,7 +653,70 @@ export async function bootstrapModels(
   throw new SetupRequiredError();
 }
 
-/** Test and setup-script entry: API-key provider only (no OAuth registration). */
+/**
+ * Provider/model the stored volume selected. Compat records stay unset here so
+ * the `llm` default row written by the wizard remains the source.
+ */
+export async function preferredVolumeSelection(
+  models: MutableModels,
+  credentials: CredentialStore,
+  stored: StoredSetup | undefined,
+): Promise<{ provider: string; modelId: string; effort?: string } | undefined> {
+  const record = stored?.record;
+  if (
+    record?.modelId &&
+    record.providerId &&
+    models.getProvider(canonicalProviderId(record.providerId))
+  ) {
+    const provider = canonicalProviderId(record.providerId);
+    const subscription =
+      record.authMode === "chatgpt" || record.providerId === "openai-codex";
+    if (
+      subscription ||
+      usableCredential(await readCredential(credentials, provider))
+    ) {
+      const bare = record.modelId.replace(/^models\//, "");
+      const model =
+        models.getModel(provider, record.modelId) ??
+        models.getModel(provider, bare);
+      if (model || subscription)
+        return {
+          provider,
+          modelId: model?.id ?? bare,
+          ...(record.effort ? { effort: record.effort } : {}),
+        };
+    }
+  }
+  if (record) return undefined;
+  let listed: readonly { providerId: string; type: "api_key" | "oauth" }[] = [];
+  try {
+    listed = await credentials.list();
+  } catch {
+    return undefined;
+  }
+  for (const row of listed) {
+    if (!isOfficialProviderId(row.providerId)) continue;
+    if (!usableCredential(await readCredential(credentials, row.providerId)))
+      continue;
+    try {
+      if (!(await models.checkAuth(row.providerId))) continue;
+    } catch {
+      continue;
+    }
+    const model = models
+      .getModels(row.providerId)
+      .find(
+        (item) =>
+          !/(tts|whisper|transcri|embedding|embed-|imagen|veo|dall-e|moderation|realtime)/i.test(
+            item.id,
+          ),
+      );
+    if (model) return { provider: row.providerId, modelId: model.id };
+  }
+  return undefined;
+}
+
+/** Test and setup-script entry: compat API-key provider only (no volume credentials). */
 export async function environmentModels(
   env: Env = process.env,
   deps: {

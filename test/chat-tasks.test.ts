@@ -18,7 +18,44 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { McpGateway, mcpToolName } from "../src/mcp.js";
 
-const gateway = { call: async () => ({ content: [] }) };
+const gateway = { catalog: async () => [] };
+
+function bindChat(app: Runtime, id: string) {
+  app.store.run(
+    "INSERT OR IGNORE INTO credentials VALUES ('telegram:bot',?)",
+    JSON.stringify({ botId: 123456, token: "123456:synthetic-test" }),
+  );
+  app.store.run(
+    "INSERT OR IGNORE INTO telegram VALUES (?,?,?)",
+    "42",
+    id,
+    "42",
+  );
+  app.store.run(
+    "INSERT OR IGNORE INTO telegram_grants VALUES (?,?,?)",
+    "42",
+    "42",
+    id,
+  );
+  app.store.run(
+    "INSERT OR IGNORE INTO telegram_conversations VALUES (?,?,?)",
+    id,
+    "42",
+    "42",
+  );
+  app.store.run(
+    "INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+    "telegram:connection",
+    JSON.stringify({
+      enabled: true,
+      bot: { id: 123456 },
+      userId: "42",
+      chatId: "42",
+      conversationId: id,
+    }),
+  );
+}
+
 const daily = {
   title: "Resumo diário",
   prompt: "Resuma as notícias da conversa",
@@ -30,7 +67,6 @@ const daily = {
 test("model receives task tools and creates/lists the same durable schedule used by the UI", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-chat-tasks-"));
   const faux = fauxProvider();
-  let taskId = "";
   faux.setResponses([
     async (transcript) => {
       const names = getCurrentTools(transcript.messages).map(
@@ -43,20 +79,18 @@ test("model receives task tools and creates/lists the same durable schedule used
       assert.ok(names.includes("tasks_list"));
       assert.ok(names.includes("tasks_edit"));
       assert.ok(names.includes("tasks_set_enabled"));
-      assert.ok(names.includes("tasks_set_delivery"));
       assert.ok(names.includes("tasks_runs"));
+      assert.equal(names.includes("tasks_set_delivery"), false);
+      assert.equal(names.includes("mcp_read"), false);
+      assert.equal(names.includes("propose_action"), false);
       // The model needs to see that sending a file is possible at all.
       assert.ok(names.includes("send_attachment"));
-      assert.match(
-        JSON.stringify(getCurrentTools(transcript.messages)),
-        /web_telegram/,
-      );
       return fauxAssistantMessage(
         {
           type: "toolCall",
           id: "create",
           name: "tasks_create",
-          arguments: { ...daily, delivery: "web_telegram" },
+          arguments: daily,
         },
         { stopReason: "toolUse" },
       );
@@ -66,45 +100,13 @@ test("model receives task tools and creates/lists the same durable schedule used
       { stopReason: "toolUse" },
     ),
     fauxAssistantMessage("Agenda criada após a confirmação da ferramenta."),
-    async (transcript) => {
-      const names = getCurrentTools(transcript.messages).map(
-        (tool) => tool.name,
-      );
-      assert.ok(names.includes("tasks_set_delivery"));
-      return fauxAssistantMessage(
-        {
-          type: "toolCall",
-          id: "set-delivery",
-          name: "tasks_set_delivery",
-          arguments: { taskId, delivery: "web" },
-        },
-        { stopReason: "toolUse" },
-      );
-    },
-    fauxAssistantMessage("Destino alterado para web."),
   ]);
   const models = createModels();
   models.setProvider(faux.provider);
   let app = await Runtime.open({ dir, gateway, models });
   try {
     const id = await app.create();
-    app.store.run(
-      "INSERT INTO credentials VALUES ('telegram:bot',?)",
-      JSON.stringify({ botId: 123456, token: "123456:synthetic-test" }),
-    );
-    app.store.run("INSERT INTO telegram VALUES (?,?,?)", "42", id, "42");
-    app.store.run("INSERT INTO telegram_grants VALUES (?,?,?)", "42", "42", id);
-    app.store.run(
-      "INSERT INTO meta VALUES (?,?)",
-      "telegram:connection",
-      JSON.stringify({
-        enabled: true,
-        bot: { id: 123456 },
-        userId: "42",
-        chatId: "42",
-        conversationId: id,
-      }),
-    );
+    bindChat(app, id);
     const names = (await (await app.conversation(id)).agent(context)).tools.map(
       (tool) => tool.name,
     );
@@ -116,6 +118,8 @@ test("model receives task tools and creates/lists the same durable schedule used
       id,
       "daily",
       "Crie um resumo diário às 8h em Brasília e entregue no Telegram",
+      "telegram",
+      "42",
     );
     await (await app.conversation(id)).waitForIdle(context);
     const tasks = new Tasks(app);
@@ -137,18 +141,6 @@ test("model receives task tools and creates/lists the same durable schedule used
     assert.ok(
       JSON.stringify(entries).includes(task.id),
       "tool results must contain the persisted task ID",
-    );
-    taskId = task.id;
-    await app.submit(
-      id,
-      "change-delivery",
-      "Change that task so it only stays in the web conversation",
-    );
-    await (await app.conversation(id)).waitForIdle(context);
-    assert.equal(app.tasks.list()[0]?.delivery, "web");
-    assert.equal(
-      app.store.all("SELECT * FROM task_delivery_changes").length,
-      1,
     );
     task = tasks.list()[0]!;
     await tasks.close();
@@ -197,12 +189,10 @@ test("direct MCP refresh preserves internal agenda tools in the actual model req
       const names = getCurrentTools(transcript.messages).map(
         (tool) => tool.name,
       );
-      for (const name of [
-        directName,
-        "tasks_list",
-        "tasks_create",
-        "propose_action",
-      ])
+      assert.equal(names.includes("propose_action"), false);
+      assert.equal(names.includes("mcp_read"), false);
+      assert.equal(names.includes("tasks_set_delivery"), false);
+      for (const name of [directName, "tasks_list", "tasks_create"])
         assert.ok(names.includes(name), `${name} absent`);
       return fauxAssistantMessage(
         { type: "toolCall", id: "mcp", name: directName, arguments: {} },
@@ -226,12 +216,14 @@ test("direct MCP refresh preserves internal agenda tools in the actual model req
   try {
     app = await Runtime.open({ dir, gateway, models });
     const id = await app.create();
+    bindChat(app, id);
     await app.refreshMcpTools();
     await app.submit(
       id,
       "mcp-agenda",
       "Leia o contexto e crie o resumo diário solicitado",
-      "web",
+      "telegram",
+      "42",
     );
     await (await app.conversation(id)).waitForIdle(context);
     assert.equal(reads, 1);
@@ -262,7 +254,7 @@ test("model edits and pauses an existing schedule via tasks_edit and tasks_set_e
         type: "toolCall",
         id: "create",
         name: "tasks_create",
-        arguments: { ...daily, delivery: "web" },
+        arguments: daily,
       },
       { stopReason: "toolUse" },
     ),
@@ -306,7 +298,14 @@ test("model edits and pauses an existing schedule via tasks_edit and tasks_set_e
   const app = await Runtime.open({ dir, gateway, models });
   try {
     const id = await app.create();
-    await app.submit(id, "edit-cron", "Crie e depois ajuste o resumo diário");
+    bindChat(app, id);
+    await app.submit(
+      id,
+      "edit-cron",
+      "Crie e depois ajuste o resumo diário",
+      "telegram",
+      "42",
+    );
     await (await app.conversation(id)).waitForIdle(context);
     const task = app.tasks.list()[0]!;
     assert.equal(task.schedule, "0 9 * * *");
@@ -424,7 +423,8 @@ test("invalid timezone and cron return tool errors without saving schedules", as
   const app = await Runtime.open({ dir, gateway, models });
   try {
     const id = await app.create();
-    await app.submit(id, "invalid", "Crie uma rotina");
+    bindChat(app, id);
+    await app.submit(id, "invalid", "Crie uma rotina", "telegram", "42");
     await (await app.conversation(id)).waitForIdle(context);
     assert.equal(app.tasks.list().length, 0);
     assert.equal(app.store.all("SELECT * FROM task_creations").length, 0);
@@ -457,7 +457,7 @@ test("the model fires a saved schedule now via tasks_run_now, marked manual", as
       const first = result.content[0];
       assert.ok(first && first.type === "text");
       taskId = JSON.parse(first.text).id;
-      app.tasks.setDelivery(taskId, "none");
+      app.tasks.update(taskId, { delivery: "none" });
       return fauxAssistantMessage(
         {
           type: "toolCall",
@@ -487,7 +487,14 @@ test("the model fires a saved schedule now via tasks_run_now, marked manual", as
   const app = await Runtime.open({ dir, gateway, models });
   try {
     const id = await app.create();
-    await app.submit(id, "run-now", "Crie o resumo diário e rode agora");
+    bindChat(app, id);
+    await app.submit(
+      id,
+      "run-now",
+      "Crie o resumo diário e rode agora",
+      "telegram",
+      "42",
+    );
     await (await app.conversation(id)).waitForIdle(context);
     const task = app.tasks.list()[0]!;
     assert.equal(task.id, taskId);
@@ -554,7 +561,14 @@ test("a run in progress refuses tasks_run_now: no recursion", async () => {
   const app = await Runtime.open({ dir, gateway, models });
   try {
     const id = await app.create();
-    await app.submit(id, "recursion-seed", "Crie o resumo diário");
+    bindChat(app, id);
+    await app.submit(
+      id,
+      "recursion-seed",
+      "Crie o resumo diário",
+      "telegram",
+      "42",
+    );
     await (await app.conversation(id)).waitForIdle(context);
     // A run of this conversation is in flight (same shape a scheduled occurrence has).
     app.store.run(
@@ -568,7 +582,7 @@ test("a run in progress refuses tasks_run_now: no recursion", async () => {
       id,
       "none",
     );
-    await app.submit(id, "recursion-attempt", "Rode agora");
+    await app.submit(id, "recursion-attempt", "Rode agora", "telegram", "42");
     await (await app.conversation(id)).waitForIdle(context);
     // The refusal is the only run of that schedule: nothing was admitted.
     assert.equal(
