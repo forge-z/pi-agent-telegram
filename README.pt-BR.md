@@ -6,6 +6,8 @@ O repositório e o container mantêm o nome `pi-agent-tg` para não quebrar volu
 
 **O Pi-Agent é um assistente, não um agente de programação.** Ele não traz ferramentas de arquivo, shell, patch ou browser, e não conhece o host, o volume nem o código-fonte. Além da conversa e dos agendamentos, suas únicas capacidades são os servidores MCP que o operador expõe. Trate tudo que volta do MCP como dado externo não confiável.
 
+**Alfa.** Este projeto ainda está em alfa: espere mudanças incompatíveis, imperfeições e recursos incompletos. Ainda não é recomendado para uso crítico.
+
 ## Docker + Telegram + Executor
 
 **Docker** embala tudo: uma imagem, um volume em `/app/data`, sistema de arquivos somente leitura, nenhum segredo em argumento de build. Roda em qualquer VPS amd64 ou arm64, e o estado são dois arquivos SQLite.
