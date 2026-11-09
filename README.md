@@ -4,6 +4,8 @@ A personal AI assistant that lives in Telegram: one container, one volume, no we
 
 The repository and container keep the `pi-agent-tg` name so existing volumes and deployments keep working.
 
+**Alpha.** This project is still in alpha: expect breaking changes, rough edges, and incomplete features. It is not yet recommended for critical use.
+
 ## Docker + Telegram + Executor
 
 **Docker** wraps the whole thing: one image, one volume at `/app/data`, read-only root filesystem, no secrets in build arguments. It runs on any VPS with arm64 or amd64, and the state is two SQLite files.
