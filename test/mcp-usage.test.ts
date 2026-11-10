@@ -124,3 +124,69 @@ test("a seção mcp-usage acompanha o catálogo descoberto", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("MCP tools keep name order and schema key order across a rediscovery", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-order-"));
+  const models = createModels();
+  models.setProvider(fauxProvider().provider);
+  const gateway = new McpGateway([
+    { name: "executor", url: "http://127.0.0.1:1/mcp", mode: "direct" },
+  ]);
+  const schema = (zFirst: boolean) =>
+    (zFirst
+      ? {
+          type: "object",
+          properties: { z: { type: "string" }, a: { type: "number" } },
+        }
+      : {
+          properties: { a: { type: "number" }, z: { type: "string" } },
+          type: "object",
+        }) as McpCatalog["tools"][number]["inputSchema"];
+  const tool = (
+    name: string,
+    zFirst: boolean,
+  ): McpCatalog["tools"][number] => ({
+    name,
+    description: `${name} tool`,
+    inputSchema: schema(zFirst),
+    operation: "direct",
+  });
+  gateway.catalog = async () => [
+    {
+      server: "executor",
+      mode: "direct",
+      tools: [tool("search", true), tool("call", true)],
+    },
+  ];
+  const app = await Runtime.open({ dir, models, gateway });
+  const listed = () =>
+    (app as unknown as { registry: Registry }).registry
+      .snapshot()
+      .extension("mcp-direct")
+      ?.tools?.map((item) => ({
+        name: item.name,
+        description: item.description,
+        parameters: JSON.parse(JSON.stringify(item.parameters)) as unknown,
+      })) ?? [];
+  try {
+    await app.refreshMcpTools();
+    const first = listed();
+    assert.deepEqual(
+      first.map((item) => item.description),
+      ["MCP executor / call. call tool", "MCP executor / search. search tool"],
+    );
+    gateway.catalog = async () => [
+      {
+        server: "executor",
+        mode: "direct",
+        tools: [tool("call", false), tool("search", false)],
+      },
+    ];
+    await app.refreshMcpTools();
+    assert.deepEqual(listed(), first);
+  } finally {
+    await app.close();
+    await gateway.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -28,20 +28,28 @@ async function wait(app: Runtime, id: string) {
   await new Promise((resolve) => setTimeout(resolve, 20));
 }
 
-test("the clock defaults to America/Sao_Paulo and follows TZ", () => {
+test("the date line is the calendar day in TZ, with no clock time", () => {
   const now = new Date("2026-11-09T18:00:00Z");
   const fallback = assistantClock({}, now);
   assert.match(fallback, /America\/Sao_Paulo/);
   assert.match(fallback, /November 9, 2026/);
-  assert.match(fallback, /15:00/);
   assert.match(fallback, /tomorrow/);
+  assert.doesNotMatch(fallback, /\d{2}:\d{2}/);
   const utc = assistantClock({ TZ: "UTC" }, now);
   assert.match(utc, /\(UTC\)/);
-  assert.match(utc, /18:00/);
+  assert.match(utc, /November 9, 2026/);
+  assert.equal(
+    assistantClock({ TZ: "UTC" }, new Date("2026-11-09T18:04:00Z")),
+    utc,
+  );
+  assert.match(
+    assistantClock({ TZ: "UTC" }, new Date("2026-11-10T00:00:00Z")),
+    /November 10, 2026/,
+  );
   assert.match(assistantClock({ TZ: "Not/AZone" }, now), /America\/Sao_Paulo/);
 });
 
-test("each turn's system prompt includes that turn's clock", async () => {
+test("the system prompt has no per-turn clock section", async () => {
   const dir = await temp();
   const { models } = model([fauxAssistantMessage("ok")]);
   const app = await Runtime.open({
@@ -52,28 +60,19 @@ test("each turn's system prompt includes that turn's clock", async () => {
     now: () => Date.parse("2026-11-09T18:04:00Z"),
   });
   try {
-    const found = (
+    const keys = (
       app as unknown as {
         registry: {
           snapshot: () => {
-            extension: (name: string) => {
-              sections?: {
-                key: string;
-                render: (...args: unknown[]) => Promise<string> | string;
-              }[];
-            };
+            extension: (name: string) => { sections?: { key: string }[] };
           };
         };
       }
     ).registry
       .snapshot()
       .extension("personal-assistant")
-      ?.sections?.find((item) => item.key === "now");
-    const text = await found?.render(undefined, undefined);
-    assert.match(text ?? "", /Current date and time/);
-    assert.match(text ?? "", /November 9, 2026/);
-    assert.match(text ?? "", /18:04/);
-    assert.match(text ?? "", /\(UTC\)/);
+      ?.sections?.map((item) => item.key);
+    assert.deepEqual(keys, ["scheduling", "policy", "long-task"]);
   } finally {
     await app.close();
     await rm(dir, { recursive: true, force: true });
