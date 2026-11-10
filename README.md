@@ -66,18 +66,18 @@ Steve Jobs closed the 2010 iPad event with "there's an app for that" ([CBS](http
 
 `$DATA_DIR/config.yaml` does not connect servers. Its `mcp_servers` map only classifies tools as read or write. A server with no `tools` list of its own uses the executor globs in `config.default.yaml`.
 
-| Service                                | What it adds                                                                                                                                      |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [AgentMail](https://www.agentmail.to)  | an inbox as a tool: receive, reply, send                                                                                                         |
-| [Browser Use](https://browser-use.com) | a real browser for pages that need clicking, not just reading                                                                                    |
-| [Cal.com](https://cal.com)             | scheduling: availability and bookings as tools                                                                                                   |
-| [Exa](https://exa.ai)                  | web search and content extraction. Hosted MCP `https://mcp.exa.ai/mcp` ([docs](https://exa.ai/docs/get-started/exa-mcp)). Key header: `x-api-key` |
-| [Firecrawl](https://www.firecrawl.dev) | crawl a whole site and extract it as clean text                                                                                                  |
-| [Fish Audio](https://fish.audio)       | speech synthesis the assistant can call ([MCP](https://docs.fish.audio/overview/mcp))                                                            |
-| [GitHub](https://github.com)           | repositories, issues and pull requests ([official MCP](https://github.com/github/github-mcp-server))                                              |
-| [Instabox](https://instabox.sh)        | a Linux sandbox as a tool: real shell, browser and persistent disk — run code, build and publish artifacts                                       |
+| Service                                | What it adds                                                                                                                                       |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [AgentMail](https://www.agentmail.to)  | an inbox as a tool: receive, reply, send                                                                                                           |
+| [Browser Use](https://browser-use.com) | a real browser for pages that need clicking, not just reading                                                                                      |
+| [Cal.com](https://cal.com)             | scheduling: availability and bookings as tools                                                                                                     |
+| [Exa](https://exa.ai)                  | web search and content extraction. Hosted MCP `https://mcp.exa.ai/mcp` ([docs](https://exa.ai/docs/get-started/exa-mcp)). Key header: `x-api-key`  |
+| [Firecrawl](https://www.firecrawl.dev) | crawl a whole site and extract it as clean text                                                                                                    |
+| [Fish Audio](https://fish.audio)       | speech synthesis the assistant can call ([MCP](https://docs.fish.audio/overview/mcp))                                                              |
+| [GitHub](https://github.com)           | repositories, issues and pull requests ([official MCP](https://github.com/github/github-mcp-server))                                               |
+| [Instabox](https://instabox.sh)        | a Linux sandbox as a tool: real shell, browser and persistent disk — run code, build and publish artifacts                                         |
 | [Parallel](https://parallel.ai)        | web search, page extraction, and research. Hosted MCP `https://mcp.parallel.ai/mcp` ([docs](https://docs.parallel.ai/integrations/mcp/quickstart)) |
-| [TinyFish](https://www.tinyfish.ai)    | web search and page fetch                                                                                                                        |
+| [TinyFish](https://www.tinyfish.ai)    | web search and page fetch                                                                                                                          |
 
 A personal assistant usually needs them in this order: mail, web, voice, then scraping, browsing, calendar, code and compute. Voice here means the agent producing audio as a tool result: the bot still answers in text, and a Telegram voice bubble is not implemented.
 
