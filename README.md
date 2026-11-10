@@ -6,11 +6,11 @@
   </picture>
 </p>
 
-# Pi-Agent
+# Pi Bot
 
 A personal AI assistant that lives in Telegram: one container, one volume, no web panel. It runs on the [pi.dev](https://pi.dev) harness. Tools come from [Executor](https://executor.sh) and, optionally, [Composio](https://composio.dev).
 
-The repository and container keep the `pi-agent-tg` name so existing volumes and deployments keep working. Renaming the volume is a separate future change. The Compose service stays `pi-agent-tg` and the volume stays `pi_agent_tg_data`.
+Pi Bot keeps the Compose service `pi-agent-tg` and the volume `pi_agent_tg_data` so existing deployments keep working. Renaming the volume is a separate future change.
 
 **Alpha.** This project is still in alpha: expect breaking changes, rough edges, and incomplete features. It is not yet recommended for critical use.
 
