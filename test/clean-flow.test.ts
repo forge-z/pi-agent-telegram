@@ -24,49 +24,7 @@ import {
 } from "../src/telegram-controls.js";
 import { decideMcp, queueMcpApprovals } from "../src/telegram-approvals.js";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { deflateSync } from "node:zlib";
-
-/** A real 64x64 PNG: providers refuse tiny images, and so does our guard. */
-function samplePng() {
-  const size = 64;
-  const raw = Buffer.alloc((size * 3 + 1) * size);
-  for (let y = 0; y < size; y += 1) {
-    const row = y * (size * 3 + 1);
-    for (let x = 0; x < size; x += 1) {
-      raw[row + 1 + x * 3] = 200;
-      raw[row + 2 + x * 3] = 60;
-      raw[row + 3 + x * 3] = 60;
-    }
-  }
-  const crc32 = (bytes: Buffer) => {
-    let crc = 0xffffffff;
-    for (const byte of bytes) {
-      crc ^= byte;
-      for (let bit = 0; bit < 8; bit += 1)
-        crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
-    }
-    return (crc ^ 0xffffffff) >>> 0;
-  };
-  const chunk = (type: string, data: Buffer) => {
-    const length = Buffer.alloc(4);
-    length.writeUInt32BE(data.length);
-    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
-    const sum = Buffer.alloc(4);
-    sum.writeUInt32BE(crc32(body));
-    return Buffer.concat([length, body, sum]);
-  };
-  const header = Buffer.alloc(13);
-  header.writeUInt32BE(size, 0);
-  header.writeUInt32BE(size, 4);
-  header[8] = 8;
-  header[9] = 2;
-  return Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    chunk("IHDR", header),
-    chunk("IDAT", deflateSync(raw)),
-    chunk("IEND", Buffer.alloc(0)),
-  ]);
-}
+import { probePng } from "../src/vision.js";
 import { hash } from "../src/store.js";
 import { telegramConversationRoute } from "../src/task-telegram.js";
 import {
@@ -75,7 +33,6 @@ import {
   parseLlmModels,
   providerNameFromEndpoint,
   readConfig,
-  resolveMcpServersJson,
   telegramAllowlistMisconfiguration,
 } from "../src/config.js";
 
@@ -108,8 +65,6 @@ async function fixture(bootstrap: { modelId?: string; effort?: string } = {}) {
       name: "executor",
       url: "http://127.0.0.1:1/mcp",
       mode: "direct",
-      readTools: [],
-      actionTools: [],
     },
   ]);
   gateway.catalog = async () => [];
@@ -188,7 +143,7 @@ async function fixture(bootstrap: { modelId?: string; effort?: string } = {}) {
       {
         downloadFile: async (fileId: string) => {
           downloads.push(fileId);
-          return { data: new Uint8Array(samplePng()) };
+          return { data: new Uint8Array(Buffer.from(probePng(), "base64")) };
         },
         sendMedia: async (chat, item, opts) => {
           if (mediaFails) throw new Error("upload refused");
@@ -366,7 +321,7 @@ test("clean starts empty, supports negative group IDs, creates only on use and i
     await f.send("/status", 11, -100123, 999);
     assert.equal(f.views.length, count);
     await f.send("/new");
-    assert.match(f.views.at(-1)!.text, /Conversa nova neste tópico/);
+    assert.match(f.views.at(-1)!.text, /New conversation in this topic/);
     const fresh = f.app.telegramChats.selection(f.owner);
     assert.notEqual(fresh, first);
     assert.equal(f.app.store.all("SELECT * FROM conversations").length, 5);
@@ -410,12 +365,12 @@ test("MCP approval card is queued immediately when a pending interaction is crea
       code: "mock source",
     });
     await until(() => f.views.length > before);
-    assert.match(f.views.at(-1)!.text, /Aprovação MCP pendente/);
+    assert.match(f.views.at(-1)!.text, /MCP approval pending/);
     assert.ok(
       f.views
         .at(-1)!
         .markup?.inline_keyboard.flat()
-        .some((b) => b.text.includes("Aprovar")),
+        .some((b) => b.text.includes("Approve")),
     );
   } finally {
     await f.close();
@@ -441,22 +396,22 @@ test("executor waiting_for_interaction with executionId and form elicitation cre
       code: "mock waiting pause",
     });
     await until(() => f.views.length > before);
-    assert.match(f.views.at(-1)!.text, /Aprovação MCP pendente/);
+    assert.match(f.views.at(-1)!.text, /MCP approval pending/);
     assert.match(f.views.at(-1)!.text, /Refresh Zoho tool catalog/);
     assert.doesNotMatch(f.views.at(-1)!.text, /"server": "executor"/);
     const card = f.views.at(-1)!;
     assert.ok(
       card.markup?.inline_keyboard
         .flat()
-        .some((b) => b.text.includes("Recusar")),
+        .some((b) => b.text.includes("Decline")),
     );
     assert.ok(
       card.markup?.inline_keyboard
         .flat()
-        .some((b) => b.text.includes("Aprovar")),
+        .some((b) => b.text.includes("Approve")),
     );
     const callsBefore = f.calls.length;
-    await f.click(f.button("Recusar", card), card);
+    await f.click(f.button("Decline", card), card);
     await until(() => f.calls.length === callsBefore + 1);
     assert.deepEqual(f.calls.at(-1), {
       tool: "resume",
@@ -478,7 +433,7 @@ test("executor waiting_for_interaction with executionId and form elicitation cre
     await f.bot.flush();
     const approveCard = f.views.at(-1)!;
     const callsBeforeApprove = f.calls.length;
-    await f.click(f.button("Aprovar", approveCard), approveCard);
+    await f.click(f.button("Approve", approveCard), approveCard);
     await until(() => f.calls.length === callsBeforeApprove + 1);
     assert.deepEqual(f.calls.at(-1), {
       tool: "resume",
@@ -512,7 +467,7 @@ test("executor approval-required with executionId creates a Telegram card and re
       code: "mock executionId pause",
     });
     await until(() => f.views.length > before);
-    assert.match(f.views.at(-1)!.text, /Aprovação MCP pendente/);
+    assert.match(f.views.at(-1)!.text, /MCP approval pending/);
     const pending = f.app.store.all(
       "SELECT payload FROM mcp_interactions WHERE state='pending'",
     );
@@ -523,7 +478,7 @@ test("executor approval-required with executionId creates a Telegram card and re
   }
 });
 
-test("an approval the user gave in chat resumes past the pending call", async () => {
+test("a delivered approval requires a claimed human decision before resume", async () => {
   const f = await fixture();
   try {
     await f.send("/status");
@@ -550,12 +505,22 @@ test("an approval the user gave in chat resumes past the pending call", async ()
     });
     await until(() => f.views.length > before);
     f.setResult({ status: "completed", execution: { ok: true, value: {} } });
-    // The user said "aprova" in the chat: the resume is the way out of the queue.
-    await f.app.mcpCalls.execute(id, 82, "executor", "resume", {
-      requestId: "apr_e80c716c",
-      response: { action: "accept" },
-    });
-    assert.ok(f.calls.some((call) => call.tool === "resume"));
+    // Delivery and a model's assertion of consent are not a human decision.
+    await assert.rejects(
+      f.app.mcpCalls.execute(id, 82, "executor", "resume", {
+        requestId: "apr_e80c716c",
+        response: { action: "accept" },
+      }),
+      /decisão humana/,
+    );
+    assert.equal(f.calls.filter((call) => call.tool === "resume").length, 0);
+    await f.app.mcpCalls.decide(
+      id,
+      f.app.mcpCalls.interactions(id)[0].id,
+      "accept",
+      {},
+    );
+    assert.equal(f.calls.filter((call) => call.tool === "resume").length, 1);
   } finally {
     await f.close();
   }
@@ -591,15 +556,15 @@ test("the real v2 pause (app_ id, kind and accounts) renders a short card", asyn
     });
     await until(() => f.views.length > before);
     const card = f.views.at(-1)!;
-    assert.match(card.text, /Aprovação MCP pendente/);
+    assert.match(card.text, /MCP approval pending/);
     assert.match(card.text, /Approve agent\.automation\.runAsync\?/);
     // The card asks the question; it does not dump the arguments as JSON.
     assert.doesNotMatch(card.text, /Arguments|output_schema|accountId/);
     // An empty form must still offer both decisions: a v2 mutation could only be
     // denied, which made every mutation impossible to approve.
     const labels = card.markup!.inline_keyboard.flat().map((b) => b.text);
-    assert.ok(labels.includes("Aprovar"), labels.join(","));
-    assert.ok(labels.includes("Recusar"), labels.join(","));
+    assert.ok(labels.includes("Approve"), labels.join(","));
+    assert.ok(labels.includes("Decline"), labels.join(","));
   } finally {
     await f.close();
   }
@@ -632,7 +597,7 @@ test("v2 accept resumes by requestId, never by executionId", async () => {
     const cardView = f.views.at(-1)!;
     const callback = cardView
       .markup!.inline_keyboard.flat()
-      .find((b) => b.text.includes("Aprovar"))!.callback_data!;
+      .find((b) => b.text.includes("Approve"))!.callback_data!;
     const data = JSON.parse(
       f.app.store.get<{ value: string }>(
         "SELECT value FROM meta WHERE key=?",
@@ -678,7 +643,7 @@ test("an expired request tells the topic once and leaves nothing open", async ()
     await queueMcpApprovals(f.app);
     await f.bot.flush();
     const notice = f.views.find((view) =>
-      view.text.includes("Aprovação MCP expirada"),
+      view.text.includes("MCP approval expired"),
     )!;
     assert.ok(notice, "o tópico precisa saber que expirou");
     assert.match(notice.text, /agent\.automation\.runAsync/);
@@ -724,7 +689,7 @@ test("a pause nested inside the execute envelope still becomes a card", async ()
     });
     await until(() => f.views.length > before);
     const card = f.views.at(-1)!;
-    assert.match(card.text, /Aprovação MCP pendente/);
+    assert.match(card.text, /MCP approval pending/);
     assert.match(card.text, /agent\.automation\.runAsync/);
     assert.match(card.text, /Approve agent\.automation\.runAsync\?/);
   } finally {
@@ -758,12 +723,12 @@ test("executor connections.refresh approval card includes Approve when invocatio
     });
     await until(() => f.views.length > before);
     const card = f.views.at(-1)!;
-    assert.match(card.text, /Aprovação MCP pendente/);
+    assert.match(card.text, /MCP approval pending/);
     assert.match(card.text, /coreTools\.connections\.refresh/);
     assert.ok(
       card.markup?.inline_keyboard
         .flat()
-        .some((b) => b.text.includes("Aprovar")),
+        .some((b) => b.text.includes("Approve")),
     );
   } finally {
     await f.close();
@@ -780,7 +745,7 @@ test("Executor approval uses requestId/response once; wrong owner/topic, replay 
     });
     await f.bot.flush();
     const card = f.views.at(-1)!;
-    const approve = f.button("Aprovar", card);
+    const approve = f.button("Approve", card);
     assert.match(card.text, /recipient@example.test/);
     assert.match(card.text, /Full mock content/);
     await f.click(approve, card, 43);
@@ -815,7 +780,7 @@ test("denial, remote expiration and /stop never approve", async () => {
     const id = f.app.telegramChats.selection(f.owner)!;
     await f.app.mcpCalls.execute(id, 1, "executor", "execute", {});
     await f.bot.flush();
-    await f.click(f.button("Recusar"));
+    await f.click(f.button("Decline"));
     await until(() => f.calls.length === 2);
     assert.equal(
       (f.calls[1].args.response as { action: string }).action,
@@ -826,7 +791,7 @@ test("denial, remote expiration and /stop never approve", async () => {
     await f.app.mcpCalls.execute(id, 2, "executor", "execute", {});
     await f.bot.flush();
     const card = f.views.at(-1)!;
-    const approve = f.button("Aprovar");
+    const approve = f.button("Approve");
     await f.send("/stop");
     await f.click(approve, card);
     assert.equal(f.calls.length, 3);
@@ -904,7 +869,7 @@ test("cron creation confirmation persists immutable origin through pause/edit/re
   const f = await fixture();
   try {
     await f.send("/crons");
-    await f.click(f.button("Criar"));
+    await f.click(f.button("Create"));
     const prompt = f.views.at(-1)!;
     assert.ok(prompt.force);
     await f.send(
@@ -915,7 +880,7 @@ test("cron creation confirmation persists immutable origin through pause/edit/re
       prompt.id,
     );
     const confirm = f.views.at(-1)!;
-    const token = f.button("Confirmar criação");
+    const token = f.button("Confirm create");
     await f.click(token, confirm);
     await f.click(token, confirm);
     assert.equal(f.app.tasks.list().length, 1);
@@ -926,17 +891,17 @@ test("cron creation confirmation persists immutable origin through pause/edit/re
     assert.equal(f.app.tasks.get(task.id)!.destinationReason, null);
     await f.send("/crons");
     await f.click(f.button("Agenda teste"));
-    await f.click(f.button("Pausar"));
+    await f.click(f.button("Pause"));
     assert.equal(f.app.tasks.get(task.id)!.enabled, false);
-    await f.click(f.button("Editar"));
-    await f.click(f.button("Título"));
+    await f.click(f.button("Edit"));
+    await f.click(f.button("Title"));
     const edit = f.views.at(-1)!;
     await f.send("Novo título", 11, -100123, 42, edit.id);
-    await f.click(f.button("Confirmar alteração"));
+    await f.click(f.button("Confirm change"));
     assert.equal(f.app.tasks.get(task.id)!.title, "Novo título");
     assert.equal(f.app.tasks.get(task.id)!.destinationMessageThreadId, 11);
-    await f.click(f.button("Excluir"));
-    await f.click(f.button("Confirmar exclusão"));
+    await f.click(f.button("Delete"));
+    await f.click(f.button("Confirm delete"));
     assert.equal(f.app.tasks.list().length, 0);
   } finally {
     await f.close();
@@ -1052,19 +1017,6 @@ test("configuration only registers API credentials and validates endpoint/model 
       MCP_SERVERS_JSON:
         '[{"name":"m","url":"https://secret:pass@example.test"}]',
     }),
-  );
-  assert.equal(
-    resolveMcpServersJson({
-      EXECUTOR_MCP_URL: "https://self-hosted.example/mcp",
-    }),
-    "[]",
-  );
-  assert.equal(
-    resolveMcpServersJson({
-      EXECUTOR_MCP_URL: "https://self-hosted.example/mcp",
-      EXECUTOR_TOKEN: "synthetic-executor-key",
-    }),
-    '[{"name":"executor","url":"https://self-hosted.example/mcp","tokenEnv":"EXECUTOR_TOKEN"}]',
   );
   await assert.rejects(
     () => environmentModels({ LLM_BASE_URL: "https://llm.example/v1" }),
@@ -1185,7 +1137,7 @@ test("copied callback message ID, sensitive and oversized reviews cannot authori
     await f.app.mcpCalls.execute(first, 10, "executor", "execute", {});
     await f.bot.flush();
     const firstCard = f.views.at(-1)!;
-    await f.click(f.button("Aprovar", firstCard), { ...firstCard, id: 999999 });
+    await f.click(f.button("Approve", firstCard), { ...firstCard, id: 999999 });
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(f.calls.length, 1);
     // A fresh independent request in another topic remains pending after /stop here.
@@ -1194,7 +1146,7 @@ test("copied callback message ID, sensitive and oversized reviews cannot authori
     const secondCard = f.views.at(-1)!;
     await f.send("/stop");
     assert.equal(f.app.mcpCalls.interactions(second).at(-1)!.state, "pending");
-    await f.click(f.button("Aprovar", secondCard), secondCard);
+    await f.click(f.button("Approve", secondCard), secondCard);
     await until(() => f.calls.length === 3);
     assert.equal(
       (f.calls[2].args.response as { action: string }).action,
@@ -1221,7 +1173,7 @@ test("copied callback message ID, sensitive and oversized reviews cannot authori
       assert.equal(
         card.markup?.inline_keyboard
           .flat()
-          .some((b) => b.text.includes("Aprovar")),
+          .some((b) => b.text.includes("Approve")),
         false,
       );
       assert.doesNotMatch(card.text, /private-value/);
@@ -1240,8 +1192,8 @@ test("concurrent approve and deny callbacks send exactly one response while engi
     await f.app.mcpCalls.execute(id, 1, "executor", "execute", {});
     await f.bot.flush();
     const card = f.views.at(-1)!;
-    const yes = f.button("Aprovar", card),
-      no = f.button("Recusar", card);
+    const yes = f.button("Approve", card),
+      no = f.button("Decline", card);
     await Promise.all([f.click(yes, card), f.click(no, card)]);
     await until(
       () =>
@@ -1258,7 +1210,7 @@ test("concurrent approve and deny callbacks send exactly one response while engi
   }
 });
 
-test("status reconciles an uncertain result only after explicit external verification without replay", async () => {
+test("status after restart reconciles only the explicitly verified action without replay", async () => {
   const f = await fixture();
   try {
     await f.send("/status");
@@ -1269,14 +1221,58 @@ test("status reconciles an uncertain result only after explicit external verific
       reason: "answered",
     });
     await f.app.mcpCalls.execute(id, 1, "executor", "execute", {});
+    const lost = f.app.mcpCalls.list(id)[0];
+    // A second independent uncertain effect must survive verification of the first.
+    f.app.store.run(
+      "INSERT INTO mcp_calls VALUES ('other-lost',?,'other-server','write','{}','uncertain',NULL,'binding',0)",
+      id,
+    );
+    await f.restart();
+    assert.equal(f.app.mcpCalls.list(id)[0].state, "uncertain");
+    assert.equal(f.app.mcpCalls.list(id)[1].state, "uncertain");
+    f.setResult({ status: "completed" });
+    await f.app.mcpCalls.execute(id, 2, "executor", "search", {});
+    assert.equal(f.app.mcpCalls.list(id)[0].state, "uncertain");
     await f.send("/status");
-    const card = f.views.at(-1)!;
-    assert.match(card.text, /incerto/);
-    await f.click(f.button("Registrar", card), card);
+    const card = f.views.findLast(
+      (view) =>
+        /executor/.test(view.text) &&
+        view.markup?.inline_keyboard
+          .flat()
+          .some((button) => button.text.includes("Record")),
+    )!;
+    assert.match(card.text, /uncertain/);
+    assert.ok(
+      f.views.some((view) => /executor \/ execute: uncertain/.test(view.text)),
+    );
+    assert.ok(
+      f.views.some((view) =>
+        /other-server \/ write: uncertain/.test(view.text),
+      ),
+    );
+    await f.click(f.button("Record", card), card);
     const review = f.views.at(-1)!;
-    await f.click(f.button("Verifiquei: ação concluída", review), review);
+    await f.click(f.button("I checked: action completed", review), review);
     assert.equal(f.app.mcpCalls.list(id)[0].state, "reconciled");
-    assert.equal(f.calls.length, 1);
+    assert.equal(
+      f.app.mcpCalls.list(id).find((call) => call.id === lost.id)?.state,
+      "reconciled",
+    );
+    assert.equal(
+      f.app.mcpCalls.list(id).find((call) => call.id === "other-lost")?.state,
+      "uncertain",
+    );
+    // Uncertainty blocks only the server that lost the call.
+    await f.app.mcpCalls.execute(id, 3, "executor", "execute", {});
+    await assert.rejects(
+      f.app.mcpCalls.execute(id, 4, "other-server", "execute", {}),
+      /resultado MCP incerto/i,
+    );
+    assert.equal(
+      f.calls.length,
+      3,
+      "the reconciled server can act again; the other server stays blocked",
+    );
   } finally {
     await f.close();
   }
@@ -1286,7 +1282,7 @@ test("cron creation rejects a copied confirmation and an incomplete multi-part p
   const f = await fixture();
   try {
     await f.send("/crons");
-    await f.click(f.button("Criar"));
+    await f.click(f.button("Create"));
     const prompt = f.views.at(-1)!;
     await f.send(
       "Preview test\n0 9 * * *\nUTC\nFull review",
@@ -1296,10 +1292,10 @@ test("cron creation rejects a copied confirmation and an incomplete multi-part p
       prompt.id,
     );
     const confirm = f.views.at(-1)!;
-    await f.click(f.button("Confirmar criação"), { ...confirm, id: 999999 });
+    await f.click(f.button("Confirm create"), { ...confirm, id: 999999 });
     assert.equal(f.app.tasks.list().length, 0);
     await f.send("/crons");
-    await f.click(f.button("Criar"));
+    await f.click(f.button("Create"));
     const longPrompt = f.views.at(-1)!;
     f.fail(true);
     await f.send(
@@ -1366,11 +1362,11 @@ test("opaque sends keep only denial; an old persisted owner-bound approval fails
     )!;
     assert.ok(old);
     const replacement = f.views.at(-1)!;
-    assert.match(replacement.text, /fluxo seguro/);
+    assert.match(replacement.text, /secure flow/);
     assert.equal(
       replacement.markup?.inline_keyboard
         .flat()
-        .some((b) => b.text.includes("Aprovar")),
+        .some((b) => b.text.includes("Approve")),
       false,
     );
     await f.restart();
@@ -1396,12 +1392,12 @@ test("opaque sends keep only denial; an old persisted owner-bound approval fails
     assert.equal(JSON.parse(receipt.result).message_id, old.id);
     await assert.rejects(
       () => decideMcp(f.app, data, old.id),
-      /não revisáveis/,
+      /cannot be reviewed/,
     );
     await f.click(token, old);
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(f.calls.length, 1);
-    await f.click(f.button("Recusar", replacement), replacement);
+    await f.click(f.button("Decline", replacement), replacement);
     await until(() => f.calls.length === 2);
     assert.equal(
       (f.calls[1].args.response as { action: string }).action,
@@ -1483,13 +1479,13 @@ test("new literal review replaces an old formatted card without replaying its em
     ) as TelegramButton;
     await assert.rejects(
       () => decideMcp(f.app, oldData, old.id),
-      /Cartão de revisão antigo/,
+      /Review card is old/,
     );
     await f.click(oldToken, old);
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(f.calls.length, 1);
     f.setResult(undefined);
-    await f.click(f.button("Aprovar", card), card);
+    await f.click(f.button("Approve", card), card);
     await until(() => f.calls.length === 2);
     assert.deepEqual(f.calls[1], {
       tool: "resume",
@@ -1534,10 +1530,10 @@ test("native wrapper prose cannot authorize; a direct plaintext mail settles its
     assert.equal(
       refused.markup?.inline_keyboard
         .flat()
-        .some((b) => b.text.includes("Aprovar")),
+        .some((b) => b.text.includes("Approve")),
       false,
     );
-    await f.click(f.button("Recusar", refused), refused);
+    await f.click(f.button("Decline", refused), refused);
     await opaque;
     assert.deepEqual(decisions, [{ action: "decline" }]);
     const direct = f.app.mcpCalls.execute(id, 2, "executor", "send_email", {
@@ -1552,7 +1548,7 @@ test("native wrapper prose cannot authorize; a direct plaintext mail settles its
     );
     await f.bot.flush();
     const card = f.views.at(-1)!;
-    const token = f.button("Aprovar", card);
+    const token = f.button("Approve", card);
     await f.click(token, card);
     await direct;
     await f.click(token, card);
@@ -1731,14 +1727,14 @@ test("draft, opaque and escaped sends have no Approve; explicit mail still resum
       assert.equal(
         card.markup?.inline_keyboard
           .flat()
-          .some((button) => button.text.includes("Aprovar")),
+          .some((button) => button.text.includes("Approve")),
         false,
         row.requestId,
       );
-      assert.match(card.text, /fluxo seguro/, row.requestId);
+      assert.match(card.text, /secure flow/, row.requestId);
       assert.match(
         card.text,
-        row.specific ? /não busca o rascunho/ : /Identificadores, rascunhos/,
+        row.specific ? /does not fetch the draft/ : /Identifiers, drafts/,
         row.requestId,
       );
       if (row.visible) assert.match(card.text, new RegExp(row.visible));
@@ -1762,7 +1758,7 @@ test("draft, opaque and escaped sends have no Approve; explicit mail still resum
         ) as TelegramButton;
         await assert.rejects(
           () => decideMcp(f.app, data, card.id),
-          /não revisáveis/,
+          /cannot be reviewed/,
         );
       }
       f.app.mcpCalls.cancelConversation(id);
@@ -1789,7 +1785,7 @@ test("draft, opaque and escaped sends have no Approve; explicit mail still resum
       assert.equal(
         card.markup?.inline_keyboard
           .flat()
-          .some((button) => button.text.includes("Aprovar")),
+          .some((button) => button.text.includes("Approve")),
         true,
         `${app}/${tool}`,
       );
@@ -1812,7 +1808,7 @@ test("draft, opaque and escaped sends have no Approve; explicit mail still resum
     const card = f.views.at(-1)!;
     f.setResult(undefined);
     const before = f.calls.length;
-    await f.click(f.button("Aprovar", card), card);
+    await f.click(f.button("Approve", card), card);
     await until(() => f.calls.length === before + 1);
     assert.deepEqual(f.calls.at(-1), {
       tool: "resume",
@@ -1852,12 +1848,12 @@ test("draft, opaque and escaped sends have no Approve; explicit mail still resum
     assert.equal(
       nativeCard.markup?.inline_keyboard
         .flat()
-        .some((button) => button.text.includes("Aprovar")),
+        .some((button) => button.text.includes("Approve")),
       false,
     );
     assert.match(nativeCard.text, /draft-native/);
-    assert.match(nativeCard.text, /não busca o rascunho/);
-    await f.click(f.button("Recusar", nativeCard), nativeCard);
+    assert.match(nativeCard.text, /does not fetch the draft/);
+    await f.click(f.button("Decline", nativeCard), nativeCard);
     await native;
     assert.deepEqual(decisions, [{ action: "decline" }]);
   } finally {
@@ -1893,7 +1889,7 @@ test("clean accepts legacy group chat type in allowlist", async () => {
     };
     await f.bot.receive(update);
     await f.bot.flush();
-    assert.match(f.views.at(-1)!.text, /Modelos:/);
+    assert.match(f.views.at(-1)!.text, /Models:/);
   } finally {
     await f.close();
   }
@@ -1950,7 +1946,7 @@ test("an unsupported attachment answers with what is accepted instead of staying
       },
     });
     await f.bot.flush();
-    assert.match(f.views.at(-1)!.text, /só leio imagens/);
+    assert.match(f.views.at(-1)!.text, /only read images/);
     // nada foi admitido: nem conversa foi criada para este chat
     assert.equal(f.app.telegramChats.selection(f.owner), undefined);
   } finally {
@@ -2213,7 +2209,7 @@ test("origin: a transcript reaches the model marked as audio, verbatim", async (
     const text = await lastUserText(f);
     assert.match(
       text,
-      /^\[áudio transcrito · \{"origin":"audio","model":"whisper-1"\}\]/,
+      /^\[audio transcript · \{"origin":"audio","model":"whisper-1"\}\]/,
     );
     // verbatim: the transcription is not corrected, summarized or wrapped
     assert.match(text, /reunião sexta às dez$/);
@@ -2269,7 +2265,7 @@ test("origin: an automated image description is marked as image", async () => {
     const text = await lastUserText(f);
     assert.match(
       text,
-      /^\[imagem: descrição automática · \{"origin":"image","model":"vision-1"\}\]/,
+      /^\[image: automatic description · \{"origin":"image","model":"vision-1"\}\]/,
     );
     assert.match(text, /um gráfico de vendas/);
   } finally {
@@ -2310,7 +2306,7 @@ test("origin: a failed transcription is admitted with the error, never dropped",
     const text = await lastUserText(f);
     assert.match(
       text,
-      /^\[áudio · \{"origin":"audio","error":"resposta 500"\}\]/,
+      /^\[audio · \{"origin":"audio","error":"response 500"\}\]/,
     );
   } finally {
     globalThis.fetch = originalFetch;
@@ -2372,7 +2368,7 @@ test("/status shows the chat, vision and transcription models", async () => {
     const text = f.views.at(-1)!.text;
     assert.match(
       text,
-      /^Modelos:\nTexto: faux-1 · Esforço: \S+\nVisão: gemini-3\.5-flash-lite\nÁudio: whisper-1 \(pt\)\n/,
+      /^Models:\nText: faux-1 · Effort: \S+\nVision: gemini-3\.5-flash-lite\nAudio: whisper-1 \(pt\)\n/,
     );
   } finally {
     await f.close();
@@ -2434,7 +2430,6 @@ test("a reply that carries a file delivers it after the text", async () => {
       3500,
       conversationId,
       11,
-      undefined,
       [
         {
           kind: "audio",
@@ -2476,7 +2471,6 @@ test("a failed upload is recorded and does not swallow the text", async () => {
       3500,
       conversationId,
       11,
-      undefined,
       [
         {
           kind: "audio",
@@ -2520,7 +2514,7 @@ test("an empty answer with no file still sends nothing", async () => {
   }
 });
 
-test("/reload keeps the conversation and clears an uncertain MCP result", async () => {
+test("/resume dismisses an uncertain MCP result and warns the call may already have run", async () => {
   const f = await fixture();
   try {
     await f.send("primeira mensagem", 11, -100123, 42);
@@ -2534,26 +2528,71 @@ test("/reload keeps the conversation and clears an uncertain MCP result", async 
         first,
       ),
     );
-    await f.send("/reload", 11, -100123, 42);
-    assert.match(f.views.at(-1)!.text, /dispensado/);
-    assert.match(f.views.at(-1)!.text, /histórico não foi alterado/);
-    assert.doesNotMatch(f.views.at(-1)!.text, /Conversa recarregada/);
+    await f.send("/resume", 11, -100123, 42);
+    const reply = f.views.at(-1)!.text;
+    assert.match(reply, /dismissed/);
+    assert.match(reply, /History was not changed/);
+    assert.match(reply, /email may have gone out/);
+    assert.match(reply, /before the agent continues/);
+    assert.doesNotMatch(reply, /Resumed /);
+    assert.doesNotMatch(reply, /Conversa recarregada/);
     // Same conversation: the history is not the problem.
     assert.equal(f.app.telegramChats.selection(f.owner), first);
     assert.equal(
       f.app.store.get("SELECT 1 FROM mcp_calls WHERE state='uncertain'"),
       undefined,
     );
-    await f.send("/destravar", 11, -100123, 42);
-    assert.match(f.views.at(-1)!.text, /Nenhum resultado MCP incerto pendente/);
-    assert.match(f.views.at(-1)!.text, /Nada foi apagado/);
-    assert.equal(f.app.telegramChats.selection(f.owner), first);
-    await f.send("depois do reload", 11, -100123, 42);
-    assert.equal(f.app.telegramChats.selection(f.owner), first);
+    assert.equal(
+      f.app.store.get<{ state: string }>(
+        "SELECT state FROM mcp_calls WHERE id='lost'",
+      )?.state,
+      "skipped",
+    );
     const page = await (
       await f.app.conversation(first)
     ).entries({}, 50, undefined, context);
     assert.equal(page.items.length > 0, true);
+  } finally {
+    await f.close();
+  }
+});
+
+test("/resume with nothing pending says so", async () => {
+  const f = await fixture();
+  try {
+    await f.send("oi", 11, -100123, 42);
+    const first = f.app.telegramChats.selection(f.owner)!;
+    await f.send("/resume", 11, -100123, 42);
+    assert.match(f.views.at(-1)!.text, /Nothing is pending in this topic/);
+    assert.equal(f.app.telegramChats.selection(f.owner), first);
+  } finally {
+    await f.close();
+  }
+});
+
+test("/reload is an unknown command and does not dismiss an uncertain MCP result", async () => {
+  const f = await fixture();
+  try {
+    await f.send("oi", 11, -100123, 42);
+    const first = f.app.telegramChats.selection(f.owner)!;
+    f.app.store.run(
+      `INSERT INTO mcp_calls(id,conversationId,server,tool,args,state,result,binding,updatedAt)
+       VALUES ('lost','${first}','executor','write','{}','uncertain','{"isError":true}','executor',0)`,
+    );
+    const before = f.views.length;
+    await f.send("/reload", 11, -100123, 42);
+    const added = f.views
+      .slice(before)
+      .map((view) => view.text)
+      .join("\n");
+    assert.match(added, /Unknown command\. Use \/help\./);
+    assert.equal(
+      f.app.store.get<{ state: string }>(
+        "SELECT state FROM mcp_calls WHERE id='lost'",
+      )?.state,
+      "uncertain",
+    );
+    assert.equal(f.app.telegramChats.selection(f.owner), first);
   } finally {
     await f.close();
   }
@@ -2587,7 +2626,7 @@ test("recibo preso, /new e a mensagem seguinte é admitida", async () => {
       () => f.app.telegramChats.ensure(f.owner),
       (error: unknown) => {
         assert.ok(error instanceof Error);
-        assert.match(error.message, /resultado incerto/);
+        assert.match(error.message, /uncertain result/);
         assert.match(error.message, /\/new/);
         assert.doesNotMatch(error.message, /verifique na web/);
         return true;
@@ -2604,15 +2643,15 @@ test("recibo preso, /new e a mensagem seguinte é admitida", async () => {
     );
     await f.send("preso");
     const stuck = f.views.map((view) => view.text).join("\n");
-    assert.match(stuck, /criação pendente/);
+    assert.match(stuck, /pending create/);
     assert.match(stuck, /\/new/);
     assert.doesNotMatch(stuck, /verifique na web/);
     assert.equal(
       f.app.store.get("SELECT 1 FROM requests WHERE text='preso'"),
       undefined,
     );
-    await f.send("/nova");
-    assert.match(f.views.at(-1)!.text, /Conversa nova neste tópico/);
+    await f.send("/new");
+    assert.match(f.views.at(-1)!.text, /New conversation in this topic/);
     const next = f.app.telegramChats.selection(f.owner)!;
     assert.notEqual(next, first);
     assert.equal(
@@ -2647,7 +2686,7 @@ test("recibo preso, /new e a mensagem seguinte é admitida", async () => {
       .slice(beforeFree)
       .map((view) => view.text)
       .join("\n");
-    assert.doesNotMatch(afterFree, /criação pendente|verifique na web/);
+    assert.doesNotMatch(afterFree, /pending create|verifique na web/);
   } finally {
     await f.close();
   }
@@ -2669,7 +2708,7 @@ test("autorização mudada durante a criação do tópico aponta para /new", asy
       () => f.app.telegramChats.ensure(owner),
       (error: unknown) => {
         assert.ok(error instanceof Error);
-        assert.match(error.message, /Autorização Telegram mudou/);
+        assert.match(error.message, /Telegram authorization changed/);
         assert.match(error.message, /\/new/);
         assert.doesNotMatch(error.message, /verifique na web/);
         return true;
@@ -2684,9 +2723,9 @@ test("/model e /thinking com texto abrem o menu; /stop com texto cancela", async
   const f = await fixture();
   try {
     await f.send("/model gpt");
-    assert.match(f.views.at(-1)!.text, /Configuração de modelo/);
+    assert.match(f.views.at(-1)!.text, /Model settings/);
     await f.send("/thinking alto");
-    assert.match(f.views.at(-1)!.text, /Esforço ativo/);
+    assert.match(f.views.at(-1)!.text, /Active effort/);
     const id = f.app.telegramChats.selection(f.owner)!;
     f.app.store.run(
       "INSERT INTO mcp_interactions(id,conversationId,callId,server,kind,payload,state) VALUES ('i-stop',?,'c-stop','srv','act','{}','pending')",
@@ -2698,9 +2737,13 @@ test("/model e /thinking com texto abrem o menu; /stop com texto cancela", async
       false,
     );
     await f.send("/resume");
-    assert.match(f.views.at(-1)!.text, /Nenhuma tarefa estacionada/);
+    assert.match(f.views.at(-1)!.text, /Nothing is pending in this topic/);
     await f.send("/retomar");
-    assert.match(f.views.at(-1)!.text, /Nenhuma tarefa estacionada/);
+    assert.match(f.views.at(-1)!.text, /Unknown command/);
+    await f.send("/destravar");
+    assert.match(f.views.at(-1)!.text, /Unknown command/);
+    await f.send("/nova");
+    assert.match(f.views.at(-1)!.text, /Unknown command/);
   } finally {
     await f.close();
   }
@@ -2733,7 +2776,7 @@ test("flush delivers assistant replies before uncertain MCP side effects run", a
       "a resposta já enfileirada deve ser entregue",
     );
     assert.ok(
-      texts.some((t) => t.includes("resultado MCP incerto")),
+      texts.some((t) => t.includes("uncertain MCP result")),
       "o aviso incerto deve ser entregue no mesmo flush",
     );
   } finally {
@@ -2765,7 +2808,7 @@ test("flush delivers a queued assistant reply when a persisted uncertain MCP not
     await f.bot.flush();
     const texts = f.views.slice(before).map((v) => v.text);
     assert.ok(
-      texts.some((t) => t.includes("resultado MCP incerto")),
+      texts.some((t) => t.includes("uncertain MCP result")),
       "deve enfileirar aviso de MCP incerto",
     );
     assert.ok(

@@ -7,8 +7,8 @@ Validation on 2026-10-22, in an isolated worktree and temporary test volumes. No
 - `npm ci` with the committed lockfile; Pi durable/AI/chord are pinned to 1.4.0 (aligned with [packages/durable](https://github.com/earendil-works/pi/tree/v1.4.0/packages/durable) on Pi `v1.4.0`).
 - Internal `defineTool` handlers return model text via `output`, not `content`, per pi-durable 1.2+.
 - `npm run check`, `npm run lint`, `npm run build`, `npm run format:check` and `git diff --check` pass.
-- `npm test`: **400 passed, 0 failed**, with concurrency limited to 2.
-- The clean flow, protocol, lifecycle and compaction suites, plus `test/telegram-approval-review.test.ts`, are included in that full run. Schema 2 of `durable.sqlite` is covered by `test/durable-schema.test.ts`.
+- `npm test`: **395 passed, 0 failed**, with concurrency limited to 2.
+- The clean flow, protocol, lifecycle and compaction suites, plus `test/telegram-approval-review.test.ts`, are included in that full run.
 - `docker compose config --quiet` passes without runtime credentials or exposed ports.
 
 The retained tests exercise durable admission, recovery, task occurrences, conversation isolation, delivery authorization and MCP ledgers. Tests specific to the removed web UI/server, login and topic mirroring were removed together with those surfaces.
@@ -27,7 +27,7 @@ The retained tests exercise durable admission, recovery, task occurrences, conve
 
 The Docker image uses `node:24-bookworm-slim`, uid 1000, built-in `node:sqlite`, no web assets/server, and a local heartbeat health check. Compose uses a new named volume, read-only root filesystem, dropped capabilities, no public ports and graceful shutdown. The reproducible offline container check is `scripts/smoke-container.sh IMAGE`; it mocks Telegram in-process and disables container networking, exercises two startups with the same test volume, checks heartbeat, one persisted native conversation, credential-free logs and successful SIGTERM.
 
-The upstream Node image manifest was inspected and includes `linux/amd64` and `linux/arm64/v8`. Runtime dependencies have no application-specific fixed-architecture native SQLite binary. Build and runtime smoke are validated on **amd64**. This builder has no ARM emulator, so **ARM64 execution is not claimed**; validate on the intended Oracle ARM VM before relying on it operationally.
+The upstream Node image manifest was inspected and includes `linux/amd64` and `linux/arm64/v8`. Runtime dependencies have no application-specific fixed-architecture native SQLite binary. Build and runtime smoke are validated on **amd64**. This builder has no ARM emulator, so **ARM64 execution is not claimed**; validate on the target ARM machine before relying on it operationally.
 
 This execution environment's BuildKit needed its proxy hostname mapped with `--add-host`, predefined HTTP(S) proxy build arguments and the optional `npm_ca` BuildKit secret. The CA is mounted only for dependency installation, never copied into the image. Normal Docker builds require neither these environment-specific options nor runtime credentials.
 

@@ -1,26 +1,47 @@
-import type { Runtime } from "./runtime.js";
+import { assistantTimeZone, type Runtime } from "./runtime.js";
 import {
+  approvalId,
   asRecord,
   executorBodies,
   isExecutorApproval,
   isExecutorFailure,
   isInputInvalid,
   programPayload,
+  statusWord,
 } from "./executor-result.js";
 
 export { programPayload };
+import { ensureDiscovered } from "./discover.js";
 import {
-  BUILTIN,
   buildReadInput,
   isTerminal,
   jobState,
   loadManifests,
   readPath,
+  renderTemplate,
   tolerantExtract,
   type JobManifest,
   type JobState,
   type ReadInput,
 } from "./job-manifest.js";
+import { loadHarnessConfig } from "./harness-config.js";
+
+/** HH:MM:SS in TZ, or America/Sao_Paulo when TZ is missing or not a real zone. */
+export function formatTickClock(
+  at: number,
+  env: Record<string, string | undefined>,
+) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: assistantTimeZone(env),
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(at));
+  const pick = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((part) => part.type === type)?.value ?? "00";
+  return `${pick("hour")}:${pick("minute")}:${pick("second")}`;
+}
 
 /** One line of `pending_jobs`: a run registered when the tool was dispatched. */
 export interface PendingJob {
@@ -37,8 +58,12 @@ export interface PendingJob {
   outcome: string | null;
   /** The result a synchronous dispatch already returned, kept until the turn delivers. */
   result: string | null;
-  /** Failed delivery attempts; the row expires instead of retrying for ever. */
+  /** Legacy mixed count. Kept so an old database can seed poll_attempts. Not written. */
   attempts: number;
+  /** Consecutive provider read failures. A successful read clears only this. */
+  poll_attempts: number;
+  /** Result submissions rejected before admission. Independent of poll failures. */
+  delivery_attempts: number;
   /** When the worker may ask the provider again (ms since epoch). */
   next_poll_at: number;
   /** Last normalized state the provider reported. */
@@ -51,6 +76,8 @@ export interface PendingJob {
   last_error?: string | null;
   /** Account the dispatch itself passed. Reads use this, never an env default. */
   account_id?: string | null;
+  /** Source of the turn that opened the row (`telegram`, `web`, `task`), or null. */
+  origin_source?: string | null;
 }
 
 interface JobTool {
@@ -61,6 +88,13 @@ interface JobTool {
   manifest: JobManifest;
 }
 
+/** Backoff for a delivery retry whose row matches no manifest. */
+const DELIVERY_BACKOFF: JobManifest = {
+  tool: "",
+  dispatch: { mode: "immediate" },
+  observe: { mode: "poll" },
+  poll: { intervalSeconds: 25, backoff: [25, 60, 150], maxAttempts: 3 },
+};
 const DEFAULT_TIMEOUT_MIN = 25;
 const DEFAULT_POLL_SECONDS = 25;
 const DEFAULT_READ_TIMEOUT_MS = 20_000;
@@ -72,6 +106,14 @@ const JOB_TURN_TTL_MS = 10 * 60 * 1000;
 const MAX_ATTEMPTS = 3;
 /** How long a closed job waits for a `sent` delivery before the operator is told. */
 const DELIVERY_CHECK_MS = 10 * 60 * 1000;
+/** Finished rows older than this are deleted. Open rows stay. */
+const JOB_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+/** At most one prune pass per process hour. */
+const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+/** Repeated identical tick failures log at most once per minute. */
+const TICK_ERROR_LOG_MS = 60 * 1000;
+/** One poll-error line keeps the reason and drops the rest. */
+const LOG_ERROR_MAX = 200;
 /** How long a dispatched result waits for its turn before the poller resends it. */
 const DISPATCH_GRACE_MS = 3 * 60 * 1000;
 /** Consecutive list failures before an integration is left alone. */
@@ -322,6 +364,10 @@ export class PendingJobs {
     delivered: number;
     errors: number;
   };
+  /** The last tick that threw. A later success does not clear it. */
+  private lastTickError?: { at: number; message: string };
+  private tickErrorLogged?: { at: number; message: string };
+  private lastPruneAt?: number;
   /** Conversations running a job-born turn, with the moment they entered it. */
   private readonly jobTurns = new Map<string, number>();
   /** Consecutive list failures per integration, to stop polling a tool that is not there. */
@@ -346,6 +392,8 @@ export class PendingJobs {
       delivered: number;
       errors: number;
     };
+    /** The last tick that threw; never cleared by a later success. */
+    last_tick_error?: { at: number; message: string };
   } {
     this.ensure();
     const openCount =
@@ -353,22 +401,27 @@ export class PendingJobs {
         "SELECT count(*) AS total FROM pending_jobs WHERE delivered_at IS NULL",
       )?.total ?? 0;
     const lastTick = this.lastTick ? { ...this.lastTick } : undefined;
+    const lastTickError = this.lastTickError
+      ? { ...this.lastTickError }
+      : undefined;
     return {
       enabled: !this.disabled,
       ...(this.disabledReason ? { reason: this.disabledReason } : {}),
       open_rows: openCount,
       manifests_count: this.manifests().length,
       ...(lastTick ? { last_tick: lastTick } : {}),
+      ...(lastTickError ? { last_tick_error: lastTickError } : {}),
     };
   }
 
   healthLine(): string {
     const h = this.health();
+    const open = `${h.open_rows} open row(s)`;
     const base = h.enabled
-      ? `Jobs assíncronos: ativo (${h.open_rows} linha(s) em aberto)`
-      : `Jobs assíncronos: desabilitado (reason=${h.reason ?? "disabled"}), ${h.open_rows} linha(s) em aberto`;
+      ? `Async jobs: active (${open})`
+      : `Async jobs: disabled (reason=${h.reason ?? "disabled"}), ${open}`;
     if (!h.last_tick) return base;
-    return `${base}; último tick às ${new Date(h.last_tick.at).toISOString().slice(11, 19)} (rows_polled=${h.last_tick.rows_polled} delivered=${h.last_tick.delivered} errors=${h.last_tick.errors})`;
+    return `${base}; last tick at ${formatTickClock(h.last_tick.at, this.env)} (rows_polled=${h.last_tick.rows_polled} delivered=${h.last_tick.delivered} errors=${h.last_tick.errors})`;
   }
 
   /**
@@ -383,7 +436,9 @@ export class PendingJobs {
         id INTEGER PRIMARY KEY AUTOINCREMENT, integration TEXT NOT NULL, tool TEXT NOT NULL,
         run_id TEXT, goal TEXT, conversation_id TEXT NOT NULL, created_at INTEGER NOT NULL,
         delivered_at INTEGER, notified_at INTEGER, outcome TEXT, result TEXT,
-        attempts INTEGER NOT NULL DEFAULT 0);
+        attempts INTEGER NOT NULL DEFAULT 0,
+        poll_attempts INTEGER NOT NULL DEFAULT 0,
+        delivery_attempts INTEGER NOT NULL DEFAULT 0);
       CREATE INDEX IF NOT EXISTS pending_jobs_open ON pending_jobs(delivered_at);
     `);
     // A database created by the first version of this table lacks the columns below;
@@ -430,6 +485,35 @@ export class PendingJobs {
       this.app.store.db.exec(
         "ALTER TABLE pending_jobs ADD COLUMN account_id TEXT",
       );
+    // Who asked. A later completion uses this to decide silence versus delivery.
+    if (!columns.includes("origin_source"))
+      this.app.store.db.exec(
+        "ALTER TABLE pending_jobs ADD COLUMN origin_source TEXT",
+      );
+    // Split the old mixed counter. Holds from the previous migration go back to
+    // normal polling: unknown history seeds poll_attempts from attempts.
+    this.app.store.savepoint("pending_job_counters", () => {
+      if (!columns.includes("poll_attempts")) {
+        this.app.store.db.exec(
+          "ALTER TABLE pending_jobs ADD COLUMN poll_attempts INTEGER NOT NULL DEFAULT 0",
+        );
+        this.app.store.run(
+          "UPDATE pending_jobs SET poll_attempts=COALESCE(attempts,0)",
+        );
+      }
+      if (!columns.includes("delivery_attempts"))
+        this.app.store.db.exec(
+          "ALTER TABLE pending_jobs ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0",
+        );
+      if (columns.includes("delivery_blocked"))
+        this.app.store.run(
+          `UPDATE pending_jobs SET
+             poll_attempts=CASE WHEN delivery_blocked='legacy_attempts_unknown' THEN COALESCE(attempts,0) ELSE poll_attempts END,
+             delivery_attempts=0,
+             delivery_blocked=NULL
+           WHERE delivery_blocked IS NOT NULL`,
+        );
+    });
     // '' is not NULL and would collide on the unique index. Unknown ids stay NULL.
     this.app.store.db.exec(`
       UPDATE pending_jobs SET run_id=NULL WHERE run_id IS NOT NULL AND trim(run_id)='';
@@ -512,6 +596,7 @@ export class PendingJobs {
     const tool = normalizeToolPath(input.tool);
     const accountId = input.accountId?.trim() || null;
     const goal = input.goal ?? null;
+    const origin = this.requester(input.conversationId);
     if (runId) {
       const existing = this.app.store.get<{ id: number }>(
         "SELECT id FROM pending_jobs WHERE run_id=?",
@@ -520,10 +605,12 @@ export class PendingJobs {
       if (existing) {
         this.app.store.run(
           `UPDATE pending_jobs
-           SET account_id=COALESCE(NULLIF(account_id, ''), ?), goal=COALESCE(goal, ?)
+           SET account_id=COALESCE(NULLIF(account_id, ''), ?), goal=COALESCE(goal, ?),
+               origin_source=COALESCE(origin_source, ?)
            WHERE id=?`,
           accountId,
           goal,
+          origin,
           existing.id,
         );
         return true;
@@ -537,11 +624,13 @@ export class PendingJobs {
       if (open && this.claimRun(open.id, runId)) {
         this.app.store.run(
           `UPDATE pending_jobs
-           SET tool=?, account_id=COALESCE(NULLIF(account_id, ''), ?), goal=COALESCE(goal, ?)
+           SET tool=?, account_id=COALESCE(NULLIF(account_id, ''), ?), goal=COALESCE(goal, ?),
+               origin_source=COALESCE(origin_source, ?)
            WHERE id=?`,
           tool,
           accountId,
           goal,
+          origin,
           open.id,
         );
         return true;
@@ -549,8 +638,8 @@ export class PendingJobs {
     }
     const inserted =
       this.app.store.run(
-        `INSERT INTO pending_jobs(integration,tool,run_id,goal,conversation_id,created_at,account_id)
-         VALUES (?,?,?,?,?,?,?)
+        `INSERT INTO pending_jobs(integration,tool,run_id,goal,conversation_id,created_at,account_id,origin_source)
+         VALUES (?,?,?,?,?,?,?,?)
          ON CONFLICT(tool, run_id) WHERE run_id IS NOT NULL DO NOTHING`,
         input.server,
         tool,
@@ -559,6 +648,7 @@ export class PendingJobs {
         input.conversationId,
         Date.now(),
         accountId,
+        origin,
       ).changes > 0;
     if (inserted) return true;
     return runId
@@ -600,6 +690,8 @@ export class PendingJobs {
         outcome: null,
         result: null,
         attempts: 0,
+        poll_attempts: 0,
+        delivery_attempts: 0,
         next_poll_at: 0,
         job_state: "pending",
       },
@@ -616,9 +708,9 @@ export class PendingJobs {
     const vars = this.previewVars(entry);
     if (accountId) vars.accountId = accountId;
     const checks = [
-      buildReadInput(entry.manifest.observe.args ?? {}, vars),
+      this.buildArgs(entry.manifest, entry.manifest.observe.args ?? {}, vars),
       ...(entry.manifest.reconcile
-        ? [buildReadInput(entry.manifest.reconcile.args, vars)]
+        ? [this.buildArgs(entry.manifest, entry.manifest.reconcile.args, vars)]
         : []),
     ];
     const bad = checks.find((check) => !check.ok);
@@ -628,7 +720,7 @@ export class PendingJobs {
   }
 
   private readInput(args: unknown, row: PendingJob, entry: JobTool): ReadInput {
-    return buildReadInput(args, this.templateVars(row, entry));
+    return this.buildArgs(entry.manifest, args, this.templateVars(row, entry));
   }
 
   /** Path desconhecido ou sem tool de leitura declarado: fecha sem acordar turno. */
@@ -671,13 +763,58 @@ export class PendingJobs {
     return this.env.ASYNC_JOB_EXECUTOR?.trim() || "executor";
   }
 
+  /** `executor` polls inside `execute`. Any other declared server is called directly. */
+  private usesSandbox(manifest: JobManifest) {
+    const name = manifest.server?.trim() ?? "";
+    return !name || name === "executor" || name === this.executorServer();
+  }
+
+  private buildArgs(
+    manifest: JobManifest,
+    template: unknown,
+    vars: Record<string, string | number | undefined>,
+  ): ReadInput {
+    if (this.usesSandbox(manifest)) return buildReadInput(template, vars);
+    const rendered = renderTemplate(template ?? {}, vars);
+    const body = asRecord(rendered);
+    if (!body) return { ok: false, error: "input: Expected object" };
+    return { ok: true, input: body };
+  }
+
+  private async readJob(
+    callDirect: (
+      server: string,
+      tool: string,
+      args: Record<string, unknown>,
+      options: { signal?: AbortSignal },
+    ) => Promise<unknown>,
+    manifest: JobManifest,
+    tool: string,
+    args: Record<string, unknown>,
+  ) {
+    const options = { signal: AbortSignal.timeout(this.readTimeoutMs()) };
+    if (this.usesSandbox(manifest))
+      return callDirect(
+        this.executorServer(),
+        "execute",
+        { code: sandboxCall(tool, args) },
+        options,
+      );
+    return callDirect(
+      manifest.server?.trim() || this.executorServer(),
+      tool,
+      args,
+      options,
+    );
+  }
+
   /** Manifests describe every provider detail; the core never names a tool. */
   private manifests(): JobManifest[] {
     try {
       return loadManifests(this.env);
     } catch (error) {
       console.warn(
-        `Jobs assíncronos: manifesto inválido (${(error as Error).message}); desligado.`,
+        `Async jobs: invalid manifest (${(error as Error).message}); turned off.`,
       );
       return [];
     }
@@ -733,12 +870,13 @@ export class PendingJobs {
   }
 
   private timeoutMs() {
-    const minutes = Number(this.env.ASYNC_JOB_TIMEOUT_MIN);
-    return (
-      (Number.isFinite(minutes) && minutes > 0
-        ? minutes
-        : DEFAULT_TIMEOUT_MIN) * 60_000
-    );
+    const fromEnv = Number(this.env.ASYNC_JOB_TIMEOUT_MIN);
+    const minutes =
+      Number.isFinite(fromEnv) && fromEnv > 0
+        ? fromEnv
+        : (loadHarnessConfig(this.env).asyncJob.timeoutMin ??
+          DEFAULT_TIMEOUT_MIN);
+    return minutes * 60_000;
   }
 
   private readTimeoutMs() {
@@ -747,12 +885,13 @@ export class PendingJobs {
   }
 
   private pollMs() {
-    const seconds = Number(this.env.ASYNC_JOB_POLL_SECONDS);
-    return (
-      (Number.isFinite(seconds) && seconds > 0
-        ? seconds
-        : DEFAULT_POLL_SECONDS) * 1000
-    );
+    const fromEnv = Number(this.env.ASYNC_JOB_POLL_SECONDS);
+    const seconds =
+      Number.isFinite(fromEnv) && fromEnv > 0
+        ? fromEnv
+        : (loadHarnessConfig(this.env).asyncJob.pollSeconds ??
+          DEFAULT_POLL_SECONDS);
+    return seconds * 1000;
   }
 
   /** The tool config for a dispatched call, when it is one that starts a job. */
@@ -797,7 +936,7 @@ export class PendingJobs {
     if (!entry || this.inJobTurn(conversationId)) return false;
     if (!this.observeTool(entry.manifest)) {
       console.warn(
-        `Jobs assíncronos: manifesto sem tool de leitura para ${entry.path}; dispatch ignorado.`,
+        `Async jobs: manifest has no read tool for ${entry.path}; dispatch ignored.`,
       );
       return false;
     }
@@ -816,7 +955,7 @@ export class PendingJobs {
       if (!this.unreadable.has(entry.path)) {
         this.unreadable.add(entry.path);
         console.error(
-          `Jobs assíncronos: ${entry.path} desabilitado. A leitura não monta {accountId, input}: ${broken}`,
+          `Async jobs: ${entry.path} disabled. The read does not build {accountId, input}: ${broken}`,
         );
       }
       void this.announce(
@@ -1151,7 +1290,6 @@ export class PendingJobs {
     row: PendingJob,
     manifest: JobManifest,
     observed: Run | JobState,
-    attempts?: number,
   ) {
     const state = typeof observed === "string" ? observed : observed.state;
     const status =
@@ -1160,18 +1298,18 @@ export class PendingJobs {
         : observed.status || observed.state.toUpperCase();
     const error =
       typeof observed === "string" ? null : (observed.error ?? null);
-    const retry = attempts ?? row.attempts;
+    // A successful read clears only the poll counter. Delivery keeps its own.
+    row.poll_attempts = 0;
     this.app.store.run(
       `UPDATE pending_jobs SET job_state=?, last_status=?, last_seen_at=?,
-         last_error=?, attempts=?, next_poll_at=? WHERE id=?`,
+         last_error=?, poll_attempts=0, next_poll_at=? WHERE id=?`,
       state,
       status,
       Date.now(),
       error,
-      retry,
       isTerminal(state)
         ? row.next_poll_at
-        : Date.now() + this.backoffMs(manifest, retry),
+        : Date.now() + this.backoffMs(manifest, 0),
       row.id,
     );
   }
@@ -1274,11 +1412,9 @@ export class PendingJobs {
       found = await this.lookupAccounts(namespace, entry.manifest.observe.tool);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await this.failNamed(
-        row,
-        "missing_account",
-        `missing_account: não consegui consultar as contas de ${namespace}: ${message}`,
-      );
+      const text = `missing_account: não consegui consultar as contas de ${namespace}: ${message}`;
+      this.logPollError(row, "account", text);
+      await this.failNamed(row, "missing_account", text);
       return false;
     }
     if (found.length === 1) {
@@ -1291,18 +1427,14 @@ export class PendingJobs {
       return true;
     }
     if (found.length === 0) {
-      await this.failNamed(
-        row,
-        "missing_account",
-        `missing_account: a chamada de ${entry.path} não trouxe accountId e a busca no namespace ${namespace} não achou nenhuma conta.`,
-      );
+      const text = `missing_account: a chamada de ${entry.path} não trouxe accountId e a busca no namespace ${namespace} não achou nenhuma conta.`;
+      this.logPollError(row, "account", text);
+      await this.failNamed(row, "missing_account", text);
       return false;
     }
-    await this.failNamed(
-      row,
-      "ambiguous_account",
-      `ambiguous_account: há mais de uma conta para ${namespace} (${found.join(", ")}) e a chamada não escolheu. Nada foi lido.`,
-    );
+    const text = `ambiguous_account: há mais de uma conta para ${namespace} (${found.join(", ")}) e a chamada não escolheu. Nada foi lido.`;
+    this.logPollError(row, "account", text);
+    await this.failNamed(row, "ambiguous_account", text);
     return false;
   }
 
@@ -1346,9 +1478,7 @@ export class PendingJobs {
       `jobs_poller: started (poll_interval=${this.pollMs() / 1000}s)`,
     );
     this.timer = setInterval(() => {
-      void this.tick().catch(() => {
-        /* The next tick retries; a poll failure is not a user-facing event. */
-      });
+      void this.tick().catch((error: unknown) => this.noteTickFailure(error));
     }, this.pollMs());
     this.timer.unref?.();
   }
@@ -1393,6 +1523,37 @@ export class PendingJobs {
       );
     }
   }
+  /** Deletes finished rows older than 30 days. Open rows are left alone. */
+  private prune(now = Date.now()) {
+    if (
+      this.lastPruneAt !== undefined &&
+      now - this.lastPruneAt < PRUNE_INTERVAL_MS
+    )
+      return;
+    this.lastPruneAt = now;
+    const pruned = this.app.store.run(
+      "DELETE FROM pending_jobs WHERE delivered_at IS NOT NULL AND delivered_at <= ?",
+      now - JOB_RETENTION_MS,
+    ).changes;
+    if (pruned > 0) console.info(`jobs_poller: pruned=${pruned}`);
+  }
+
+  /** Records a throwing tick. The timer keeps running; nothing is sent to the user. */
+  private noteTickFailure(error: unknown) {
+    const at = Date.now();
+    const message = error instanceof Error ? error.message : String(error);
+    this.lastTickError = { at, message };
+    const logged = this.tickErrorLogged;
+    if (
+      logged &&
+      logged.message === message &&
+      at - logged.at < TICK_ERROR_LOG_MS
+    )
+      return;
+    this.tickErrorLogged = { at, message };
+    console.error(`jobs_poller: tick failed: ${message}`);
+  }
+
   /** One reconciliation pass. Public for the timer and for tests. */
   async tick() {
     this.ensure();
@@ -1403,6 +1564,7 @@ export class PendingJobs {
     let deliveredCount = 0;
     let errorsCount = 0;
     try {
+      this.prune();
       this.checkDelivered(Date.now());
       if (!pending.length) return;
       // Only a gateway that can reach a direct connection has runs to read.
@@ -1417,8 +1579,15 @@ export class PendingJobs {
           }
         | undefined;
       if (!gateway?.callDirect) return;
+      const skipDiscovery = await ensureDiscovered(
+        this.env,
+        (server, tool, args, options) =>
+          gateway.callDirect!(server, tool, args, options ?? {}),
+        pending,
+      );
       const groups = new Map<string, PendingJob[]>();
       for (const row of pending) {
+        if (skipDiscovery.has(row.tool)) continue;
         const key = this.rowPath(row);
         groups.set(key, [...(groups.get(key) ?? []), row]);
       }
@@ -1431,7 +1600,10 @@ export class PendingJobs {
         const observe = entry.manifest.observe;
         if (observe.mode !== "webhook" && observe.tool) {
           for (const row of rows) {
-            if (!(await this.ensureAccount(row, entry))) {
+            if (
+              this.usesSandbox(entry.manifest) &&
+              !(await this.ensureAccount(row, entry))
+            ) {
               errorsCount++;
               continue;
             }
@@ -1446,18 +1618,21 @@ export class PendingJobs {
                 : undefined);
             if (!row.run_id && reconcile) {
               try {
-                const args = await this.argsOrFail(row, entry, reconcile.args);
+                const args = await this.argsOrFail(
+                  row,
+                  entry,
+                  reconcile.args,
+                  "reconcile",
+                );
                 if (!args) {
                   errorsCount++;
                   continue;
                 }
-                const executed = await gateway.callDirect(
-                  this.executorServer(),
-                  "execute",
-                  {
-                    code: sandboxCall(reconcile.tool, args),
-                  },
-                  { signal: AbortSignal.timeout(this.readTimeoutMs()) },
+                const executed = await this.readJob(
+                  gateway.callDirect.bind(gateway),
+                  entry.manifest,
+                  reconcile.tool,
+                  args,
                 );
                 const window =
                   Date.now() - (reconcile.windowMinutes ?? 15) * 60_000;
@@ -1485,7 +1660,7 @@ export class PendingJobs {
                   this.app.store.run(
                     "UPDATE pending_jobs SET job_state='unknown', next_poll_at=? WHERE id=?",
                     Date.now() +
-                      this.backoffMs(entry.manifest, row.attempts + 1),
+                      this.backoffMs(entry.manifest, row.poll_attempts + 1),
                     row.id,
                   );
                   if (!row.notified_at)
@@ -1501,7 +1676,7 @@ export class PendingJobs {
                   const run = candidates[0]!;
                   if (!this.claimRun(row.id, run.run_id)) continue;
                   row.run_id = run.run_id;
-                  this.noteState(row, entry.manifest, run, 0);
+                  this.noteState(row, entry.manifest, run);
                   if (await this.settle(row, [run])) deliveredCount++;
                   continue;
                 }
@@ -1515,16 +1690,18 @@ export class PendingJobs {
                   this.app.store.run(
                     "UPDATE pending_jobs SET next_poll_at=? WHERE id=?",
                     Date.now() +
-                      this.backoffMs(entry.manifest, row.attempts + 1),
+                      this.backoffMs(entry.manifest, row.poll_attempts + 1),
                     row.id,
                   );
                 continue;
               } catch (error) {
                 errorsCount++;
+                this.logPollError(row, "reconcile", error);
                 if (await this.failIfInputInvalid(row, error)) continue;
                 this.app.store.run(
-                  "UPDATE pending_jobs SET attempts=attempts+1, next_poll_at=? WHERE id=?",
-                  Date.now() + this.backoffMs(entry.manifest, row.attempts + 1),
+                  "UPDATE pending_jobs SET poll_attempts=poll_attempts+1, next_poll_at=? WHERE id=?",
+                  Date.now() +
+                    this.backoffMs(entry.manifest, row.poll_attempts + 1),
                   row.id,
                 );
                 await this.warnIfTimedOut(row, error);
@@ -1537,18 +1714,17 @@ export class PendingJobs {
                 row,
                 entry,
                 observe.args ?? {},
+                "observe",
               );
               if (!args) {
                 errorsCount++;
                 continue;
               }
-              const executed = await gateway.callDirect(
-                this.executorServer(),
-                "execute",
-                {
-                  code: sandboxCall(observe.tool, args),
-                },
-                { signal: AbortSignal.timeout(this.readTimeoutMs()) },
+              const executed = await this.readJob(
+                gateway.callDirect.bind(gateway),
+                entry.manifest,
+                observe.tool,
+                args,
               );
               const payload = programResult(executed);
               if (isNotFoundError(payload)) {
@@ -1559,14 +1735,15 @@ export class PendingJobs {
                   this.app.store.run(
                     "UPDATE pending_jobs SET job_state='unknown', next_poll_at=? WHERE id=?",
                     Date.now() +
-                      this.backoffMs(entry.manifest, row.attempts + 1),
+                      this.backoffMs(entry.manifest, row.poll_attempts + 1),
                     row.id,
                   );
                   continue;
                 }
                 this.app.store.run(
-                  "UPDATE pending_jobs SET attempts=attempts+1, next_poll_at=? WHERE id=?",
-                  Date.now() + this.backoffMs(entry.manifest, row.attempts + 1),
+                  "UPDATE pending_jobs SET poll_attempts=poll_attempts+1, next_poll_at=? WHERE id=?",
+                  Date.now() +
+                    this.backoffMs(entry.manifest, row.poll_attempts + 1),
                   row.id,
                 );
                 if (!row.notified_at)
@@ -1580,6 +1757,7 @@ export class PendingJobs {
                     },
                     payload,
                   );
+                this.endIfTimedOut(row, payload);
                 continue;
               }
               const found = runsOf(payload, entry.manifest);
@@ -1603,7 +1781,7 @@ export class PendingJobs {
                   this.app.store.run(
                     "UPDATE pending_jobs SET job_state='unknown', next_poll_at=? WHERE id=?",
                     Date.now() +
-                      this.backoffMs(entry.manifest, row.attempts + 1),
+                      this.backoffMs(entry.manifest, row.poll_attempts + 1),
                     row.id,
                   );
                   if (!row.notified_at)
@@ -1620,7 +1798,7 @@ export class PendingJobs {
                   if (!row.run_id && !this.claimRun(row.id, run.run_id))
                     continue;
                   if (!row.run_id) row.run_id = run.run_id;
-                  this.noteState(row, entry.manifest, run, 0);
+                  this.noteState(row, entry.manifest, run);
                   if (await this.settle(row, [run])) deliveredCount++;
                 } else if (
                   row.run_id &&
@@ -1641,7 +1819,7 @@ export class PendingJobs {
                 row.run_id,
               );
               if (single) {
-                this.noteState(row, entry.manifest, single, 0);
+                this.noteState(row, entry.manifest, single);
                 if (await this.settle(row, [single])) deliveredCount++;
               } else if (Date.now() - row.created_at > this.timeoutMs()) {
                 // The read succeeded but carried no run: settle re-reads once before
@@ -1650,12 +1828,14 @@ export class PendingJobs {
               } else {
                 this.app.store.run(
                   "UPDATE pending_jobs SET job_state='unknown', next_poll_at=? WHERE id=?",
-                  Date.now() + this.backoffMs(entry.manifest, row.attempts + 1),
+                  Date.now() +
+                    this.backoffMs(entry.manifest, row.poll_attempts + 1),
                   row.id,
                 );
               }
             } catch (error) {
               errorsCount++;
+              this.logPollError(row, "observe", error);
               if (await this.failIfInputInvalid(row, error)) continue;
               if (isNotFoundError(error)) {
                 if (
@@ -1666,14 +1846,15 @@ export class PendingJobs {
                   this.app.store.run(
                     "UPDATE pending_jobs SET job_state='unknown', next_poll_at=? WHERE id=?",
                     Date.now() +
-                      this.backoffMs(entry.manifest, row.attempts + 1),
+                      this.backoffMs(entry.manifest, row.poll_attempts + 1),
                     row.id,
                   );
                   continue;
                 }
                 this.app.store.run(
-                  "UPDATE pending_jobs SET attempts=attempts+1, next_poll_at=? WHERE id=?",
-                  Date.now() + this.backoffMs(entry.manifest, row.attempts + 1),
+                  "UPDATE pending_jobs SET poll_attempts=poll_attempts+1, next_poll_at=? WHERE id=?",
+                  Date.now() +
+                    this.backoffMs(entry.manifest, row.poll_attempts + 1),
                   row.id,
                 );
                 if (!row.notified_at)
@@ -1687,6 +1868,7 @@ export class PendingJobs {
                     },
                     error,
                   );
+                this.endIfTimedOut(row, error);
                 continue;
               }
               const count = (this.failing.get(key) ?? 0) + 1;
@@ -1694,14 +1876,15 @@ export class PendingJobs {
               // Backoff per row, and a pause that always lifts: a provider that is down
               // must not turn into permanent silence.
               this.app.store.run(
-                "UPDATE pending_jobs SET attempts=attempts+1, next_poll_at=? WHERE id=?",
-                Date.now() + this.backoffMs(entry.manifest, count),
+                "UPDATE pending_jobs SET poll_attempts=poll_attempts+1, next_poll_at=? WHERE id=?",
+                Date.now() +
+                  this.backoffMs(entry.manifest, row.poll_attempts + 1),
                 row.id,
               );
               const max = entry.manifest.poll?.maxAttempts ?? MAX_LIST_FAILURES;
               if (count === max)
                 console.warn(
-                  `Jobs assíncronos: ${entry.path} falhou ${count} vezes seguidas; seguindo com backoff.`,
+                  `Async jobs: ${entry.path} failed ${count} times in a row; continuing with backoff.`,
                 );
               await this.warnIfTimedOut(row, error);
             }
@@ -1756,7 +1939,7 @@ export class PendingJobs {
       // Two runs could be this job: claiming either would deliver the wrong result.
       this.app.store.run(
         "UPDATE pending_jobs SET job_state='unknown', next_poll_at=? WHERE id=?",
-        Date.now() + this.backoffMs(entry.manifest, row.attempts + 1),
+        Date.now() + this.backoffMs(entry.manifest, row.poll_attempts + 1),
         row.id,
       );
       if (!row.notified_at)
@@ -1787,7 +1970,7 @@ export class PendingJobs {
         return false;
       }
       const max = entry.manifest.poll?.maxAttempts ?? MAX_LIST_FAILURES;
-      if (row.attempts >= max)
+      if (row.poll_attempts >= max)
         this.expireTerminal(
           row,
           "provider_timeout",
@@ -1870,11 +2053,11 @@ export class PendingJobs {
       if (row.run_id && observe.tool) {
         const built = this.readInput(observe.args ?? {}, row, entry);
         if (!built.ok) return { error: built.error };
-        const executed = await gateway.callDirect(
-          this.executorServer(),
-          "execute",
-          { code: sandboxCall(observe.tool, built.input) },
-          { signal: AbortSignal.timeout(this.readTimeoutMs()) },
+        const executed = await this.readJob(
+          gateway.callDirect.bind(gateway),
+          entry.manifest,
+          observe.tool,
+          built.input,
         );
         const payload = programResult(executed);
         const run =
@@ -1901,11 +2084,11 @@ export class PendingJobs {
         return { error: "sem job_id e sem ferramenta de reconciliação" };
       const built = this.readInput(reconcile.args, row, entry);
       if (!built.ok) return { error: built.error };
-      const executed = await gateway.callDirect(
-        this.executorServer(),
-        "execute",
-        { code: sandboxCall(reconcile.tool, built.input) },
-        { signal: AbortSignal.timeout(this.readTimeoutMs()) },
+      const executed = await this.readJob(
+        gateway.callDirect.bind(gateway),
+        entry.manifest,
+        reconcile.tool,
+        built.input,
       );
       const window = Date.now() - (reconcile.windowMinutes ?? 15) * 60_000;
       const candidates = runsOf(programResult(executed), entry.manifest).filter(
@@ -1935,9 +2118,11 @@ export class PendingJobs {
     row: PendingJob,
     entry: JobTool,
     template: unknown,
+    step: string,
   ): Promise<Record<string, unknown> | undefined> {
     const built = this.readInput(template, row, entry);
     if (built.ok) return built.input;
+    this.logPollError(row, step, built.error);
     await this.failInput(row, built.error);
     return undefined;
   }
@@ -1980,6 +2165,41 @@ export class PendingJobs {
     const message =
       error instanceof Error ? error.message : String(error ?? "");
     return message.trim().slice(0, 300) || "erro desconhecido";
+  }
+
+  /**
+   * One line for each counted poll error. The tick summary stays; this is the
+   * reason it was missing. Secrets and tokens are not written.
+   */
+  private logPollError(row: PendingJob, step: string, error: unknown) {
+    console.error(
+      `jobs_poller: error job=${row.id} manifest=${this.rowPath(row)} step=${step} error=${this.publicError(error)}`,
+    );
+  }
+
+  /**
+   * A missing status (the job never started) is retried through the grace
+   * notice, then closed once the job timeout has passed. A transient read
+   * failure stays open so a later read can still deliver.
+   */
+  private endIfTimedOut(row: PendingJob, error: unknown) {
+    if (Date.now() - row.created_at <= this.timeoutMs()) return;
+    this.expireTerminal(row, "provider_timeout", this.publicError(error));
+  }
+
+  /** Operator log text: one line, about 200 characters, no credentials. */
+  private publicError(error: unknown) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : typeof error === "string"
+          ? error
+          : formatExecutorError(error) || String(error ?? "");
+    const flat = message.replace(/\s+/g, " ").trim();
+    const hidden = redactLogSecrets(this.app.options.redact?.(flat) ?? flat);
+    const text = hidden.trim();
+    if (!text) return "erro desconhecido";
+    return text.length > LOG_ERROR_MAX ? text.slice(0, LOG_ERROR_MAX) : text;
   }
 
   /** A failed read only becomes a notice after the timeout, and never for a terminal run. */
@@ -2079,6 +2299,29 @@ export class PendingJobs {
   /** Stable per job; a re-delivery of the same job is the same request. */
   private dedupeFor(row: PendingJob) {
     return `job:${row.id}:${row.run_id ?? "unknown"}`;
+  }
+  /**
+   * True when this completion request belongs to a job a person started.
+   * A schedule that dispatched the job stays on the silence rule.
+   */
+  userDispatched(requestId: string) {
+    const id = /^job:(\d+):/.exec(requestId)?.[1];
+    if (!id) return false;
+    this.ensure();
+    const origin = this.app.store.get<{ origin_source: string | null }>(
+      "SELECT origin_source FROM pending_jobs WHERE id=?",
+      Number(id),
+    )?.origin_source;
+    return origin === "telegram" || origin === "web";
+  }
+  /** Source of the turn that is dispatching, while that request is still pending. */
+  private requester(conversationId: string) {
+    return (
+      this.app.store.get<{ source: string }>(
+        "SELECT source FROM requests WHERE conversationId=? AND status='pending' ORDER BY rowid DESC LIMIT 1",
+        conversationId,
+      )?.source ?? null
+    );
   }
   /** Webhook entry point: an event converges on the same delivery path as a poll. */
   notify(payload: unknown) {
@@ -2275,13 +2518,13 @@ export class PendingJobs {
       );
       return true;
     }
-    const attempts = row.attempts + 1;
+    const attempts = row.delivery_attempts + 1;
     const entry = this.match(row.integration, row.tool);
-    const manifest = entry?.manifest ?? BUILTIN[0];
+    const manifest = entry?.manifest ?? DELIVERY_BACKOFF;
     if (attempts >= MAX_ATTEMPTS) {
-      // The same crash can repeat; a row that never delivers must stop, not loop.
+      // Poll failures do not spend this budget. Only a rejected delivery does.
       this.app.store.run(
-        `UPDATE pending_jobs SET attempts=?,delivered_at=?,outcome='expired',
+        `UPDATE pending_jobs SET delivery_attempts=?,delivered_at=?,outcome='expired',
            last_error=? WHERE id=?`,
         attempts,
         now,
@@ -2295,7 +2538,7 @@ export class PendingJobs {
     }
     const retryMs = this.backoffMs(manifest, attempts);
     this.app.store.run(
-      "UPDATE pending_jobs SET attempts=?,last_error=?,next_poll_at=? WHERE id=?",
+      "UPDATE pending_jobs SET delivery_attempts=?,last_error=?,next_poll_at=? WHERE id=?",
       attempts,
       "delivery_failed",
       now + retryMs,
@@ -2521,21 +2764,6 @@ function programResult(result: unknown) {
   return undefined;
 }
 
-function statusWord(value: unknown) {
-  return String(value ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/[\s-]+/g, "_");
-}
-
-function approvalId(body: Record<string, unknown>) {
-  for (const key of ["requestId", "executionId"]) {
-    const value = body[key];
-    if (typeof value === "string" && value.trim()) return value.trim();
-  }
-  return "";
-}
-
 /** Executor envelope `{status, execution}`. Its status is not a job state. */
 function isExecutorEnvelope(
   value: unknown,
@@ -2543,6 +2771,18 @@ function isExecutorEnvelope(
   const body = asRecord(value);
   const execution = asRecord(body?.execution);
   return !!body && !!execution && typeof body.status === "string";
+}
+
+/** Shapes that must never reach a poll-error line. Applied after known values. */
+function redactLogSecrets(text: string) {
+  return text
+    .replace(/Bearer\s+\S+/gi, "[REDACTED]")
+    .replace(/\bsk-[\w-]{8,}/gi, "[REDACTED]")
+    .replace(/\b\d{6,}:[A-Za-z0-9_-]{20,}\b/g, "[REDACTED]")
+    .replace(
+      /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|authorization|token)\s*[=:]\s*\S+/gi,
+      "[REDACTED]",
+    );
 }
 
 function notFoundText(message: string) {

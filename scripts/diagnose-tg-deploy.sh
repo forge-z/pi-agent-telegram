@@ -71,8 +71,9 @@ fi
 
 section "Dicas rápidas"
 cat <<'EOF'
+- TELEGRAM_BOT_TOKEN e TELEGRAM_ALLOWED_USERS são opcionais: `npm run setup` grava os dois no volume. Se estiverem no ambiente, vencem o volume.
 - TELEGRAM_ALLOWED_CHATS é opcional (omita em DM; supergrupo = negativo, ex. -100…).
-- TELEGRAM_ALLOWED_USERS = user ID de quem controla o bot (@userinfobot no privado).
+- User ID de quem controla o bot (@userinfobot no privado) entra no setup, ou em TELEGRAM_ALLOWED_USERS como override.
 - Chat privado: CHATS pode ser o mesmo ID positivo do seu usuário.
 - npm run setup é o assistente completo (provedor, visão e áudio). npm run login é só OAuth (device-code: npm run login -- openai-codex --device-code). Os dois gravam no volume; LLM_* no ambiente vence.
 - LLM_BASE_URL + LLM_API_KEY continuam válidos e vencem o volume, mas não são obrigatórios depois do setup.

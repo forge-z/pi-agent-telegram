@@ -789,7 +789,7 @@ test("admission failure sends a generic deduplicated notification without leakin
     assert.equal(run.state, "failed");
     await f.engine().flush();
     assert.equal(f.sent.length, 1);
-    assert.match(f.sent[0]!.text, /não pôde iniciar/);
+    assert.match(f.sent[0]!.text, /could not start/);
     assert.doesNotMatch(f.sent[0]!.text, /private-secret-sentinel/);
     await f.reopen();
     await f.tasks.tick();
@@ -816,7 +816,7 @@ test(
       assert.equal(run.state, "failed");
       await f.engine().flush();
       assert.equal(f.sent.length, 1);
-      assert.match(f.sent[0]!.text, /não foi concluída/);
+      assert.match(f.sent[0]!.text, /did not finish/);
       assert.doesNotMatch(f.sent[0]!.text, /private-provider-secret-sentinel/);
       await f.reopen();
       await f.tasks.tick();
@@ -1050,8 +1050,8 @@ test("notify with invisible text is refused and sends nothing", async () => {
     const transcript = JSON.stringify(
       (await (await f.app.conversation(f.id)).context(context)).messages,
     );
-    assert.match(transcript, /ficou vazio/);
-    assert.match(transcript, /Nada foi enviado/);
+    assert.match(transcript, /was empty/);
+    assert.match(transcript, /Nothing was sent/);
   } finally {
     await f.close();
   }

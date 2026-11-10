@@ -217,8 +217,8 @@ function taskRoute(store: Store, conversationId: string, task: TaskDelivery) {
     ? null
     : (task.destinationReason ??
       (frozen
-        ? "Vínculo Telegram revogado antes do envio."
-        : "Destino legado não comprovado. Selecione o destino para execuções futuras."));
+        ? "Telegram link revoked before send."
+        : "Legacy destination was not proven. Select the destination for future runs."));
   return { route, reason };
 }
 
@@ -256,7 +256,7 @@ export function queueNotify(
   replyTo?: number,
 ) {
   if (isBlankMessage(text))
-    return "notify recusou o texto: depois de remover espaços e caracteres invisíveis ele ficou vazio. Nada foi enviado.";
+    return "notify refused the text: after removing spaces and invisible characters it was empty. Nothing was sent.";
   const task = taskDelivery(store, conversationId, requestId);
   const source = store.get<{ source: string }>(
     "SELECT source FROM requests WHERE conversationId=? AND requestId=?",
@@ -264,19 +264,18 @@ export function queueNotify(
     requestId,
   )?.source;
   if (source === "task" && !task)
-    return "Não há ocorrência de agendamento para esta chamada. Nada foi enviado.";
+    return "There is no schedule occurrence for this call. Nothing was sent.";
   if (task?.delivery === "none")
-    return "Este agendamento não envia mensagens. Nada foi enviado.";
+    return "This schedule does not send messages. Nothing was sent.";
   if (task?.delivery === "web")
-    return "Este agendamento não tem destino no Telegram. Nada foi enviado.";
+    return "This schedule has no Telegram destination. Nothing was sent.";
   const resolved = task ? taskRoute(store, conversationId, task) : undefined;
   const route =
     resolved?.route ??
     (!task ? telegramConversationRoute(store, conversationId) : undefined);
   if (!route) {
     const reason =
-      resolved?.reason ??
-      "Esta conversa não está vinculada a um chat do Telegram.";
+      resolved?.reason ?? "This conversation is not linked to a Telegram chat.";
     if (task) rememberRouteError(store, requestId, reason);
     return `${reason} Nada foi enviado.`;
   }
@@ -307,7 +306,7 @@ export function queueNotify(
       existing.state !== "sent"
     ) {
       store.db.exec("RELEASE SAVEPOINT notify_delivery");
-      return "O destino deste agendamento não aceita mensagens. Nada foi enviado.";
+      return "This schedule's destination does not accept messages. Nothing was sent.";
     }
     const reply = acceptedReplyTo(store, route.chat, replyTo);
     store.queueTelegram(
@@ -317,7 +316,6 @@ export function queueNotify(
       3500,
       conversationId,
       route.messageThreadId,
-      undefined,
       undefined,
       reply,
     );
@@ -335,7 +333,7 @@ export function queueNotify(
     throw error;
   }
   if (!runNotified(store, conversationId, requestId))
-    return "notify não enviou: o texto não produziu mensagem. Nada foi enviado.";
+    return "notify did not send: the text produced no message. Nothing was sent.";
   return;
 }
 

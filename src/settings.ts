@@ -116,13 +116,13 @@ export class Settings {
     // MODEL_PROVIDER/MODEL_ID leaving the environment must not leave live
     // conversations without a model: fall back to the first catalog entry.
     if (!modelId)
-      throw new SettingsError("Nenhum modelo disponível. Rode npm run setup.");
+      throw new SettingsError("No model available. Run npm run setup.");
     const model = this.app.models.getModel(provider, modelId);
     // The stored setup is a bootstrap, so a model it names must exist: failing here is
     // better than silently running another one.
     if (this.app.options.modelId && !model)
       throw new SettingsError(
-        `O modelo ${this.app.options.modelId} do setup não está no catálogo do provedor. Rode npm run setup.`,
+        `The setup model ${this.app.options.modelId} is not in the provider catalog. Run npm run setup.`,
       );
     const wanted = this.app.options.effort;
     const levels = model ? getSupportedThinkingLevels(model) : [];
@@ -159,19 +159,19 @@ export class Settings {
       typeof value.modelId !== "string" ||
       typeof value.effort !== "string"
     )
-      throw new SettingsError("Escolha provider, modelo e esforço");
+      throw new SettingsError("Choose a provider, model, and effort");
     const model = this.app.models.getModel(provider, value.modelId);
     if (
       !model ||
       !this.catalog(provider).some((entry) => entry.id === value.modelId)
     )
-      throw new SettingsError("Modelo não disponível no catálogo do Pi");
+      throw new SettingsError("Model not available in the Pi catalog");
     if (
       !getSupportedThinkingLevels(model).includes(
         value.effort as ModelThinkingLevel,
       )
     )
-      throw new SettingsError("Esforço não suportado por este modelo");
+      throw new SettingsError("Effort not supported by this model");
     return {
       provider,
       modelId: value.modelId,
@@ -215,7 +215,7 @@ export class Settings {
       )
         return undefined;
       const current = this.defaults();
-      return `Aviso: nenhum modelo padrão foi escolhido; usando ${current.provider}/${current.modelId} com esforço ${current.effort}. Ajuste com /model e /thinking, ou defina o padrão no terminal do container com npm run setup.`;
+      return `Notice: no default model was chosen; using ${current.provider}/${current.modelId} with effort ${current.effort}. Change it with /model and /thinking, or set the default in the container terminal with npm run setup.`;
     } catch {
       /* A missing or removed catalog must not block the reply path. */
       return undefined;
@@ -258,7 +258,7 @@ export class Settings {
         )
       )
         throw new SettingsError(
-          "Aguarde a conversa concluir antes de mudar provider, modelo e esforço",
+          "Wait for the conversation to finish before changing provider, model, and effort",
         );
       // Native controls recheck their owner and original selection under the
       // same settings lock, after asynchronous inspections and before configure.

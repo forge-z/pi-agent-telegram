@@ -76,6 +76,22 @@ if [ -f "$WORK_DIR/package-lock.json" ]; then
   (cd "$WORK_DIR" && npm ci) > "$JOB_DIR/npm-ci.log" 2>&1 || fail "Falha no npm ci em $REPO"
 fi
 
+# Clone already used the real credentials. A logged-in gh ignores an unset token
+# and falls back to ~/.config/gh, so point it at an empty directory too.
+if [ "${JOB_READONLY:-}" = "1" ]; then
+  unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN
+  export GH_CONFIG_DIR="$JOB_DIR/gh-readonly"
+  mkdir -p "$GH_CONFIG_DIR"
+  export GIT_TERMINAL_PROMPT=0
+  git -C "$WORK_DIR" config --local --unset-all credential.helper >/dev/null 2>&1 || true
+  case "$PROMPT" in
+    *"não faça push"*) ;;
+    *) PROMPT="${PROMPT}
+
+Somente leitura: não faça push, não abra pull requests e não comente." ;;
+  esac
+fi
+
 # Executa agente pedido com timeout de 20 min (1200 segundos) e stdin de /dev/null
 set +e
 case "$AGENT" in
@@ -104,20 +120,22 @@ elif [ "$AGENT_EXIT" -ne 0 ]; then
 fi
 
 PR_URL=""
-# Verifica se há alterações para commitar e criar PR
-if [ -n "$(git -C "$WORK_DIR" status --porcelain)" ]; then
-  git -C "$WORK_DIR" add -A > "$JOB_DIR/git.log" 2>&1
-  COMMIT_MSG="feat(agent): tarefa $JOB_ID"
-  git -C "$WORK_DIR" commit -m "$COMMIT_MSG" >> "$JOB_DIR/git.log" 2>&1 || true
-fi
+if [ "${JOB_READONLY:-}" != "1" ]; then
+  # Verifica se há alterações para commitar e criar PR
+  if [ -n "$(git -C "$WORK_DIR" status --porcelain)" ]; then
+    git -C "$WORK_DIR" add -A > "$JOB_DIR/git.log" 2>&1
+    COMMIT_MSG="feat(agent): tarefa $JOB_ID"
+    git -C "$WORK_DIR" commit -m "$COMMIT_MSG" >> "$JOB_DIR/git.log" 2>&1 || true
+  fi
 
-# Se a branch local estiver à frente da origin, faz push normal e cria PR
-LOCAL_REV=$(git -C "$WORK_DIR" rev-parse HEAD 2>/dev/null || true)
-REMOTE_REV=$(git -C "$WORK_DIR" rev-parse "origin/$BRANCH" 2>/dev/null || true)
+  # Se a branch local estiver à frente da origin, faz push normal e cria PR
+  LOCAL_REV=$(git -C "$WORK_DIR" rev-parse HEAD 2>/dev/null || true)
+  REMOTE_REV=$(git -C "$WORK_DIR" rev-parse "origin/$BRANCH" 2>/dev/null || true)
 
-if [ "$LOCAL_REV" != "$REMOTE_REV" ] && [ -n "$LOCAL_REV" ]; then
-  git -C "$WORK_DIR" push -u origin "$BRANCH" >> "$JOB_DIR/git.log" 2>&1 || fail "Falha ao enviar branch $BRANCH para origin"
-  PR_URL=$(cd "$WORK_DIR" && gh pr create --fill --head "$BRANCH" 2>> "$JOB_DIR/git.log" || gh pr view --json url -q .url 2>> "$JOB_DIR/git.log" || true)
+  if [ "$LOCAL_REV" != "$REMOTE_REV" ] && [ -n "$LOCAL_REV" ]; then
+    git -C "$WORK_DIR" push -u origin "$BRANCH" >> "$JOB_DIR/git.log" 2>&1 || fail "Falha ao enviar branch $BRANCH para origin"
+    PR_URL=$(cd "$WORK_DIR" && gh pr create --fill --head "$BRANCH" 2>> "$JOB_DIR/git.log" || gh pr view --json url -q .url 2>> "$JOB_DIR/git.log" || true)
+  fi
 fi
 
 # Grava status final DONE com JSON.stringify via node de forma atômica

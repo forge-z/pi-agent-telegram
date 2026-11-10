@@ -9,8 +9,6 @@ export type CommandAccess = {
 };
 export class CommandError extends Error {}
 export class Commands {
-  private work = new Map<string, Promise<unknown>>();
-  private inputs = new Map<string, { id: string; text: string }>();
   constructor(private app: Runtime) {}
   key(requestId: string, access: CommandAccess) {
     return `telegram:${access.chat}:${access.user}:${access.messageThreadId === undefined ? "" : `topic:${access.messageThreadId}:`}${requestId}`;
@@ -42,11 +40,8 @@ export class Commands {
       // preserve the actual error so polling can retry rather than reject it.
       this.app.telegramChats.authorize(id, access);
     if (!this.allowed(access).some((item) => item.id === id))
-      throw new CommandError("Conversa não autorizada neste chat.");
+      throw new CommandError("Conversation not authorized in this chat.");
     this.app.assertConversationAvailable(id);
-  }
-  busy(id: string) {
-    return [...this.inputs.values()].some((input) => input.id === id);
   }
   async active(access: CommandAccess) {
     const ids = new Set(this.allowed(access).map((item) => item.id));
@@ -62,8 +57,5 @@ export class Commands {
         status: record.state.status,
         phase: state.kind,
       }));
-  }
-  async close() {
-    await Promise.allSettled(this.work.values());
   }
 }

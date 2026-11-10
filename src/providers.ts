@@ -1,5 +1,5 @@
 /**
- * Compat-only hints for the generic `llm` reserve (menu "Outro") and for a
+ * Compat-only hints for the generic `llm` reserve (menu "Other") and for a
  * vision backend that still speaks OpenAI chat completions. The official chat
  * menu is the pi-ai catalog in `native-providers.ts`, not this list.
  */
@@ -37,7 +37,7 @@ export const PROVIDERS: readonly ProviderEntry[] = [
     name: "Gemini (Google AI Studio)",
     baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
     docs: "https://ai.google.dev/gemini-api/docs/openai",
-    hint: "superfície OpenAI-compatible; a raiz já inclui /v1beta/openai",
+    hint: "OpenAI-compatible surface; the root already includes /v1beta/openai",
   },
   {
     id: "openai",
@@ -56,7 +56,7 @@ export const PROVIDERS: readonly ProviderEntry[] = [
     name: "OpenCode Go",
     baseUrl: "https://opencode.ai/zen/go/v1",
     docs: "https://opencode.ai/docs/zen",
-    hint: "catálogo separado do Zen; a mesma chave pode não valer",
+    hint: "separate catalog from Zen; the same key may not apply",
   },
   {
     id: "openrouter",
@@ -66,10 +66,10 @@ export const PROVIDERS: readonly ProviderEntry[] = [
   },
   {
     id: CUSTOM_PROVIDER_ID,
-    name: "Outro (OpenAI-compatible)",
+    name: "Other (OpenAI-compatible)",
     baseUrl: "",
     docs: "",
-    hint: "informe a URL raiz, por exemplo https://meu-provedor/v1",
+    hint: "enter the base URL, for example https://my-provider/v1",
   },
 ];
 

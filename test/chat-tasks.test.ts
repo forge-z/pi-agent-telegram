@@ -80,9 +80,6 @@ test("model receives task tools and creates/lists the same durable schedule used
       assert.ok(names.includes("tasks_edit"));
       assert.ok(names.includes("tasks_set_enabled"));
       assert.ok(names.includes("tasks_runs"));
-      assert.equal(names.includes("tasks_set_delivery"), false);
-      assert.equal(names.includes("mcp_read"), false);
-      assert.equal(names.includes("propose_action"), false);
       // The model needs to see that sending a file is possible at all.
       assert.ok(names.includes("send_attachment"));
       return fauxAssistantMessage(
@@ -178,8 +175,6 @@ test("direct MCP refresh preserves internal agenda tools in the actual model req
       name: "executor",
       mode: "direct",
       url: `http://127.0.0.1:${address.port}/mcp`,
-      readTools: [],
-      actionTools: [],
     },
   ]);
   const faux = fauxProvider();
@@ -189,9 +184,6 @@ test("direct MCP refresh preserves internal agenda tools in the actual model req
       const names = getCurrentTools(transcript.messages).map(
         (tool) => tool.name,
       );
-      assert.equal(names.includes("propose_action"), false);
-      assert.equal(names.includes("mcp_read"), false);
-      assert.equal(names.includes("tasks_set_delivery"), false);
       for (const name of [directName, "tasks_list", "tasks_create"])
         assert.ok(names.includes(name), `${name} absent`);
       return fauxAssistantMessage(

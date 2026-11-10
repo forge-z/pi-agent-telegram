@@ -1,6 +1,7 @@
 import {
   queueMcpApprovals,
   queueMcpUncertainNotices,
+  sweepMcpApprovals,
   decideMcp,
   queueMcpChecks,
   verifyMcp,
@@ -30,6 +31,7 @@ import { MAX_TEXT } from "./limits.js";
 import {
   ConversationBusyError,
   ConversationError,
+  isRetryableError,
   type Runtime,
 } from "./runtime.js";
 import { resolveFunctions } from "./functions.js";
@@ -130,14 +132,14 @@ type ImageRef = { fileId: string; mimeType: string; size?: number };
 function describeFailure(error: unknown) {
   const message = error instanceof Error ? error.message : "";
   return /^vision \d{3}$/.test(message)
-    ? `resposta ${message.slice(-3)}`
-    : "falha ao descrever";
+    ? `response ${message.slice(-3)}`
+    : "could not describe the image";
 }
 /** Same rule for transcription: a status code, never the provider body. */
 function transcribeFailure(error: unknown) {
   const message = error instanceof Error ? error.message : "";
   const status = /(\d{3})$/.exec(message)?.[1];
-  return status ? `resposta ${status}` : "falha na transcrição";
+  return status ? `response ${status}` : "transcription failed";
 }
 function originHeader(label: string, value: Record<string, unknown>) {
   return `[${label} · ${JSON.stringify(value)}]`;
@@ -361,8 +363,7 @@ export class TelegramHttp implements TelegramTransport {
       },
     );
     const result = (await response.json()) as { ok?: boolean };
-    if (!response.ok || !result.ok)
-      throw new Error("Falha na entrega Telegram");
+    if (!response.ok || !result.ok) throw new Error("Telegram delivery failed");
     return result;
   }
 }
@@ -372,21 +373,38 @@ export class TelegramSendRefused extends Error {
     readonly code: number,
     readonly retryAfter = 0,
   ) {
-    super(`Telegram recusou o envio (código ${code}).`);
+    super(`Telegram refused the send (code ${code}).`);
   }
 }
 const CLEAN_HELP = [
-  "/model — provedor e modelo",
-  "/thinking — esforço",
-  "/crons — criar e gerenciar agendamentos",
-  "/stop — interromper este tópico",
-  "/status — estado",
-  "/reload — dispensar resultado MCP incerto desta conversa (histórico intacto; /destravar também)",
-  "/new — outra conversa neste tópico (a anterior permanece)",
-  "/resume — executar de novo uma tarefa estacionada por quedas (/retomar também)",
-  "/help — ajuda",
-  "Cada tópico nativo tem histórico próprio. Crie tópicos no Telegram. Escolhas de modelo persistem após reinício. Compactação automática usa o modelo e esforço ativos.",
+  "/model — provider and model",
+  "/thinking — effort",
+  "/crons — create and manage schedules",
+  "/new — another conversation in this topic (the previous one stays)",
+  "/resume — resume a stuck task (a crash-parked task, or an uncertain MCP result)",
+  "/stop — stop this topic",
+  "/status — status",
+  "/help — help",
+  "Each native topic has its own history. Create topics in Telegram. Model choices persist after a restart. Automatic compaction uses the active model and effort.",
 ].join("\n");
+
+/** One reply for /resume: parked work, an uncertain MCP result, both, or neither. */
+function resumeReport(
+  cleared: number,
+  resumed: { id: string; kind: string }[],
+) {
+  const parts: string[] = [];
+  if (cleared)
+    parts.push(
+      `${cleared} uncertain MCP result(s) in this conversation dismissed. History was not changed. The call may already have been executed (for example, an email may have gone out) before the agent continues.`,
+    );
+  if (resumed.length)
+    parts.push(
+      `Resumed ${resumed.map((task) => `${task.kind} #${task.id}`).join(", ")}.`,
+    );
+  return parts.join("\n") || "Nothing is pending in this topic.";
+}
+
 export class Telegram {
   private closing = false;
   private sendAfter = 0;
@@ -413,7 +431,7 @@ export class Telegram {
     this.credentialBinding = hash(credential?.value ?? "");
     this.botUsername = botUsername?.trim().replace(/^@/, "") || undefined;
     if (this.botUsername && !/^[a-zA-Z0-9_]{5,32}$/.test(this.botUsername))
-      throw new Error("TELEGRAM_BOT_USERNAME deve ser o username do bot");
+      throw new Error("TELEGRAM_BOT_USERNAME must be the bot username");
   }
   private commandText(raw: string) {
     const start = raw.trimStart();
@@ -459,7 +477,7 @@ export class Telegram {
     );
     if (saved && saved.value !== fingerprint)
       throw new TelegramInputError(
-        "update_id já utilizado com conteúdo diferente",
+        "update_id already used with different content",
       );
     return { key, fingerprint, seen: !!saved };
   }
@@ -474,7 +492,7 @@ export class Telegram {
     );
     if (prior && prior.value !== fingerprint)
       throw new TelegramInputError(
-        "update_id já utilizado com conteúdo diferente",
+        "update_id already used with different content",
       );
     const message = query.message;
     const answer = async (text: string) => {
@@ -512,7 +530,7 @@ export class Telegram {
     );
     if (!saved) {
       await answer(
-        "Botão indisponível. Use /model, /thinking, /crons ou /status novamente.",
+        "Button unavailable. Use /model, /thinking, /crons, or /status again.",
       );
       return { ignored: true };
     }
@@ -535,7 +553,7 @@ export class Telegram {
       (this.privateDm && !this.controlRoute(origin)) ||
       (this.botId && message.from?.id !== this.botId)
     ) {
-      await answer("Botão expirado ou não autorizado.");
+      await answer("Button expired or not authorized.");
       return { ignored: true };
     }
     try {
@@ -554,7 +572,7 @@ export class Telegram {
           data.owner.messageThreadId ?? null,
         )
       )
-        throw new CommandError("Tópico fechado no estado observado.");
+        throw new CommandError("Topic is closed in the observed state.");
       this.app.store.run(
         "INSERT OR IGNORE INTO meta VALUES (?,?)",
         identity.key,
@@ -563,8 +581,8 @@ export class Telegram {
       if (data.used) {
         await answer(
           data.kind === "model"
-            ? "Este controle já foi processado. Use /model novamente."
-            : "Este controle já foi processado. Use /crons ou /status.",
+            ? "This control was already handled. Use /model again."
+            : "This control was already handled. Use /crons or /status.",
         );
         return { processed: true };
       }
@@ -586,7 +604,7 @@ export class Telegram {
       );
       if (data.kind === "mcp-check") {
         await verifyMcp(this.app, data, message.message_id);
-        await answer("Verificação atualizada.");
+        await answer("Verification updated.");
       } else if (data.kind === "mcp") {
         const work = decideMcp(this.app, data, message.message_id);
         this.approvalWork.add(work);
@@ -597,11 +615,11 @@ export class Telegram {
               `telegram:mcp-error:${data.interactionId}`,
               data.owner,
               data.conversationId,
-              "A decisão não foi concluída. Verifique /status e o serviço externo. A chamada não será repetida automaticamente.",
+              "The decision did not finish. Check /status and the external service. The call will not be repeated automatically.",
             ),
           )
           .finally(() => this.approvalWork.delete(work));
-        await answer("Decisão recebida; acompanhe o resultado neste tópico.");
+        await answer("Decision received; follow the result in this topic.");
       } else if (data.kind === "cron") {
         await handleCronMenu(
           this.app,
@@ -623,7 +641,7 @@ export class Telegram {
               (this.privateDm && !this.controlRoute(origin))
             )
               throw new SettingsError(
-                "Conexão Telegram mudou. Use /model novamente.",
+                "The Telegram connection changed. Use /model again.",
               );
           },
         );
@@ -638,10 +656,10 @@ export class Telegram {
         error instanceof ConversationError
           ? error.message
           : data.kind === "cron"
-            ? "Operação não concluída. Use /crons novamente; este controle não será repetido automaticamente."
+            ? "Operation did not finish. Use /crons again; this control will not be repeated automatically."
             : data.kind === "model"
-              ? "Seleção não concluída. Use /model novamente; este controle não será repetido automaticamente."
-              : "Controle não concluído. Consulte /status; a chamada não será repetida automaticamente.";
+              ? "Selection did not finish. Use /model again; this control will not be repeated automatically."
+              : "Control did not finish. Check /status; the call will not be repeated automatically.";
       await answer(text);
       return { error: text, control: true };
     }
@@ -719,7 +737,7 @@ export class Telegram {
           this.app.store.queueTelegram(
             `telegram:clean:${update.update_id}`,
             chat,
-            "Anexo recebido, mas por enquanto só leio imagens (foto ou JPEG/PNG/WebP/GIF) e recados de voz.",
+            "Attachment received, but for now I only read images (photo or JPEG/PNG/WebP/GIF) and voice notes.",
             3500,
             undefined,
             messageThreadId,
@@ -734,7 +752,7 @@ export class Telegram {
         )
       )
         throw new TelegramInputError(
-          "update_id já utilizado com conteúdo diferente",
+          "update_id already used with different content",
         );
       try {
         this.app.telegramChats.creationAuthority(owner);
@@ -762,9 +780,9 @@ export class Telegram {
     const command =
       image || voice ? undefined : this.commandText(message.text ?? "");
     const text = image
-      ? message.caption?.trim() || "[imagem]"
+      ? message.caption?.trim() || "[image]"
       : voice
-        ? "[áudio]"
+        ? "[audio]"
         : command === "/crons"
           ? command
           : cronReplyReceipt(this.app, owner, message)
@@ -800,11 +818,11 @@ export class Telegram {
           previous.fingerprint === fingerprint);
     if (previous && previous.fingerprint !== fingerprint && !legacyReplay)
       throw new TelegramInputError(
-        "update_id já utilizado com conteúdo diferente",
+        "update_id already used with different content",
       );
     if (legacy && legacy.replayFingerprint !== null && !legacyReplay)
       throw new TelegramInputError(
-        "update_id já utilizado com conteúdo diferente",
+        "update_id already used with different content",
       );
     this.app.store.run(
       "INSERT OR IGNORE INTO meta VALUES (?,?)",
@@ -974,7 +992,7 @@ export class Telegram {
         : text;
       if (request.text !== escaped)
         throw new TelegramInputError(
-          "update_id já utilizado com conteúdo diferente",
+          "update_id already used with different content",
         );
       authorize(request.conversationId);
       // Runtime.open reattaches/submits durable requests using their original
@@ -1080,7 +1098,7 @@ export class Telegram {
   ) {
     // /new has to run before ensure(): a stuck topic receipt throws there, which is
     // the case this command exists to leave behind. It does not rewrite into /topics.
-    if (/^\/(?:new|nova)(?:\s|$)/.test(text)) {
+    if (/^\/new(?:\s|$)/.test(text)) {
       try {
         const created = await this.app.telegramChats.startFresh(owner);
         queueControl(
@@ -1088,7 +1106,7 @@ export class Telegram {
           `telegram:clean:${updateId}`,
           owner,
           created,
-          "Conversa nova neste tópico. A anterior permanece no volume e o histórico não foi apagado. Resultados MCP incertos não foram dispensados; use /reload para isso.",
+          "New conversation in this topic. The previous one stays on the volume and its history was not deleted. Uncertain MCP results were not dismissed; use /resume for that.",
         );
         return { conversationId: created, control: true };
       } catch (error) {
@@ -1162,12 +1180,12 @@ export class Telegram {
             .filter((i) => i.state === "pending").length ?? 0;
         const ledger =
           calls.map((c) => `${c.server} / ${c.tool}: ${c.state}`).join("\n") ||
-          "Nenhuma chamada pendente ou incerta.";
+          "No pending or uncertain calls.";
         // The warning only means something when there is an uncertain call to verify.
         const uncertain =
           calls.length === 0
             ? ""
-            : "Se houver resultado incerto, verifique o serviço externo; a chamada não será repetida. /stop encerra esperas locais; efeitos externos exigem verificação.";
+            : "If a result is uncertain, check the external service; the call will not be repeated. /stop ends local waits; external effects need verification.";
         const functions = resolveFunctions(
           process.env,
           this.app.settings.setup(),
@@ -1175,15 +1193,15 @@ export class Telegram {
         );
         reply(
           [
-            "Modelos:",
+            "Models:",
             // Effort belongs to the text model, so it rides on its line.
-            `Texto: ${settings.modelId} · Esforço: ${settings.effort}`,
-            `Visão: ${this.featureLabel(functions.vision, this.mainSeesImages() ? "mesmo do chat" : "desativado")}`,
-            `Áudio: ${this.featureLabel(functions.audio, "desativado")}`,
+            `Text: ${settings.modelId} · Effort: ${settings.effort}`,
+            `Vision: ${this.featureLabel(functions.vision, this.mainSeesImages() ? "same as chat" : "off")}`,
+            `Audio: ${this.featureLabel(functions.audio, "off")}`,
             "",
-            `Execuções neste tópico: ${active.length} · Aprovações pendentes: ${pending}`,
+            `Runs in this topic: ${active.length} · Pending approvals: ${pending}`,
             "",
-            "Registro MCP:",
+            "MCP ledger:",
             ledger,
             ...(uncertain ? ["", uncertain] : []),
             "",
@@ -1193,33 +1211,24 @@ export class Telegram {
             "",
             this.app.pendingJobs.healthLine(),
             "",
-            `Versão: ${info.version ?? "dev"} (${info.commit ?? "sem SHA"})`,
-            "Compactação automática: modelo e esforço ativos desta conversa.",
+            `Version: ${info.version ?? "dev"} (${info.commit ?? "no SHA"})`,
+            "Automatic compaction: this conversation's active model and effort.",
           ].join("\n"),
         );
         queueMcpChecks(this.app, owner, id, updateId);
-      } else if (text === "/resume" || text === "/retomar") {
-        const resumed = await this.app.resumeParked(id);
-        reply(
-          resumed.length
-            ? `Retomei ${resumed.map((task) => `${task.kind} #${task.id}`).join(", ")}.`
-            : "Nenhuma tarefa estacionada nesta conversa.",
-        );
-      } else if (text === "/reload" || text === "/destravar") {
-        // Clears uncertain MCP results only. It does not start a conversation.
+      } else if (text === "/resume") {
+        // Dismiss uncertain MCP first, then continue a crash-parked task.
+        // One reply covers whichever of those was actually pending.
         const cleared = this.app.telegramChats.reload(owner);
-        reply(
-          cleared
-            ? `${cleared} resultado(s) MCP incerto(s) desta conversa dispensado(s). O histórico não foi alterado.`
-            : "Nenhum resultado MCP incerto pendente. Nada foi apagado.",
-        );
+        const resumed = await this.app.resumeParked(id);
+        reply(resumeReport(cleared, resumed));
       } else if (text === "/help" || text === "/start") reply(CLEAN_HELP);
       else if (
         text.startsWith("/") &&
         !text.startsWith("//") &&
         command !== "stop"
       )
-        reply("Comando desconhecido. Use /help.");
+        reply("Unknown command. Use /help.");
       else {
         if (command === "stop") this.app.mcpCalls?.cancelConversation(id);
         const notice = this.app.settings.pendingModelNotice(id);
@@ -1238,7 +1247,7 @@ export class Telegram {
             `telegram:busy:${updateId}`,
             owner,
             id,
-            "Recebi, vou considerar no que estou fazendo. /stop cancela.",
+            "Got it. I will take that into account. /stop cancels.",
           );
           void this.flush();
         }
@@ -1287,6 +1296,8 @@ export class Telegram {
         );
       }
     } catch (error) {
+      // Temporary service state: polling keeps the receipt pending and retries.
+      if (isRetryableError(error)) throw error;
       if (error instanceof SettingsError || error instanceof CommandError)
         reply(error.message);
       else throw error;
@@ -1342,31 +1353,31 @@ export class Telegram {
       if (Array.isArray(loaded))
         return {
           images: loaded,
-          text: `${originHeader("imagem", { origin: "image", model: this.chatModelId() })}\n${caption}`,
+          text: `${originHeader("image", { origin: "image", model: this.chatModelId() })}\n${caption}`,
         };
       return {
-        text: `${originHeader("imagem", { origin: "image", error: loaded.error })}\n${caption}`,
+        text: `${originHeader("image", { origin: "image", error: loaded.error })}\n${caption}`,
       };
     }
     if (vision) {
       const loaded = await this.loadImage(image);
       if (!Array.isArray(loaded))
         return {
-          text: `${originHeader("imagem", { origin: "image", error: loaded.error })}\n${caption}`,
+          text: `${originHeader("image", { origin: "image", error: loaded.error })}\n${caption}`,
         };
       try {
         const description = await describeImage(vision, loaded[0]);
         return {
-          text: `${originHeader("imagem: descrição automática", { origin: "image", model: vision.modelId })}\n${caption}\n${description}`,
+          text: `${originHeader("image: automatic description", { origin: "image", model: vision.modelId })}\n${caption}\n${description}`,
         };
       } catch (error) {
         return {
-          text: `${originHeader("imagem", { origin: "image", error: describeFailure(error) })}\n${caption}`,
+          text: `${originHeader("image", { origin: "image", error: describeFailure(error) })}\n${caption}`,
         };
       }
     }
     return {
-      text: `${originHeader("imagem", { origin: "image", error: "nenhum modelo lê imagens (defina VISION_MODEL)" })}\n${caption}`,
+      text: `${originHeader("image", { origin: "image", error: "no model reads images (set VISION_MODEL)" })}\n${caption}`,
     };
   }
 
@@ -1383,32 +1394,32 @@ export class Telegram {
     );
     if (!audio)
       return {
-        text: originHeader("áudio", {
+        text: originHeader("audio", {
           origin: "audio",
-          error: "nenhum modelo transcreve (defina AUDIO_MODEL)",
+          error: "no model transcribes audio (set AUDIO_MODEL)",
         }),
       };
     if ((voice.size ?? 0) > MAX_VOICE_BYTES)
       return {
-        text: originHeader("áudio", {
+        text: originHeader("audio", {
           origin: "audio",
-          error: "áudio acima do limite de 10 MB",
+          error: "audio exceeds the 10 MB limit",
         }),
       };
     if (!this.transport.downloadFile)
       return {
-        text: originHeader("áudio", {
+        text: originHeader("audio", {
           origin: "audio",
-          error: "este ambiente não consegue baixar anexos",
+          error: "this environment cannot download attachments",
         }),
       };
     try {
       const { data } = await this.transport.downloadFile(voice.fileId);
       if (data.byteLength > MAX_VOICE_BYTES)
         return {
-          text: originHeader("áudio", {
+          text: originHeader("audio", {
             origin: "audio",
-            error: "áudio acima do limite de 10 MB",
+            error: "audio exceeds the 10 MB limit",
           }),
         };
       const transcription = await transcribeAudio(audio, {
@@ -1417,11 +1428,11 @@ export class Telegram {
       });
       // Verbatim: the specialist's words reach the model unchanged.
       return {
-        text: `${originHeader("áudio transcrito", { origin: "audio", model: audio.modelId })}\n${transcription}`,
+        text: `${originHeader("audio transcript", { origin: "audio", model: audio.modelId })}\n${transcription}`,
       };
     } catch (error) {
       return {
-        text: originHeader("áudio", {
+        text: originHeader("audio", {
           origin: "audio",
           error: transcribeFailure(error),
         }),
@@ -1433,22 +1444,21 @@ export class Telegram {
     image: ImageRef,
   ): Promise<TelegramImage[] | { error: string }> {
     if ((image.size ?? 0) > MAX_IMAGE_BYTES)
-      return { error: "imagem acima do limite de 5 MB" };
+      return { error: "image exceeds the 5 MB limit" };
     if (!this.transport.downloadFile)
-      return { error: "este ambiente não consegue baixar anexos" };
+      return { error: "this environment cannot download attachments" };
     try {
       const { data } = await this.transport.downloadFile(image.fileId);
       if (data.byteLength > MAX_IMAGE_BYTES)
-        return { error: "imagem acima do limite de 5 MB" };
+        return { error: "image exceeds the 5 MB limit" };
       const base64 = Buffer.from(data).toString("base64");
       // A provider refuses an unusable image and the part then fails every later turn;
       // the chat hears why instead of the conversation getting poisoned.
       const verdict = imageVerdict(base64, image.mimeType);
-      if (!verdict.ok)
-        return { error: `imagem não utilizável: ${verdict.reason}` };
+      if (!verdict.ok) return { error: `image is unusable: ${verdict.reason}` };
       return [{ type: "image", data: base64, mimeType: image.mimeType }];
     } catch {
-      return { error: "falha ao baixar a imagem" };
+      return { error: "image download failed" };
     }
   }
   /** Sends the files a delivery carries; each failure is recorded, none is thrown. */
@@ -1460,7 +1470,7 @@ export class Telegram {
     const results: unknown[] = [];
     for (const item of media) {
       if (!this.transport.sendMedia) {
-        results.push({ error: "transporte sem envio de arquivo" });
+        results.push({ error: "transport cannot send files" });
         continue;
       }
       try {
@@ -1473,7 +1483,7 @@ export class Telegram {
         );
       } catch (error) {
         results.push({
-          error: error instanceof Error ? error.message : "falha no envio",
+          error: error instanceof Error ? error.message : "send failed",
         });
       }
     }
@@ -1493,18 +1503,20 @@ export class Telegram {
     await Promise.allSettled([...this.receives.values(), ...this.approvalWork]);
     await this.flushWork;
   }
-  setDmChat(chat: string) {
-    if (this.privateDm) {
-      if (!this.chats.includes(chat)) this.typing.close();
-      this.chats = [chat];
-    }
-  }
   private async sendPending() {
     this.typing.check();
     try {
+      await sweepMcpApprovals(
+        this.app,
+        this.transport.editMessage?.bind(this.transport),
+      );
+    } catch (error) {
+      logFailure("Failed to review MCP approvals", error);
+    }
+    try {
       queueMcpApprovals(this.app);
     } catch (error) {
-      logFailure("Falha ao enfileirar aprovações MCP", error);
+      logFailure("Failed to queue MCP approvals", error);
     }
     try {
       queueMcpUncertainNotices(this.app);
@@ -1556,7 +1568,7 @@ export class Telegram {
       ) {
         this.app.store.run(
           "UPDATE deliveries SET state='cancelled',result=? WHERE id=? AND state='pending'",
-          "Vínculo Telegram revogado antes do envio.",
+          "Telegram link revoked before send.",
           delivery.id,
         );
         continue;
@@ -1570,7 +1582,7 @@ export class Telegram {
       ) {
         this.app.store.run(
           "UPDATE deliveries SET state='cancelled',result=? WHERE id=? AND state='pending'",
-          "Conexão Telegram revogada antes do envio.",
+          "Telegram connection revoked before send.",
           delivery.id,
         );
         continue;
@@ -1589,7 +1601,7 @@ export class Telegram {
               this.controlRoute({ chat: delivery.chat, user }),
             );
             if (!user)
-              throw new CommandError("Conexão Telegram não autorizada.");
+              throw new CommandError("Telegram connection is not authorized.");
             // Only an unowned legacy row still depends on the legacy binding.
             this.app.telegramChats.binding({ chat: delivery.chat, user });
           }
@@ -1598,7 +1610,7 @@ export class Telegram {
           if (!unavailableConversation(error)) throw error;
           this.app.store.run(
             "UPDATE deliveries SET state='cancelled',result=? WHERE id=? AND state='pending'",
-            "Conversa Telegram indisponível antes do envio.",
+            "Telegram conversation unavailable before send.",
             delivery.id,
           );
           continue;
@@ -1610,7 +1622,7 @@ export class Telegram {
         if (!(error instanceof TaskError) && !unavailableConversation(error))
           throw error;
         this.app.store.run(
-          "UPDATE deliveries SET state='cancelled',result='Autorização ou menu de crons mudou antes do envio.' WHERE id=? AND state='pending'",
+          "UPDATE deliveries SET state='cancelled',result='Authorization or the crons menu changed before send.' WHERE id=? AND state='pending'",
           delivery.id,
         );
         continue;
@@ -1721,8 +1733,8 @@ export class Telegram {
           error instanceof TelegramSendRefused ? "failed" : "uncertain";
         const detail =
           error instanceof TelegramSendRefused
-            ? `${error.message} Não foi entregue nem será reenviada.`
-            : "Verifique no Telegram. Não reenviado automaticamente.";
+            ? `${error.message} It was not delivered and will not be resent.`
+            : "Check Telegram. Not resent automatically.";
         this.app.store.run(
           "UPDATE deliveries SET state=?,result=? WHERE id=?",
           failed,
@@ -1730,7 +1742,7 @@ export class Telegram {
           delivery.id,
         );
         if (delivery.id.startsWith("telegram:mcp:"))
-          logFailure(`Falha ao enviar cartão MCP (${delivery.id})`, error);
+          logFailure(`Failed to send MCP card (${delivery.id})`, error);
       }
     }
   }

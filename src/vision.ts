@@ -99,7 +99,7 @@ function chunk(type: string, data: Buffer) {
  * A 64x64 flat PNG built here instead of pasted as base64 - one mistyped character would
  * become "unsupported image" on the provider and a false "text only" verdict.
  */
-function probePng() {
+export function probePng() {
   const size = 64;
   const raw = Buffer.alloc((size * 3 + 1) * size);
   for (let y = 0; y < size; y += 1) {
@@ -125,6 +125,28 @@ function probePng() {
 const PROBE_PNG = probePng();
 
 type ImageSupport = "vision" | "text" | "unknown";
+
+/**
+ * Provider error text for a setup test. The JSON `message` is preferred; a long
+ * body is cut on a word boundary so a model id is not sliced mid-token.
+ */
+export function providerErrorHint(body: string, limit = 180): string {
+  const matched =
+    /"message"\s*:\s*"((?:\\.|[^"\\])*)"/.exec(body)?.[1] ??
+    /"description"\s*:\s*"((?:\\.|[^"\\])*)"/.exec(body)?.[1];
+  const decoded = (matched ?? body)
+    .replace(/\\n/g, " ")
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, "\\")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!/[a-z]{3,}/i.test(decoded)) return "";
+  if (decoded.length <= limit) return decoded;
+  const slice = decoded.slice(0, limit);
+  const space = slice.lastIndexOf(" ");
+  const cut = space >= Math.floor(limit * 0.6) ? slice.slice(0, space) : slice;
+  return `${cut}…`;
+}
 
 /**
  * Asks the model itself whether it reads images. A catalog lies and a status code alone
@@ -160,12 +182,7 @@ export async function probeImageSupport(
       ...(options.signal ? { signal: options.signal } : {}),
     });
     const body = response.ok ? "" : await response.text().catch(() => "");
-    // Short provider message: "missing field model" is worth showing, the JSON is not.
-    const found =
-      /"message"\s*:\s*"([^"]{1,120})"/.exec(body)?.[1] ??
-      body.replace(/\s+/g, " ").slice(0, 60);
-    // "{}" or punctuation alone says nothing; only a readable message is worth showing.
-    const hint = /[a-z]{3,}/i.test(found) ? found : "";
+    const hint = providerErrorHint(body);
     return { ok: response.ok, status: response.status, hint };
   };
   const control = await send(false).catch(() => undefined);
@@ -173,8 +190,8 @@ export async function probeImageSupport(
     return {
       verdict: "unknown",
       detail: control
-        ? `modelo não respondeu (${control.status}${control.hint ? `: ${control.hint}` : ""})`
-        : "sem resposta",
+        ? `model did not respond (${control.status}${control.hint ? `: ${control.hint}` : ""})`
+        : "no response",
     };
   const first = await send(true).catch(() => undefined);
   if (first?.ok) return { verdict: "vision" };
@@ -183,10 +200,10 @@ export async function probeImageSupport(
   if (first && second && !first.ok && !second.ok)
     return {
       verdict: "text",
-      detail: `resposta ${first.status}${first.hint ? `: ${first.hint}` : ""}`,
+      detail: `response ${first.status}${first.hint ? `: ${first.hint}` : ""}`,
     };
   return {
     verdict: "unknown",
-    detail: first ? `resposta ${first.status}, não confirmada` : "sem resposta",
+    detail: first ? `response ${first.status}, not confirmed` : "no response",
   };
 }

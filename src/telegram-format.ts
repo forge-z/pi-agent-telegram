@@ -19,22 +19,10 @@ type MarkdownCell = { text?: string; tokens?: MarkdownToken[] };
 type Tag = { name: "b" | "i" | "s" | "code" | "pre" | "a"; open: string };
 
 /** Format Markdown into independently valid Telegram HTML messages. */
-export type TelegramMessageRole = "web_user" | "web_assistant";
-
-export function formatTelegramMessage(
-  text: string,
-  role?: TelegramMessageRole,
-): string[] {
+export function formatTelegramMessage(text: string): string[] {
   const writer = new HtmlChunks();
   writeBlocks(writer, lexer(text) as unknown as MarkdownToken[]);
-  const chunks = writer.finish();
-  if (!role) return chunks;
-  const label =
-    role === "web_user" ? "👤 Você · via web" : "🤖 Agente · resposta à web";
-  return chunks.map(
-    (chunk, index) =>
-      `<b>${label}${chunks.length > 1 ? ` · ${index + 1}/${chunks.length}` : ""}</b>\n\n${chunk}`,
-  );
+  return writer.finish();
 }
 
 class HtmlChunks {

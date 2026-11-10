@@ -1,8 +1,6 @@
-# Diagnóstico histórico: poller de jobs assíncronos sem entrega
+# Diagnóstico: poller de jobs assíncronos sem entrega (PR #96)
 
-Este texto descreve uma falha vista em 21/10/2026, antes das correções que estão no código atual. O comportamento vigente está em [jobs.md](jobs.md). `EXECUTOR_ACCOUNT_ID` e `ASYNC_JOB_TOOLS` não são lidas: a conta da leitura vem da chamada que disparou o job. Os números de linha abaixo são do código da época. O `run_id` é fictício.
-
-`run_id` `00000000-0000-4000-8000-000000000096`
+Data do incidente: 21/10/2026. `run_id` `dfa4e4d6-32c6-4271-b235-5cd2009ba699`
 terminou `COMPLETED` em 26 s, mas 3,9 min depois não houve entrega nem aviso.
 
 ## Onde cada etapa vive (antes das correções)
@@ -34,8 +32,8 @@ terminou `COMPLETED` em 26 s, mas 3,9 min depois não houve entrega nem aviso.
 
 ## O que foi corrigido
 
-- A conta não vem mais de `EXECUTOR_ACCOUNT_ID`. Ela vem da chamada que disparou
-  o job; zero contas vira `missing_account` e duas ou mais vira `ambiguous_account`.
+- Conta apenas de `EXECUTOR_ACCOUNT_ID`; falta da conta desliga com
+  `console.error` na inicialização, `health.json.jobs_poller` e linha no `/info`.
 - Varredura reconhece caminho direto, bracket, variável de segmento/path,
   alias de objeto, destructuring e `/`; `capture` grava `run_id` e o caminho
   normalizado mesmo quando a pré-registração não abriu linha.
@@ -43,13 +41,12 @@ terminou `COMPLETED` em 26 s, mas 3,9 min depois não houve entrega nem aviso.
   saúde consultável.
 - `delivered_at` só é gravado após `submit`; falha agenda retry com backoff e,
   após 3 tentativas, emite aviso explícito com o resultado preservado na linha.
-- `ASYNC_JOB_TOOLS` deixou de ser lido. Um job é um manifesto em
-  `ASYNC_JOB_MANIFESTS` ou um dos manifestos embutidos (TinyFish, Instabox).
+- Compatibilidade com `ASYNC_JOB_TOOLS` mantida via manifesto sintetizado.
 
 ## Pendente
 
-- Conferir `health.json` e a linha em `pending_jobs` após o primeiro tick de um
-  job novo. Não há variável de conta para preencher.
+- Validar em produção com `EXECUTOR_ACCOUNT_ID` real e um run novo; conferir
+  `health.json` e a linha em `pending_jobs` após o primeiro tick.
 - Se o provedor devolver um `run_id` fora dos formatos conhecidos, a captura
   ainda depende de `dispatchOutcome`; um log do payload bruto nesse caso é o
   próximo passo.

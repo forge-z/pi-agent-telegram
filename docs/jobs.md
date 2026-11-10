@@ -88,7 +88,15 @@ which is why the id is required.
    going quiet for ever;
 6. a finished job whose payload carries no result becomes `expired`, once, with a notice;
 7. the worker never dispatches: it only reads and delivers;
-8. `attempts` is capped and the row ends as `expired` with its result preserved.
+8. provider read failures (`poll_attempts`) and delivery failures (`delivery_attempts`) are counted separately. Three failed reads do not expire a finished result. Three rejected deliveries do. A successful read clears only `poll_attempts`. Delivery uses the stable request id `job:<row>:<run>`, which the runtime dedupes.
+
+## Counters, retention, and old databases
+
+`poll_attempts` and `delivery_attempts` are the live counters. The old `attempts` column is left in place and is not written. On a database from before the split, `poll_attempts` is copied from `attempts` and `delivery_attempts` starts at 0. On a database that already held rows (`legacy_attempts_unknown` and the other holds), every hold is cleared and the row returns to normal polling. For `legacy_attempts_unknown`, `poll_attempts` is taken from `attempts` again and `delivery_attempts` is set to 0. The migration is idempotent: a later boot does not reset counters on a row that is no longer held. Holds no longer block deleting a conversation.
+
+Finished rows (`delivered_at` set) older than 30 days are deleted. Open rows are kept. There is no environment variable for the window.
+
+A poller tick that throws is recorded on `health().last_tick_error` and logged at most once a minute for the same message. A later successful tick does not clear that error, and nothing is sent to the chat.
 
 ## Which Executor
 
@@ -105,14 +113,14 @@ is taken from the call that started the job.
 
 What changed in the v2 path:
 
-|          | v1                                                         | v2                                                 |
-| -------- | ---------------------------------------------------------- | -------------------------------------------------- |
-| dispatch | `tinyfish_mcp.user.personalTinyfishMcp.run_web_automation` | `tools.tinyfish.agent.automation.runAsync`         |
-| read     | `list_runs` with a time window and a goal suffix           | `getRunById` with `input.path.id`                  |
-| id       | `runId` at the top level                                   | `value.run_id`                                     |
-| envelope | `{ status, result: "<json string>" }`                      | `{ status, execution: { ok, value, error } }`      |
-| status   | `COMPLETED`                                                | `COMPLETED` (same words, manifest maps them)       |
-| program  | any                                                        | pure JS: a TypeScript annotation is a `ParseError` |
+|          | v1                                               | v2                                                 |
+| -------- | ------------------------------------------------ | -------------------------------------------------- |
+| dispatch | `tinyfish_mcp.user.example.run_web_automation`   | `tools.tinyfish.agent.automation.runAsync`         |
+| read     | `list_runs` with a time window and a goal suffix | `getRunById` with `input.path.id`                  |
+| id       | `runId` at the top level                         | `value.run_id`                                     |
+| envelope | `{ status, result: "<json string>" }`            | `{ status, execution: { ok, value, error } }`      |
+| status   | `COMPLETED`                                      | `COMPLETED` (same words, manifest maps them)       |
+| program  | any                                              | pure JS: a TypeScript annotation is a `ParseError` |
 
 `session_id` (and its `tf-` prefix) no longer exists. `send_attachment` and the approval card
 are unchanged.
@@ -130,7 +138,7 @@ topic that asked is told when the machine is ready:
     "mode": "poll",
     "tool": "tools.instabox.operations.get",
     "args": {
-      "accountId": "acc_00000000-0000-0000-0000-000000000000",
+      "accountId": "acc_...",
       "input": { "id": "${id}", "wait": "25s" }
     },
     "statePath": "state",
@@ -145,21 +153,52 @@ topic that asked is told when the machine is ready:
 `machines.exec` is synchronous (up to 600 s) and needs no manifest; wrap long builds in
 `nohup` and register the work with the job tools instead.
 
-### Tarefas de código no Instabox (`instabox_code_task`)
+### Tarefas de código na sandbox (`sandbox_code_task`)
 
-Para rodar tarefas de desenvolvimento assíncronas em sandboxes Instabox (usando agentes como `agy`, `pi` ou `claude`) sem travar o bot de Telegram nem o turno da conversa:
+A ferramenta interna é genérica: `config.default.yaml` traz o Instabox como entrada padrão, e servidor, chamada de exec e manifesto de leitura vêm do bloco `sandbox_code_task`. Trocar de sandbox (freestyle.sh, por exemplo) é configurar outro bloco e outro manifesto em `async_jobs`, sem tocar em código.
 
-- **Ferramenta interna**: `instabox_code_task` (disponível automaticamente quando `INSTABOX_MACHINE_ID` está configurado).
-- **Parâmetros**:
-  - `repo` (`string`, obrigatório): repositório no formato `owner/name` (ex.: `example/app`).
-  - `agent` (`string`, obrigatório): agente a executar (`agy`, `pi` ou `claude`).
-  - `prompt` (`string`, obrigatório): descrição detalhada da tarefa para o agente.
-  - `branch` (`string`, opcional): nome da branch a ser criada; por padrão `agent/<jobId>`.
-- **Comportamento**:
-  - O disparo gera um `jobId` no formato `cj-<timestamp-base36>-<random>` e chama a ferramenta MCP `execute` com `return await tools.instabox.machines.exec({...})` (`cmd: "bash ~/bin/start-job.sh <jobId>"`, `timeoutSeconds: 15`). Esse caminho não é um nome de ferramenta MCP. O prompt nunca trafega pela linha de comando nem por variáveis de ambiente, apenas via `stdin` em JSON seguro.
-  - A ferramenta retorna imediatamente para o modelo (`{ jobId, status: "dispatched" }`), liberando o turno do Telegram.
-  - O poller observa `/data/home/jobs/${id}/status.json` via manifesto embutido (`internal.instabox.codeTask`) chamando `tools.instabox.machines.readFiles` dentro de `execute` a cada 20 segundos (com backoff). O `status:"completed"` do Executor é o envelope da chamada, não o estado do job. Um `status.json` ausente (404) durante a carência fica em silêncio.
-  - Quando o job conclui, o poller entrega o resultado como um turno novo no tópico original, incluindo o link do Pull Request criado (`result.pr`).
+```yaml
+sandbox_code_task:
+  tool: sandbox_code_task
+  job: "internal.instabox.codeTask" # manifesto em async_jobs
+  server: executor # executor usa `execute` + tools.*; outro nome é chamado direto
+  goal: prompt
+  idPrefix: "cj-"
+  exec:
+    tool: "tools.instabox.machines.exec"
+    args:
+      accountId: "${INSTABOX_ACCOUNT_ID}"
+      input:
+        id: "${INSTABOX_MACHINE_ID}"
+        cmd: "bash ~/bin/start-job.sh ${job_id}" # writes=false prefixa com readonly.env
+        timeoutSeconds: 15
+        stdin: "${payload}" # parâmetros do modelo em JSON
+  parameters: # JSON Schema da chamada do modelo
+    type: object
+    required: [repo, agent, prompt]
+    properties:
+      repo: { type: string }
+      agent: { type: string, enum: [agy, pi, claude] }
+      prompt: { type: string }
+      branch: { type: string }
+      writes: { type: boolean } # padrão false; true pede o cartão antes do exec
+  readonly:
+    env: "JOB_READONLY=1" # prefixo do comando quando writes é false
+    command: input.cmd
+    prompt: "Somente leitura: não faça push, não abra pull requests e não comente."
+  allow:
+    field: repo
+    # patterns is empty in config.default.yaml. Set it here or via
+    # INSTABOX_REPO_ALLOWLIST. Example only, not a shipped default:
+    patterns: "example/*"
+```
+
+- O disparo gera um `jobId` (`<idPrefix><timestamp-base36>-<random>`) e registra a linha em `pending_jobs` antes de chamar a sandbox. No caso do Instabox, o `jobId` vira `cmd` e os parâmetros vão apenas no `stdin` em JSON — o prompt nunca trafega pela linha de comando nem por variáveis de ambiente.
+- A ferramenta retorna imediatamente (`{ jobId, status: "dispatched" }`, ou `{ status: "approval_pending" }` quando `writes` é true), liberando o turno do Telegram.
+- O poller usa o manifesto `job` para ler o status; no padrão, `/data/home/jobs/${id}/status.json` via `tools.instabox.machines.readFiles` a cada 20 segundos (com backoff). O `status:"completed"` do Executor é o envelope da chamada, não o estado do job. Um `status.json` ausente (404) durante a carência fica em silêncio.
+- Quando o job conclui, o poller entrega o resultado como um turno novo no tópico original. Um job com `writes: true` pode incluir o link do Pull Request (`result.pr`). Com `writes` omitido ou false, o disparo não abre cartão: o comando de início ganha o prefixo `readonly.env` e o prompt do agente ganha `readonly.prompt`.
+- `writes: true` não registra a linha nem chama o exec até o cartão de aprovação (o mesmo "Aprovação MCP pendente", com repositório, agente, branch e um trecho curto do prompt). Recusar não dispara nada.
+- Linhas antigas de `instabox_code_task` continuam resolvendo porque o manifesto padrão mantém `tool: internal.instabox.codeTask`.
 - **Instalação na Sandbox Instabox**:
   1. Copie os scripts versionados no repositório (`scripts/instabox/start-job.sh` e `scripts/instabox/run-job.sh`) para o diretório `~/bin/` da máquina:
      ```bash
@@ -175,11 +214,13 @@ Para rodar tarefas de desenvolvimento assíncronas em sandboxes Instabox (usando
      export OPENAI_API_KEY="..."
      ```
   3. Certifique-se de que as ferramentas `git`, `gh`, `node` e os agentes CLI (`agy`, `pi`, `claude`) estejam instalados no ambiente da sandbox.
+  4. Atualize o `~/bin/run-job.sh` da máquina com a cópia do repositório. `start-job.sh` não muda: ele herda o ambiente, então `JOB_READONLY=1 bash ~/bin/start-job.sh <jobId>` chega no runner. Com essa variável, depois do clone o script apaga `GH_TOKEN`, `GITHUB_TOKEN` e `GH_ENTERPRISE_TOKEN`, aponta `GH_CONFIG_DIR` para um diretório vazio (um `gh` já logado ignora o token apagado e usa `~/.config/gh`), remove o `credential.helper` do worktree, define `GIT_TERMINAL_PROMPT=0`, pula commit, push e `gh pr create`, e acrescenta a frase de somente leitura ao prompt se ela ainda não estiver lá.
 
 - **Variáveis de Ambiente**:
-  - `INSTABOX_MACHINE_ID`: ID da sandbox Instabox (obrigatória para habilitar a ferramenta).
-  - `INSTABOX_ACCOUNT_ID`: Conta do Instabox, se a chamada não trouxer `accountId`.
-  - `INSTABOX_REPO_ALLOWLIST`: Allowlist de repositórios permitidos (se vazia, o código usa `example/*`; aceita lista separada por vírgula com curingas `owner/*`). Defina a lista do deploy.
+  - `INSTABOX_MACHINE_ID`: opcional. Sem ela, o `discover` do manifesto escolhe a máquina somente quando existe exatamente uma em execução. Zero ou várias é erro e a lista é mostrada. Não há nome padrão.
+  - `INSTABOX_ACCOUNT_ID`: opcional. Sem ela, usa a única conta encontrada. Mais de uma é erro.
+  - `INSTABOX_REPO_ALLOWLIST`: override opcional de `sandbox_code_task.allow.patterns`. O padrão em `config.default.yaml` é vazio: nada é permitido até o operador definir a lista em `$DATA_DIR/config.yaml` ou nesta variável. Lista separada por vírgula; `owner/*` casa com o dono. A variável, quando definida, vence o arquivo.
   - `MCP_CALL_TIMEOUT_MS`: Timeout de chamadas de ferramenta no MCP (padrão `60000` ms).
-  - `ASYNC_JOB_TIMEOUT_MIN`: Timeout padrão de jobs assíncronos (padrão `25` min).
+  - `ASYNC_JOB_TIMEOUT_MIN`: override opcional de `async_job.timeout_min` (padrão `25`).
+  - `ASYNC_JOB_POLL_SECONDS`: override opcional de `async_job.poll_seconds` (padrão `25`).
   - `ASYNC_JOB_READ_TIMEOUT_MS`: Timeout de leitura do poller (padrão `20000` ms).

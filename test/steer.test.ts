@@ -320,7 +320,7 @@ test("Mensagem que chega depois da última rodada de ferramentas (modelo respond
   }
 });
 
-test("Foto com legenda e áudio transcrito durante turno viram steer com o conteúdo correto", async () => {
+test("Foto com legenda e audio transcript durante turno viram steer com o conteúdo correto", async () => {
   const barrier = new Deferred<void>();
   let imageSeen = false;
   let audioSeen = false;
@@ -385,14 +385,14 @@ test("Foto com legenda e áudio transcrito durante turno viram steer com o conte
       [fakeImage],
     );
 
-    // Envia áudio transcrito como steer
+    // Envia audio transcript como steer
     await f.app.submit(id, "req-audio", "audio transcrito aqui", "web");
 
     barrier.resolve();
     await wait(f.app, id);
 
     assert.ok(imageSeen, "imagem e legenda entraram no transcript do modelo");
-    assert.ok(audioSeen, "áudio transcrito entrou no transcript do modelo");
+    assert.ok(audioSeen, "audio transcript entrou no transcript do modelo");
   } finally {
     await f.close();
   }
@@ -547,9 +547,7 @@ test("O aviso 'Recebi, vou considerar...' é enviado uma vez por turno ocupado",
       "-100123",
     );
     const count1 = deliveries1.filter((d) =>
-      d.text.includes(
-        "Recebi, vou considerar no que estou fazendo. /stop cancela.",
-      ),
+      d.text.includes("Got it. I will take that into account. /stop cancels."),
     ).length;
     assert.equal(count1, 1, "primeiro steer envia aviso");
 
@@ -570,9 +568,7 @@ test("O aviso 'Recebi, vou considerar...' é enviado uma vez por turno ocupado",
       "-100123",
     );
     const count2 = deliveries2.filter((d) =>
-      d.text.includes(
-        "Recebi, vou considerar no que estou fazendo. /stop cancela.",
-      ),
+      d.text.includes("Got it. I will take that into account. /stop cancels."),
     ).length;
     assert.equal(count2, 1, "não repete aviso no mesmo turno ocupado");
 
@@ -593,9 +589,7 @@ test("O aviso 'Recebi, vou considerar...' é enviado uma vez por turno ocupado",
       "-100123",
     );
     const count3 = deliveries3.filter((d) =>
-      d.text.includes(
-        "Recebi, vou considerar no que estou fazendo. /stop cancela.",
-      ),
+      d.text.includes("Got it. I will take that into account. /stop cancels."),
     ).length;
     assert.equal(count3, 1, "comando não envia aviso");
 
@@ -634,9 +628,7 @@ test("O aviso 'Recebi, vou considerar...' é enviado uma vez por turno ocupado",
       "-100123",
     );
     const count4 = deliveries4.filter((d) =>
-      d.text.includes(
-        "Recebi, vou considerar no que estou fazendo. /stop cancela.",
-      ),
+      d.text.includes("Got it. I will take that into account. /stop cancels."),
     ).length;
     assert.equal(count4, 2, "novo turno ocupado envia aviso uma vez novamente");
 

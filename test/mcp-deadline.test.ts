@@ -121,13 +121,11 @@ function gateway(url: string) {
       name: "mock",
       url,
       mode: "direct",
-      readTools: [],
-      actionTools: ["execute", "fast", "resume"],
     },
   ]);
 }
 
-test("uma chamada pendurada libera a trava no prazo e a seguinte passa", async () => {
+test("uma escrita pendurada libera recursos, mas bloqueia a próxima ação até verificação", async () => {
   const previous = process.env.MCP_CALL_TIMEOUT_MS;
   process.env.MCP_CALL_TIMEOUT_MS = "2000";
   const mock = await fixture();
@@ -157,16 +155,26 @@ test("uma chamada pendurada libera a trava no prazo e a seguinte passa", async (
       (error: Error) => error.message,
     );
     assert.match(failure, /estourou o prazo/);
-    assert.match(failure, /trava foi liberada/);
+    assert.match(failure, /resultado.*incerto/i);
     assert.equal(
       store.get<{ state: string }>(
         "SELECT state FROM mcp_calls WHERE tool='execute'",
       )?.state,
-      "failed",
+      "uncertain",
     );
     assert.equal(notices.length, 1);
     assert.match(notices[0]!.text, /estourou o prazo/);
-    const next = await calls.execute("conversation", 3, "mock", "fast", {});
+    await assert.rejects(
+      calls.execute("conversation", 3, "mock", "fast", {}),
+      /resultado MCP incerto/i,
+    );
+    const lost = calls.list("conversation")[0];
+    calls.reconcile(
+      "conversation",
+      lost.id,
+      "Usuário verificou o efeito remoto",
+    );
+    const next = await calls.execute("conversation", 4, "mock", "fast", {});
     assert.match(JSON.stringify(next), /done:fast/);
   } finally {
     mock.releaseWrite();
@@ -180,7 +188,7 @@ test("uma chamada pendurada libera a trava no prazo e a seguinte passa", async (
   }
 });
 
-test("um resume que falha libera a trava e a chamada seguinte passa", async () => {
+test("um resume com retorno perdido mantém incerteza até resolução humana", async () => {
   const mock = await fixture();
   const mcp = gateway(mock.url);
   const dir = await mkdtemp(join(tmpdir(), "mcp-resume-fail-"));
@@ -241,13 +249,22 @@ test("um resume que falha libera a trava e a chamada seguinte passa", async () =
         "SELECT state FROM mcp_calls WHERE id=?",
         call.id,
       )?.state,
-      "failed",
+      "uncertain",
     );
     assert.match(
       notices.map((notice) => notice.text).join("\n"),
-      /trava foi liberada|resume|Falha na conexão/,
+      /trava foi liberada|resume|connection failed|MCP connection/,
     );
-    const next = await calls.execute("conversation", 2, "mock", "fast", {});
+    await assert.rejects(
+      calls.execute("conversation", 2, "mock", "fast", {}),
+      /resultado MCP incerto/i,
+    );
+    calls.reconcile(
+      "conversation",
+      call.id,
+      "Usuário verificou a retomada no serviço",
+    );
+    const next = await calls.execute("conversation", 3, "mock", "fast", {});
     assert.match(JSON.stringify(next), /done:fast/);
   } finally {
     await calls.close();
@@ -258,7 +275,7 @@ test("um resume que falha libera a trava e a chamada seguinte passa", async () =
   }
 });
 
-test("running vencido ou pausa sem retomada não deixa a conversa presa", async () => {
+test("running vencido fica incerto; pausa sem despacho permite continuar", async () => {
   const mock = await fixture();
   const mcp = gateway(mock.url);
   const dir = await mkdtemp(join(tmpdir(), "mcp-stale-"));
@@ -287,14 +304,14 @@ test("running vencido ou pausa sem retomada não deixa a conversa presa", async 
         () => "passou",
         (error: Error) => error.message,
       );
-    assert.equal(blocked, "passou");
+    assert.match(blocked, /resultado MCP incerto/i);
     assert.equal(
       store.get<{ state: string }>(
         "SELECT state FROM mcp_calls WHERE id='stuck'",
       )?.state,
-      "failed",
+      "uncertain",
     );
-    assert.match(notices[0]!.text, /trava foi liberada/);
+    assert.match(notices[0]!.text, /resultado MCP incerto/i);
     store.run(
       "UPDATE mcp_calls SET state='paused', updatedAt=? WHERE id='stuck'",
       Date.now(),

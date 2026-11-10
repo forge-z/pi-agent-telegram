@@ -1,6 +1,10 @@
 import { CommandError } from "./commands.js";
 import { SettingsError } from "./settings.js";
-import { ConversationError, ConversationBusyError } from "./runtime.js";
+import {
+  ConversationError,
+  ConversationBusyError,
+  isRetryableError,
+} from "./runtime.js";
 import { writeFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -15,15 +19,14 @@ import { TelegramApiError, type TelegramApi } from "./telegram-api.js";
 import { hash } from "./store.js";
 
 export const cleanCommands = [
-  { command: "model", description: "Escolher provedor e modelo" },
-  { command: "thinking", description: "Escolher esforço" },
-  { command: "crons", description: "Criar e gerenciar agendamentos" },
-  { command: "stop", description: "Interromper execução deste tópico" },
-  { command: "status", description: "Modelo, MCPs, execução e versão" },
-  { command: "reload", description: "Dispensar resultado MCP incerto" },
-  { command: "new", description: "Começar outra conversa neste tópico" },
-  { command: "resume", description: "Retomar tarefa estacionada por quedas" },
-  { command: "help", description: "Ajuda" },
+  { command: "model", description: "Choose provider and model" },
+  { command: "thinking", description: "Choose effort" },
+  { command: "crons", description: "Create and manage schedules" },
+  { command: "new", description: "Start another conversation in this topic" },
+  { command: "resume", description: "Resume a stuck task" },
+  { command: "stop", description: "Stop this topic" },
+  { command: "status", description: "Model, MCPs, run, and version" },
+  { command: "help", description: "Help" },
 ];
 /**
  * Telegram keeps a separate command list per language. An earlier implementation
@@ -38,7 +41,7 @@ export function configureTelegram(
   bot: { id: number; username?: string },
 ) {
   if (!Number.isSafeInteger(bot.id) || bot.id <= 0)
-    throw new Error("Identidade do bot inválida.");
+    throw new Error("Invalid bot identity.");
   const old = appStore.get<{ value: string }>(
     "SELECT value FROM meta WHERE key='telegram:connection'",
   );
@@ -86,6 +89,11 @@ export class TelegramPolling {
   private completedUpdates = new Set<number>();
   private unacknowledged = new Set<number>();
   private persistedOffset?: number;
+  /** Transient failures stay unacked and retry with backoff. Keyed by update id. */
+  private retries = new Map<
+    number,
+    { lane: string; attempts: number; after: number }
+  >();
   readonly engine: Telegram;
   constructor(
     private app: Runtime,
@@ -184,7 +192,7 @@ export class TelegramPolling {
     this.work = this.run().catch(() => {
       if (this.controller.signal.aborted) return;
       this.failed = true;
-      console.error("Polling interrompido; verifique configuração/conexão.");
+      console.error("Polling stopped; check configuration and connection.");
       setTimeout(onFailure, 0);
     });
     this.timer = setInterval(() => {
@@ -245,7 +253,7 @@ export class TelegramPolling {
         )
           throw error;
         console.error(
-          `setMyCommands falhou para chat ${chat}${language_code ? ` (${language_code})` : ""} (bot fora do chat ou ID errado em TELEGRAM_ALLOWED_CHATS). Polling continua.`,
+          `setMyCommands failed for chat ${chat}${language_code ? ` (${language_code})` : ""} (bot is not in the chat, or TELEGRAM_ALLOWED_CHATS has the wrong id). Polling continues.`,
         );
       }
     }
@@ -270,6 +278,36 @@ export class TelegramPolling {
     }
   }
 
+  /** Best-effort reply. A lost answer does not retry the update's effects. */
+  private async replyToUpdate(
+    value: TelegramUpdate,
+    text: string,
+    signal: AbortSignal,
+  ) {
+    const message = value.message;
+    if (!message?.from || !message.chat || !text) return;
+    const user = String(message.from.id);
+    const chat = String(message.chat.id);
+    if (!this.config.users.includes(user) || !this.config.chats.includes(chat))
+      return;
+    try {
+      await this.api.call(
+        "sendMessage",
+        {
+          chat_id: chat,
+          text,
+          ...(Number.isSafeInteger(message.message_thread_id) &&
+          message.message_thread_id! > 0
+            ? { message_thread_id: message.message_thread_id }
+            : {}),
+        },
+        signal,
+      );
+    } catch {
+      /* The update is still terminal for a non-transient failure. */
+    }
+  }
+
   private async run() {
     const signal = this.controller.signal;
     const webhook = (await this.api.call("getWebhookInfo", {}, signal)) as {
@@ -277,13 +315,20 @@ export class TelegramPolling {
     };
     if (webhook.url)
       throw new Error(
-        "Webhook existente; remova-o explicitamente antes de iniciar polling.",
+        "A webhook is set; remove it explicitly before starting polling.",
       );
     for (const chat of this.config.chats)
       await this.registerCommands(chat, true, signal);
     // A running deployment picks up a changed menu from `/status`, not only at boot.
     this.engine.onReload = (chat) => this.registerCommands(chat);
     if (signal.aborted) return;
+    // Drop the removed per-message journal. Leave the completion offset alone:
+    // Telegram redelivers anything it still has, and we do not replay a stored copy.
+    this.app.store.run(
+      `DELETE FROM meta WHERE key GLOB 'telegram:polling:*'
+        OR key GLOB 'telegram:journal-offset:*'
+        OR key GLOB 'telegram:update-identity:*'`,
+    );
     this.app.tasks.start();
     let failures = 0;
     while (!signal.aborted) {
@@ -307,12 +352,21 @@ export class TelegramPolling {
           },
           signal,
         );
-        if (!Array.isArray(updates)) throw new Error("Updates inválidos");
+        if (!Array.isArray(updates)) throw new Error("Invalid updates");
         this.lastPoll = Date.now();
         let newUpdatesCount = 0;
         for (const value of updates as TelegramUpdate[]) {
           if (!Number.isSafeInteger(value.update_id) || value.update_id < 0)
-            throw new Error("Update inválido");
+            throw new Error("Invalid update");
+          const lane = updateLaneKey(value);
+          const waiting = this.retries.get(value.update_id);
+          if (waiting && Date.now() < waiting.after) continue;
+          if (
+            [...this.retries.values()].some(
+              (item) => item.lane === lane && Date.now() < item.after,
+            )
+          )
+            continue;
           if (
             this.inFlightUpdates.has(value.update_id) ||
             this.completedUpdates.has(value.update_id) ||
@@ -324,59 +378,51 @@ export class TelegramPolling {
           newUpdatesCount++;
           this.unacknowledged.add(value.update_id);
           this.inFlightUpdates.add(value.update_id);
-          const lane = updateLaneKey(value);
           const prev = this.lanes.get(lane) ?? Promise.resolve();
           const task = prev
             .catch(() => {})
             .then(async () => {
+              let settle = true;
               try {
                 await this.engine.receive(value, signal);
               } catch (error) {
-                if (!(
-                  error instanceof TelegramInputError ||
-                  error instanceof CommandError ||
-                  error instanceof SettingsError ||
-                  (error instanceof ConversationError &&
-                    !(error instanceof ConversationBusyError))
-                ))
-                  throw error;
-                const message = value.message;
-                if (
-                  message?.from &&
-                  message.chat &&
-                  typeof error.message === "string" &&
-                  error.message
-                ) {
-                  const user = String(message.from.id);
-                  const chat = String(message.chat.id);
-                  if (
-                    this.config.users.includes(user) &&
-                    this.config.chats.includes(chat)
-                  ) {
-                    try {
-                      await this.api.call(
-                        "sendMessage",
-                        {
-                          chat_id: chat,
-                          text: error.message,
-                          ...(Number.isSafeInteger(message.message_thread_id) &&
-                          message.message_thread_id! > 0
-                            ? { message_thread_id: message.message_thread_id }
-                            : {}),
-                        },
-                        signal,
-                      );
-                    } catch {
-                      /* Best-effort; the update stays terminal. */
-                    }
-                  }
+                if (isRetryableError(error)) {
+                  const attempts =
+                    (this.retries.get(value.update_id)?.attempts ?? 0) + 1;
+                  this.retries.set(value.update_id, {
+                    lane,
+                    attempts,
+                    after:
+                      Date.now() +
+                      Math.min(30_000, 1000 * 2 ** Math.min(attempts - 1, 5)),
+                  });
+                  settle = false;
+                  console.error(
+                    `Telegram update ${value.update_id} deferred because of a transient state; retrying without completing the message.`,
+                  );
+                } else {
+                  const known =
+                    error instanceof TelegramInputError ||
+                    error instanceof CommandError ||
+                    error instanceof SettingsError ||
+                    (error instanceof ConversationError &&
+                      !(error instanceof ConversationBusyError));
+                  console.error(
+                    known
+                      ? "Telegram update rejected because of an identity conflict."
+                      : `Telegram update ${value.update_id} failed; the topic continues.`,
+                    known ? undefined : error,
+                  );
+                  const text =
+                    error instanceof Error && error.message
+                      ? error.message
+                      : "I could not process this message. The topic continues.";
+                  await this.replyToUpdate(value, text, signal);
                 }
-                // Identity conflict is terminal for this update; never retry its effects.
-                console.error(
-                  "Update Telegram rejeitado por conflito de identidade.",
-                );
               } finally {
                 this.inFlightUpdates.delete(value.update_id);
+                if (!settle) return;
+                this.retries.delete(value.update_id);
                 this.completedUpdates.add(value.update_id);
                 this.advanceOffset(key);
               }
@@ -397,9 +443,7 @@ export class TelegramPolling {
           ["invalid_token", "conflict"].includes(error.kind)
         )
           throw error;
-        console.error(
-          "Polling temporariamente indisponível; offset preservado.",
-        );
+        console.error("Polling temporarily unavailable; offset kept.");
         await delay(
           Math.min(30_000, 1000 * 2 ** Math.min(failures++, 5)),
           undefined,

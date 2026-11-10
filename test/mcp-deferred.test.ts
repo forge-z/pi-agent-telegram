@@ -125,8 +125,6 @@ test("gateway rejects unknown modes and accepts deferred alwaysLoad", async () =
   const base = {
     name: "github",
     url: "https://mcp.example/mcp",
-    readTools: [],
-    actionTools: [],
   };
   assert.doesNotThrow(
     () =>
@@ -140,12 +138,12 @@ test("gateway rejects unknown modes and accepts deferred alwaysLoad", async () =
   for (const mode of ["legacy", "codemode"]) {
     assert.throws(
       () => new McpGateway([{ ...base, mode: mode as McpConfig["mode"] }]),
-      /modo/,
+      /mode/,
     );
   }
   assert.throws(
     () => new McpGateway([{ ...base, alwaysLoad: [""] }]),
-    /listas de ferramentas/,
+    /tool lists/,
   );
 
   const deferred = new McpGateway([
@@ -154,8 +152,6 @@ test("gateway rejects unknown modes and accepts deferred alwaysLoad", async () =
       url: "http://127.0.0.1:1/mcp",
       mode: "deferred",
       alwaysLoad: ["search_code"],
-      readTools: [],
-      actionTools: [],
       allowedTools: ["search_code", "get_file"],
       deniedTools: ["delete_file"],
     },
@@ -169,11 +165,11 @@ test("gateway rejects unknown modes and accepts deferred alwaysLoad", async () =
     assert.doesNotThrow(() => deferred.assertDirect("github", "search_code"));
     assert.throws(
       () => deferred.assertDirect("github", "delete_file"),
-      /restrições configuradas/,
+      /configured restrictions/,
     );
     assert.throws(
       () => deferred.assertDirect("github", "create_issue"),
-      /restrições configuradas/,
+      /configured restrictions/,
     );
   } finally {
     await deferred.close();
@@ -262,8 +258,6 @@ test("default Executor registration stays direct and does not install tool_searc
     {
       name: "executor",
       url: "http://127.0.0.1:1/mcp",
-      readTools: [],
-      actionTools: [],
     },
   ]);
   const names = ["search", "describe", "call", "execute", "resume", "skills"];
@@ -361,8 +355,6 @@ test("deferred tools hide until tool_search, alwaysLoad stays direct, and policy
     url: `http://127.0.0.1:${address.port}/mcp`,
     mode: "deferred",
     alwaysLoad: ["search_code"],
-    readTools: [],
-    actionTools: [],
     allowedTools: ["search_code", "get_file", "create_issue"],
     deniedTools: ["delete_file"],
   };
@@ -394,11 +386,11 @@ test("deferred tools hide until tool_search, alwaysLoad stays direct, and policy
     );
     assert.throws(
       () => gateway.assertDirect("github", "delete_file"),
-      /restrições configuradas/,
+      /configured restrictions/,
     );
     await assert.rejects(
       gateway.callDirect("github", "delete_file", {}),
-      /restrições configuradas/,
+      /configured restrictions/,
     );
     assert.deepEqual(seen, []);
 
@@ -431,7 +423,7 @@ test("deferred tools hide until tool_search, alwaysLoad stays direct, and policy
     const policy = String(
       await sectionText(app, "personal-assistant", "policy"),
     );
-    assert.match(policy, /Aprovação MCP pendente/);
+    assert.match(policy, /MCP approval pending/);
     assert.match(policy, /tool_search/);
 
     const id = await app.create();
@@ -511,7 +503,7 @@ test("deferred tools hide until tool_search, alwaysLoad stays direct, and policy
     );
     assert.throws(
       () => gateway.assertDirect("github", "delete_file"),
-      /restrições configuradas/,
+      /configured restrictions/,
     );
 
     config.mode = "direct";

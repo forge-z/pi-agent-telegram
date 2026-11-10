@@ -157,8 +157,6 @@ async function fixture() {
       name: "executor",
       url: `http://127.0.0.1:${address.port}/mcp`,
       mode: "direct",
-      readTools: [],
-      actionTools: [],
     },
   ]);
   let ledger = new McpCalls(store, gateway);
@@ -208,7 +206,13 @@ test("a scheduled occurrence skips an approval pause instead of waiting for a cl
     assert.equal(f.ledger.interactions("1").length, 0);
     assert.equal(
       f.store.get<{ state: string }>("SELECT state FROM mcp_calls")?.state,
-      "skipped",
+      "uncertain",
+    );
+    // The service paused this program, but the pause alone cannot prove that
+    // earlier steps had no effects. A second action requires verification.
+    await assert.rejects(
+      f.ledger.execute("1", 2, "executor", "execute", { code: "sched" }),
+      /incerto/,
     );
     assert.equal(f.writes, 0);
   } finally {

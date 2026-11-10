@@ -27,8 +27,6 @@ const app = await Runtime.open({
       name: "mock",
       url: process.argv[3],
       mode: "direct",
-      readTools: [],
-      actionTools: [],
     },
   ]),
   models,

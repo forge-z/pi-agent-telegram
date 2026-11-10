@@ -17,7 +17,7 @@ test("formatMcpStatus mostra erro, contagem e nomes originais", () => {
       mode: "direct",
       tools: [],
       error:
-        "MCP recusou a autenticação (HTTP 401). Verifique o token ou o método de login exigido pelo servidor.",
+        "MCP refused authentication (HTTP 401). Verifique o token ou o método de login exigido pelo servidor.",
     },
     {
       server: "other",
@@ -39,8 +39,8 @@ test("formatMcpStatus mostra erro, contagem e nomes originais", () => {
     },
   ];
   const text = formatMcpStatus(servers);
-  assert.match(text, /executor: indisponível — MCP recusou a autenticação/);
-  assert.match(text, /other: conectado — 2 ferramenta/);
+  assert.match(text, /executor: unavailable — MCP refused authentication/);
+  assert.match(text, /other: connected — 2 tool/);
   assert.match(text, /search, call/);
   assert.doesNotMatch(text, /https?:\/\//);
   assert.doesNotMatch(text, /secret\.example/);
@@ -70,8 +70,6 @@ test("a seção mcp-usage acompanha o catálogo descoberto", async () => {
       name: "executor",
       url: "http://127.0.0.1:1/mcp",
       mode: "direct",
-      readTools: [],
-      actionTools: [],
     },
   ]);
   gateway.catalog = async () => [];

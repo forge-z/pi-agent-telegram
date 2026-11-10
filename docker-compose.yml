@@ -7,15 +7,10 @@ services:
     env_file:
       - path: .env
         required: false
-    environment:
-      # NODE_ENV and DATA_DIR are fixed in the image (Dockerfile ENV).
-      # Required: without these the bot refuses to start. ${VAR:?} ensures Coolify
-      # highlights them in the panel and blocks deployment until values are set.
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?}
-      TELEGRAM_ALLOWED_USERS: ${TELEGRAM_ALLOWED_USERS:?}
-      # All optional variables (LLM_*, EXECUTOR_*, TZ, ASYNC_JOB_*, etc.) reach
-      # the container through env_file above (.env). In Coolify, add them
-      # manually in the Environment Variables tab. See .env.example for details.
+    # No required variables. `npm run setup` stores the Telegram token, allowed
+    # users, model key and MCP aggregator on the volume. Values in .env are
+    # optional overrides and win over the volume. TZ stays an env var (container clock).
+    # NODE_ENV and DATA_DIR are fixed in the image (Dockerfile ENV).
 
     volumes:
       - pi_agent_tg_data:/app/data

@@ -62,6 +62,7 @@ export function queueControl(
   conversationId: string,
   text: string,
   markup?: TelegramReplyMarkup,
+  replyTo?: number,
 ) {
   app.store.savepoint("telegram_native_control", () => {
     app.store.queueTelegram(
@@ -71,6 +72,8 @@ export function queueControl(
       3500,
       conversationId,
       owner.messageThreadId,
+      undefined,
+      replyTo,
     );
     // Attach controls only to the last message if formatting splits the text.
     const parts = app.store.all<{ id: string }>(
@@ -241,7 +244,7 @@ export function discardTelegramControls(
 
   for (const row of rows) {
     store.run(
-      "UPDATE deliveries SET state='cancelled',result='Conversa excluída antes do envio.' WHERE id=? AND state='pending'",
+      "UPDATE deliveries SET state='cancelled',result='Conversation deleted before send.' WHERE id=? AND state='pending'",
       row.deliveryId,
     );
     if (!permanent) continue;

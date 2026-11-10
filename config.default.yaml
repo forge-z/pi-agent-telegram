@@ -1,0 +1,238 @@
+# Product defaults.
+#
+# Merge rules:
+# - An optional user file at $DATA_DIR/config.yaml (or CONFIG_FILE) merges on top, key-by-key.
+# - Dictionaries merge recursively.
+# - A list replaces that list entirely (no concatenation).
+# - Setting a key to null removes that key.
+# - Invalid YAML or schema violations are logged at startup and ignored; the runner continues with defaults.
+#
+# Tool classification (read/write precedence):
+# 1. Matching 'write' glob -> write (pauses for approval card).
+# 2. Matching 'read' glob -> read (safe/read-only, executes automatically).
+# 3. annotations.readOnlyHint === true from tools/list -> read ONLY if server has trust: trusted;
+#    untrusted servers ignore readOnlyHint and treat the tool as a write.
+# 4. Otherwise -> write.
+#
+# Meta/protocol tools:
+# 'search', 'describe', and 'skills' stay hardcoded reads in code; the model cannot call 'resume'.
+
+mcp_servers:
+  # Map of MCP server names to their trust level and tool lists.
+  # Servers without their own 'tools' list inherit from 'executor'.
+  executor:
+    # trust: 'trusted' | 'untrusted' (default). Only trusted servers honor annotations.readOnlyHint as reads.
+    trust: untrusted
+    tools:
+      # Globs for read-only tools. '.' separates segments; '*' matches one segment; '**' crosses segments.
+      read:
+        # Concrete paths (previously KNOWN_READS).
+        - "tools.search"
+        - "tools.describe"
+        - "tools.tinyfish.agent.runs.getRunById"
+        - "tools.tinyfish.agent.runs.listRuns"
+        - "tools.instabox.machines.readFiles"
+        - "tools.instabox.machines.list"
+        - "tools.tinyfish.fetch.root.fetchUrls"
+        - "tools.tinyfish.search.root.search"
+        # Leaf prefix (previously READ_VERBS), any depth.
+        - "get*"
+        - "list*"
+        - "read*"
+        - "search*"
+        - "fetch*"
+        - "find*"
+        - "query*"
+        - "describe*"
+        - "show*"
+        - "view*"
+        - "status*"
+        - "**.get*"
+        - "**.list*"
+        - "**.read*"
+        - "**.search*"
+        - "**.fetch*"
+        - "**.find*"
+        - "**.query*"
+        - "**.describe*"
+        - "**.show*"
+        - "**.view*"
+        - "**.status*"
+      # Globs for write tools. Takes precedence over read globs.
+      write: []
+  # Composio slugs are TOOLKIT_ACTION. An infix verb (*_GET_*, *_LIST_*, *_SEARCH_*, and the same set) is a read.
+  composio:
+    trust: untrusted
+    tools:
+      read:
+        - "*_GET_*"
+        - "*_LIST_*"
+        - "*_SEARCH_*"
+        - "*_FETCH_*"
+        - "*_FIND_*"
+        - "*_QUERY_*"
+        - "*_DESCRIBE_*"
+        - "*_SHOW_*"
+        - "*_VIEW_*"
+        - "*_STATUS_*"
+      write: []
+
+# Worker that watches every async job. Per-job read cadence stays on each
+# manifest (`poll`, `graceMinutes`). Override in $DATA_DIR/config.yaml.
+# ASYNC_JOB_TIMEOUT_MIN and ASYNC_JOB_POLL_SECONDS still override when set.
+async_job:
+  # Minutes before a still-running job is announced.
+  timeout_min: 25
+  # Seconds between worker wake-ups.
+  poll_seconds: 25
+
+# Async jobs. Each entry declares how a background job is dispatched, polled, and read.
+#
+# Polling mechanism:
+# - server: executor (or omitted): polled inside execute.
+# - Any other server: polled directly via callDirect on observe.tool.
+#
+# Override:
+# - ASYNC_JOB_MANIFESTS env var still merges on top, matched by tool.
+async_jobs:
+  # Descriptive job label.
+  tinyfish:
+    # MCP tool path that dispatches the job.
+    tool: "tools.tinyfish.agent.automation.runAsync"
+    # Target server: 'executor' polls inside execute; other servers poll directly via callDirect.
+    server: executor
+    # Dispatch contract: how job id is retrieved from the initial call response.
+    dispatch:
+      mode: immediate
+      idPath: run_id
+    # Observation contract: tool and argument template to poll job progress and final status.
+    observe:
+      mode: poll
+      tool: "tools.tinyfish.agent.runs.getRunById"
+      args:
+        accountId: "${accountId}"
+        input:
+          path:
+            id: "${job_id}"
+      statePath: status
+      resultPath: result
+      errorPath: error
+    # Reconciliation contract: look up in-flight runs if initial dispatch response was lost.
+    reconcile:
+      tool: "tools.tinyfish.agent.runs.listRuns"
+      args:
+        accountId: "${accountId}"
+        input:
+          query:
+            goal: "${goal}"
+            limit: 20
+            sort_direction: desc
+      match: goalSuffix
+      windowMinutes: 15
+    # Polling cadence, backoff steps (seconds), and max retries per attempt.
+    poll:
+      intervalSeconds: 25
+      backoff: [25, 60, 150]
+      maxAttempts: 3
+    # Grace window (minutes) before marking an unacknowledged job as failed.
+    graceMinutes: 5
+  instabox_status:
+    # Internal dispatch tool for sandbox code tasks.
+    tool: "internal.instabox.codeTask"
+    server: executor
+    dispatch:
+      mode: immediate
+    observe:
+      mode: poll
+      tool: "tools.instabox.machines.readFiles"
+      args:
+        accountId: "${INSTABOX_ACCOUNT_ID}"
+        input:
+          id: "${INSTABOX_MACHINE_ID}"
+          path: "/data/home/jobs/${id}/status.json"
+      statePath: state
+      resultPath: result
+      errorPath: error
+    poll:
+      intervalSeconds: 20
+      backoff: [20, 30, 60]
+      maxAttempts: 3
+    graceMinutes: 3
+    # When the env var is unset, list and pick. A set env var or a value in
+    # $DATA_DIR/config.yaml wins. There is no default machine name.
+    # The account step picks only when exactly one account is linked.
+    # The machine step picks only when exactly one machine is running.
+    # Zero or several is an error that lists them; nothing is chosen.
+    discover:
+      - var: INSTABOX_ACCOUNT_ID
+        tool: search
+        args:
+          namespace: tools.instabox
+          limit: 20
+        pick: single
+      - var: INSTABOX_MACHINE_ID
+        tool: tools.instabox.machines.list
+        args:
+          accountId: "${INSTABOX_ACCOUNT_ID}"
+          input: {}
+        list: machines
+        id: id
+        label: name
+        running: state
+
+# Internal sandbox code task. `tool` is the tool the model calls; `job` is the
+# async_jobs manifest above that polls the result. `exec` is the dispatch call,
+# rendered with environment variables, `${job_id}` and `${payload}` (the JSON
+# parameter object). Unset ids are filled by that manifest's `discover` steps.
+# `allow` filters one parameter. Swapping sandbox = editing this block and
+# the manifest, not code.
+sandbox_code_task:
+  tool: sandbox_code_task
+  description: 'Para qualquer tarefa que possa passar de ~60s ou quando pedirem "avise quando terminar": chame esta ferramenta uma vez. Nunca fique em loop de leitura esperando o fim. O disparo não bloqueia a conversa; o resultado chega automaticamente quando a tarefa termina. writes=true só para push, pull request ou comentário (pede aprovação antes de disparar); sem writes a tarefa é somente leitura.'
+  job: "internal.instabox.codeTask"
+  goal: prompt
+  idPrefix: "cj-"
+  server: executor
+  exec:
+    tool: "tools.instabox.machines.exec"
+    args:
+      accountId: "${INSTABOX_ACCOUNT_ID}"
+      input:
+        id: "${INSTABOX_MACHINE_ID}"
+        cmd: "bash ~/bin/start-job.sh ${job_id}"
+        timeoutSeconds: 15
+        stdin: "${payload}"
+  allow:
+    field: repo
+    # Comma-separated. `owner/*` matches that owner. Empty until the operator
+    # sets `patterns` in $DATA_DIR/config.yaml or INSTABOX_REPO_ALLOWLIST.
+    # Nothing is allowed until one of those is set. A set env var wins.
+  # writes=false prefixes `command` with `env` and appends `prompt`. writes=true waits for the card.
+  readonly:
+    env: "JOB_READONLY=1"
+    command: input.cmd
+    prompt: "Somente leitura: não faça push, não abra pull requests e não comente."
+  parameters:
+    type: object
+    required: [repo, agent, prompt]
+    properties:
+      repo:
+        type: string
+        pattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        description: "Repositório no formato owner/name permitido na allowlist"
+      agent:
+        type: string
+        enum: [agy, pi, claude]
+        description: "Agente executor na sandbox (agy, pi ou claude)"
+      prompt:
+        type: string
+        minLength: 1
+        maxLength: 32768
+        pattern: "\\S"
+        description: "Instruções completas da tarefa de código"
+      branch:
+        type: string
+        description: "Branch base/alvo opcional (padrão agent/<jobId>)"
+      writes:
+        type: boolean
+        description: "true somente para push, pull request ou comentário. O padrão é false (somente leitura, sem cartão). true pede aprovação no Telegram antes de disparar."

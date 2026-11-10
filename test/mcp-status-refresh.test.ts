@@ -19,7 +19,7 @@ import {
 } from "../src/mcp.js";
 
 const AUTH_ERROR =
-  "MCP recusou a autenticação (HTTP 401). Verifique o token ou o método de login exigido pelo servidor.";
+  "MCP refused authentication (HTTP 401). Verifique o token ou o método de login exigido pelo servidor.";
 
 function serverCatalog(
   server: string,
@@ -65,8 +65,6 @@ async function openStatus(deadline?: number) {
       name: "executor",
       url: "http://127.0.0.1:1/mcp",
       mode: "direct",
-      readTools: [],
-      actionTools: [],
     },
   ]);
   gateway.catalog = () => {
@@ -158,8 +156,6 @@ test("mcp discovery timeout is the sanitized sentence, not the upstream text", a
       name: "executor",
       url: "http://127.0.0.1:1/mcp",
       mode: "direct",
-      readTools: [],
-      actionTools: [],
     },
   ]);
   try {
@@ -180,7 +176,7 @@ test("mcp discovery timeout is the sanitized sentence, not the upstream text", a
     };
     const [failed] = await gateway.catalog();
     assert.equal(failed.timedOut, undefined);
-    assert.equal(failed.error, "Não foi possível descobrir ferramentas MCP");
+    assert.equal(failed.error, "Could not discover MCP tools");
     assert.doesNotMatch(failed.error ?? "", /secret/);
   } finally {
     await gateway.close();
@@ -227,10 +223,7 @@ test("/status returns the cached MCP snapshot without waiting for rediscovery", 
     f.age();
     await within(f.send("/status"), 3000);
     const text = f.views.at(-1)!.text;
-    assert.match(
-      text,
-      /executor: conectado — 2 ferramenta\(s\) \(search, call\)/,
-    );
+    assert.match(text, /executor: connected — 2 tool\(s\) \(search, call\)/);
     assert.doesNotMatch(text, /secret\.example/);
     assert.doesNotMatch(text, /não respondeu/);
     assert.equal(f.calls(), before + 1);
@@ -276,7 +269,7 @@ test("/status shows a stored MCP error without waiting to rediscover", async () 
     const text = f.views.at(-1)!.text;
     assert.match(
       text,
-      /executor: indisponível — MCP recusou a autenticação \(HTTP 401\)/,
+      /executor: unavailable — MCP refused authentication \(HTTP 401\)/,
     );
     assert.doesNotMatch(text, /search, call/);
     assert.doesNotMatch(text, /secret\.example/);
@@ -350,10 +343,7 @@ test("a rediscovery that answers with an error replaces the MCP snapshot", async
     assert.match(f.views.at(-1)!.text, /search, call/);
     await f.send("/status");
     const text = f.views.at(-1)!.text;
-    assert.match(
-      text,
-      /indisponível — MCP recusou a autenticação \(HTTP 401\)/,
-    );
+    assert.match(text, /unavailable — MCP refused authentication \(HTTP 401\)/);
     assert.doesNotMatch(text, /search, call/);
     assert.doesNotMatch(text, /não respondeu/);
   } finally {
@@ -378,7 +368,7 @@ test("a slow rediscovery is reported on the next /status and a later success con
     await f.send("/status");
     assert.equal(f.views.length, before + 1);
     assert.match(f.views.at(-1)!.text, /search, call/);
-    assert.match(f.views.at(-1)!.text, /A descoberta não respondeu/);
+    assert.match(f.views.at(-1)!.text, /Discovery did not answer/);
     release([serverCatalog("executor", ["describe", "execute"])]);
     await new Promise((resolve) => setTimeout(resolve, 30));
     assert.deepEqual(

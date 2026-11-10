@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -120,7 +127,7 @@ test("run-job.sh grava RUNNING e DONE com os argumentos do node -e", async () =>
     await writeFile(
       join(jobDir, "request.json"),
       JSON.stringify({
-        repo: "forge-z/example",
+        repo: "example/app",
         agent: "agy",
         prompt,
         branch: "agent/cj-argvfix1",
@@ -185,7 +192,7 @@ test("start-job.sh solta o runner numa sessão nova que sobrevive ao fim do exec
     });
     child.stdin.end(
       JSON.stringify({
-        repo: "forge-z/example",
+        repo: "example/app",
         agent: "agy",
         prompt,
         branch: "agent/cj-detach1",
@@ -251,6 +258,89 @@ function execNode(code: string, args: string[]) {
   });
 }
 
+test("JOB_READONLY=1 drops write credentials and does not open a PR", async () => {
+  const box = await sandbox();
+  const jobId = "cj-readonly1";
+  const bin = join(box.home, "..", "bin");
+  await writeFile(
+    join(bin, "gh"),
+    `#!/bin/sh
+printf 'gh %s\\n' "$*" >> "$HOME/cmd.log"
+if [ "$1" = "repo" ] && [ "$2" = "clone" ]; then mkdir -p "$4/.git"; fi
+if [ "$1" = "pr" ]; then printf '%s\\n' "https://example.test/pull/1"; fi
+exit 0
+`,
+    { mode: 0o755 },
+  );
+  await writeFile(
+    join(bin, "git"),
+    `#!/bin/sh
+printf 'git %s\\n' "$*" >> "$HOME/cmd.log"
+if [ "$1" = "-C" ]; then shift 2; fi
+case "$1" in
+  rev-parse)
+    if [ "$2" = "HEAD" ]; then printf 'local\\n'; else printf 'remote\\n'; fi
+    ;;
+esac
+exit 0
+`,
+    { mode: 0o755 },
+  );
+  await writeFile(
+    join(bin, "pi"),
+    `#!/bin/sh
+printf '%s\\n' "\${GH_TOKEN-}" "\${GITHUB_TOKEN-}" "\${GH_ENTERPRISE_TOKEN-}" "\${GH_CONFIG_DIR-}" "\${GIT_TERMINAL_PROMPT-}" > "$HOME/seen.txt"
+printf '%s\\n' "$*" > "$HOME/agent-args.txt"
+exit 0
+`,
+    { mode: 0o755 },
+  );
+  try {
+    const jobDir = join(box.home, "jobs", jobId);
+    await mkdir(jobDir, { recursive: true });
+    await writeFile(
+      join(jobDir, "request.json"),
+      JSON.stringify({
+        repo: "example/app",
+        agent: "pi",
+        prompt: "só leia o código",
+        branch: "agent/cj-readonly1",
+      }),
+    );
+    const result = await run(RUN, [jobId], {
+      ...box.env,
+      JOB_READONLY: "1",
+      GH_TOKEN: "should-not-reach-the-agent",
+      GITHUB_TOKEN: "should-not-reach-the-agent",
+      GH_ENTERPRISE_TOKEN: "should-not-reach-the-agent",
+    });
+    assert.equal(result.code, 0, result.stderr);
+    const status = await readStatus(box.home, jobId);
+    assert.equal(status.state, "DONE");
+    assert.equal(status.result?.pr, undefined);
+    const [gh, github, enterprise, configDir, promptFlag] = (
+      await readFile(join(box.home, "seen.txt"), "utf8")
+    ).split("\n");
+    assert.equal(gh, "");
+    assert.equal(github, "");
+    assert.equal(enterprise, "");
+    assert.match(configDir ?? "", /\/gh-readonly$/);
+    assert.equal(promptFlag, "0");
+    assert.deepEqual(await readdir(configDir ?? ""), []);
+    assert.match(
+      await readFile(join(box.home, "agent-args.txt"), "utf8"),
+      /não faça push/,
+    );
+    const cmds = await readFile(join(box.home, "cmd.log"), "utf8");
+    assert.match(cmds, /gh repo clone/);
+    assert.match(cmds, /config --local --unset-all credential\.helper/);
+    assert.doesNotMatch(cmds, /\bpush\b/);
+    assert.doesNotMatch(cmds, /\bpr\b/);
+  } finally {
+    await box.close();
+  }
+});
+
 test("os trechos node -e do run-job aceitam o primeiro argumento como caminho", async () => {
   const source = await readFile(RUN, "utf8");
   const snippets = [...source.matchAll(/node -e '([\s\S]*?)'/g)].map(
@@ -290,7 +380,7 @@ test("os trechos node -e do run-job aceitam o primeiro argumento como caminho", 
     await execNode(done, [
       statusPath,
       logPath,
-      "https://example.com/pull/9",
+      "https://github.com/example/other/pull/9",
       "agent/cj-snippet",
     ]);
     const status = JSON.parse(await readFile(statusPath, "utf8")) as {
@@ -298,7 +388,7 @@ test("os trechos node -e do run-job aceitam o primeiro argumento como caminho", 
       result?: { pr?: string; branch?: string; summary?: string };
     };
     assert.equal(status.state, "DONE");
-    assert.equal(status.result?.pr, "https://example.com/pull/9");
+    assert.equal(status.result?.pr, "https://github.com/example/other/pull/9");
     assert.equal(status.result?.branch, "agent/cj-snippet");
     assert.match(status.result?.summary ?? "", /resumo do agente/);
   } finally {
