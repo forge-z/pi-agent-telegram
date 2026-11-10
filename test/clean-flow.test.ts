@@ -2207,12 +2207,12 @@ test("origin: a transcript reaches the model marked as audio, verbatim", async (
       },
     );
     const text = await lastUserText(f);
+    // verbatim: the transcription is not corrected or summarized. The date is
+    // the only addition, and it sits after the transcript.
     assert.match(
       text,
-      /^\[audio transcript · \{"origin":"audio","model":"whisper-1"\}\]/,
+      /^\[audio transcript · \{"origin":"audio","model":"whisper-1"\}\]\nreunião sexta às dez\n\nCurrent date: /,
     );
-    // verbatim: the transcription is not corrected, summarized or wrapped
-    assert.match(text, /reunião sexta às dez$/);
   } finally {
     globalThis.fetch = originalFetch;
     await f.close();
@@ -2280,7 +2280,11 @@ test("origin: typed text carries no prefix and no metadata", async () => {
     // user 42 is in the allowlist; anything else is dropped before the turn
     await f.send("bom dia, tudo certo?", 11, -100123, 42);
     const text = await lastUserText(f);
-    assert.equal(text, "bom dia, tudo certo?");
+    assert.match(text, /^bom dia, tudo certo\?\n\nCurrent date: /);
+    assert.doesNotMatch(
+      text,
+      /respondendo|message_id|message_thread|\[image|\[audio/,
+    );
   } finally {
     await f.close();
   }
