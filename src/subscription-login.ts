@@ -63,7 +63,7 @@ export function oauthInteractionFromReadline(
         p.options.forEach((opt, index) => {
           console.log(`  [${index + 1}] ${opt.label ?? opt.id}`);
         });
-        const answer = (await readline.question("Escolha [1]: ")).trim() || "1";
+        const answer = (await readline.question("Choice [1]: ")).trim() || "1";
         const index = Number(answer);
         if (
           Number.isSafeInteger(index) &&
@@ -76,7 +76,7 @@ export function oauthInteractionFromReadline(
       }
       if (p.type === "manual_code" || p.type === "text") {
         console.log(p.message);
-        if (p.placeholder) console.log(`(ex.: ${p.placeholder})`);
+        if (p.placeholder) console.log(`(e.g. ${p.placeholder})`);
         return (await readline.question("> ")).trim();
       }
       if (p.type === "secret") {
@@ -84,7 +84,7 @@ export function oauthInteractionFromReadline(
       }
       const unknown = p as { message?: string };
       const fallback =
-        typeof unknown.message === "string" ? unknown.message : "Resposta";
+        typeof unknown.message === "string" ? unknown.message : "Answer";
       return (await readline.question(`${fallback}: `)).trim();
     },
     notify: (event) => {
@@ -94,11 +94,11 @@ export function oauthInteractionFromReadline(
           console.log(`${link.label ?? "Link"}: ${link.url}`);
         }
       } else if (event.type === "auth_url") {
-        console.log(event.instructions ?? "Abra este link no navegador:");
+        console.log(event.instructions ?? "Open this link in a browser:");
         console.log(event.url);
       } else if (event.type === "device_code") {
         console.log(
-          `Código: ${event.userCode}\nAbra: ${event.verificationUri}\nAguardando confirmação (até ${Math.round((event.expiresInSeconds ?? 900) / 60)} min)...`,
+          `Code: ${event.userCode}\nOpen: ${event.verificationUri}\nWaiting for confirmation (up to ${Math.round((event.expiresInSeconds ?? 900) / 60)} min)...`,
         );
       } else if (event.type === "progress") {
         console.log(event.message);

@@ -1,5 +1,10 @@
 import type { Credential, CredentialStore } from "@earendil-works/pi-ai";
-import type { StoredSetup } from "./setup.js";
+import type {
+  StoredAggregators,
+  StoredSetup,
+  StoredTelegram,
+} from "./setup.js";
+import { validAggregatorUserId, validTelegramToken } from "./setup.js";
 import { readFileSync } from "node:fs";
 import {
   createModels,
@@ -75,63 +80,109 @@ function endpoint(value: string) {
     );
   return url.href.replace(/\/$/, "");
 }
-/** MCP list JSON unless MCP_CONFIG_FILE is set. Explicit MCP_SERVERS_JSON wins over EXECUTOR_MCP_URL. */
-export function resolveMcpServersJson(env: Env = process.env) {
-  const explicit = env.MCP_SERVERS_JSON?.trim();
-  if (explicit && explicit !== "[]") return explicit;
-  const url = env.EXECUTOR_MCP_URL?.trim();
-  // URL alone must not block startup; wire Executor only when the token is present.
-  if (url && operatorSecret(env, "EXECUTOR_TOKEN"))
-    return JSON.stringify([
-      { name: "executor", url, tokenEnv: "EXECUTOR_TOKEN" },
-    ]);
-  return explicit ?? "[]";
+/** Hosted Composio Connect MCP. Project URLs use `x-api-key` instead. */
+export const COMPOSIO_CONNECT_URL = "https://connect.composio.dev/mcp";
+export const COMPOSIO_SERVER_NAME = "composio";
+
+/**
+ * Header Composio documents for this host.
+ * `connect.composio.dev` takes `x-consumer-api-key`. Every other hosted MCP URL
+ * takes `x-api-key`.
+ */
+export function composioAuthHeader(url: string) {
+  return new URL(url).hostname.toLowerCase() === "connect.composio.dev"
+    ? "x-consumer-api-key"
+    : "x-api-key";
 }
-export function readConfig(env: Env = process.env) {
-  const token = secret(env, "TELEGRAM_BOT_TOKEN");
-  const allowlist = (
-    value: string | undefined,
-    name: "TELEGRAM_ALLOWED_USERS" | "TELEGRAM_ALLOWED_CHATS",
-    negative = false,
-  ) => {
-    const trimmed = value?.trim();
-    if (!trimmed)
-      throw new Error(
-        `Configure ${name} (IDs numéricos separados por vírgula; supergrupos usam ID negativo).`,
-      );
-    const rows = trimmed
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (
-      !rows.length ||
-      rows.some(
-        (s) =>
-          !(negative ? /^-?[1-9]\d*$/ : /^[1-9]\d*$/).test(s) ||
-          !Number.isSafeInteger(Number(s)),
-      )
-    )
-      throw new Error(
-        `${name} inválido: use IDs numéricos separados por vírgula${
-          negative ? " (supergrupos nativos com ID negativo)" : ""
-        }.`,
-      );
-    return [...new Set(rows)];
-  };
-  if (!token || !/^\d+:[\w-]+$/.test(token))
-    throw new Error("Configure TELEGRAM_BOT_TOKEN ou TELEGRAM_BOT_TOKEN_FILE.");
-  const users = allowlist(env.TELEGRAM_ALLOWED_USERS, "TELEGRAM_ALLOWED_USERS");
-  const chatsRaw = env.TELEGRAM_ALLOWED_CHATS?.trim();
-  const chats = chatsRaw
-    ? allowlist(env.TELEGRAM_ALLOWED_CHATS, "TELEGRAM_ALLOWED_CHATS", true)
-    : [...users];
-  const rawMcp = env.MCP_CONFIG_FILE
-    ? readFileSync(env.MCP_CONFIG_FILE, "utf8")
-    : resolveMcpServersJson(env);
-  const parsed = json(rawMcp, "MCP");
+
+/**
+ * Project and session MCP URLs scope the user with a `user_id` query.
+ * Connect identifies the user by the consumer key and does not take that query.
+ */
+export function composioSendsUserId(url: string) {
+  return new URL(url).hostname.toLowerCase() !== "connect.composio.dev";
+}
+
+/** Same public-endpoint check the MCP list uses. */
+export function validatePublicEndpoint(value: string) {
+  return endpoint(value);
+}
+
+function blank(value: string | undefined) {
+  const trimmed = value?.trim();
+  return trimmed || undefined;
+}
+
+/**
+ * Executor and Composio from the volume, with env vars overriding each field.
+ * A complete env pair also turns that aggregator on. `MCP_SERVERS_JSON` does not
+ * come through here.
+ */
+export function mcpServersFromAggregators(
+  env: Env,
+  stored?: StoredAggregators,
+): McpConfig[] {
+  const record = stored?.record;
+  const choice = record?.choice;
+  const executorUrl = blank(env.EXECUTOR_MCP_URL);
+  const executorToken =
+    operatorSecret(env, "EXECUTOR_TOKEN") || stored?.executorToken;
+  const composioUrl = blank(env.COMPOSIO_MCP_URL);
+  const composioKey =
+    operatorSecret(env, "COMPOSIO_API_KEY") || stored?.composioKey;
+  const composioUser = blank(env.COMPOSIO_USER_ID) || record?.composio?.userId;
+  const legacy = !record;
+  const envExecutor = Boolean(
+    executorUrl && operatorSecret(env, "EXECUTOR_TOKEN"),
+  );
+  const envComposio = Boolean(
+    composioUrl && operatorSecret(env, "COMPOSIO_API_KEY"),
+  );
+  const wantExecutor = legacy
+    ? envExecutor
+    : choice === "executor" || choice === "both" || envExecutor;
+  const wantComposio = legacy
+    ? envComposio
+    : choice === "composio" || choice === "both" || envComposio;
+  const servers: McpConfig[] = [];
+  if (wantExecutor) {
+    const url = executorUrl || record?.executor?.url;
+    if (url && executorToken)
+      servers.push({
+        name: "executor",
+        url: endpoint(url),
+        mode: "direct",
+        token: executorToken,
+      });
+  }
+  if (wantComposio) {
+    const url = composioUrl || record?.composio?.url;
+    if (url && composioKey) {
+      const normalized = endpoint(url);
+      const sendUser = composioSendsUserId(normalized);
+      if (sendUser && !composioUser)
+        throw new Error(
+          "COMPOSIO_USER_ID ausente para esta URL MCP do Composio.",
+        );
+      if (sendUser && composioUser && !validAggregatorUserId(composioUser))
+        throw new Error("COMPOSIO_USER_ID inválido.");
+      servers.push({
+        name: COMPOSIO_SERVER_NAME,
+        url: normalized,
+        mode: "direct",
+        token: composioKey,
+        tokenHeader: composioAuthHeader(normalized),
+        ...(sendUser && composioUser ? { userId: composioUser } : {}),
+      });
+    }
+  }
+  return servers;
+}
+
+function parseMcpList(parsed: unknown, env: Env): McpConfig[] {
   if (!Array.isArray(parsed) || parsed.length > 20)
     throw new Error("MCP deve ser uma lista de até 20 servidores.");
-  const mcp: McpConfig[] = parsed.map((v: Record<string, unknown>) => {
+  return parsed.map((v: Record<string, unknown>) => {
     if (
       !v ||
       typeof v.name !== "string" ||
@@ -165,19 +216,96 @@ export function readConfig(env: Env = process.env) {
       );
     if (v.tokenFile !== undefined && typeof v.tokenFile !== "string")
       throw new Error("MCP tokenFile inválido.");
+    if (
+      v.tokenHeader !== undefined &&
+      (typeof v.tokenHeader !== "string" ||
+        !/^[\w-]{1,64}$/.test(v.tokenHeader))
+    )
+      throw new Error("MCP tokenHeader inválido.");
+    if (
+      v.userId !== undefined &&
+      (typeof v.userId !== "string" || !validAggregatorUserId(v.userId))
+    )
+      throw new Error("MCP userId inválido.");
     return {
       name: v.name,
       url: endpoint(v.url),
       mode: v.mode === "deferred" ? "deferred" : "direct",
-      readTools: [],
-      actionTools: [],
       ...(tokenValue ? { token: tokenValue } : {}),
       ...(v.tokenFile ? { tokenFile: String(v.tokenFile) } : {}),
+      ...(typeof v.tokenHeader === "string"
+        ? { tokenHeader: v.tokenHeader }
+        : {}),
+      ...(typeof v.userId === "string" ? { userId: v.userId } : {}),
       ...(alwaysLoad ? { alwaysLoad } : {}),
       ...(v.allowedTools ? { allowedTools: v.allowedTools as string[] } : {}),
       ...(v.deniedTools ? { deniedTools: v.deniedTools as string[] } : {}),
     };
   });
+}
+
+export function readConfig(
+  env: Env = process.env,
+  stored?: StoredAggregators,
+  telegram?: StoredTelegram,
+) {
+  // A placeholder left in the environment is not an override: the volume token stands.
+  const fromEnv = secret(env, "TELEGRAM_BOT_TOKEN");
+  const envToken =
+    fromEnv && !/replace_with/i.test(fromEnv) ? fromEnv : undefined;
+  if (envToken && !validTelegramToken(envToken))
+    throw new Error("Configure TELEGRAM_BOT_TOKEN ou TELEGRAM_BOT_TOKEN_FILE.");
+  const token = envToken || telegram?.token;
+  const allowlist = (
+    value: string | undefined,
+    name: "TELEGRAM_ALLOWED_USERS" | "TELEGRAM_ALLOWED_CHATS",
+    negative = false,
+  ) => {
+    const trimmed = value?.trim();
+    if (!trimmed)
+      throw new Error(
+        `Configure ${name} (IDs numéricos separados por vírgula; supergrupos usam ID negativo).`,
+      );
+    const rows = trimmed
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (
+      !rows.length ||
+      rows.some(
+        (s) =>
+          !(negative ? /^-?[1-9]\d*$/ : /^[1-9]\d*$/).test(s) ||
+          !Number.isSafeInteger(Number(s)),
+      )
+    )
+      throw new Error(
+        `${name} inválido: use IDs numéricos separados por vírgula${
+          negative ? " (supergrupos nativos com ID negativo)" : ""
+        }.`,
+      );
+    return [...new Set(rows)];
+  };
+  if (!token) throw new SetupRequiredError("token do Telegram");
+  if (!validTelegramToken(token))
+    throw new Error("Configure TELEGRAM_BOT_TOKEN ou TELEGRAM_BOT_TOKEN_FILE.");
+  const usersSource =
+    env.TELEGRAM_ALLOWED_USERS?.trim() || telegram?.users?.join(",");
+  if (!usersSource)
+    throw new SetupRequiredError("usuários permitidos do Telegram");
+  const users = allowlist(usersSource, "TELEGRAM_ALLOWED_USERS");
+  const chatsRaw = env.TELEGRAM_ALLOWED_CHATS?.trim();
+  const chats = chatsRaw
+    ? allowlist(env.TELEGRAM_ALLOWED_CHATS, "TELEGRAM_ALLOWED_CHATS", true)
+    : [...users];
+  const explicitMcp = env.MCP_SERVERS_JSON?.trim();
+  const rawMcp = env.MCP_CONFIG_FILE
+    ? readFileSync(env.MCP_CONFIG_FILE, "utf8")
+    : explicitMcp && explicitMcp !== "[]"
+      ? explicitMcp
+      : undefined;
+  const mcp: McpConfig[] = rawMcp
+    ? parseMcpList(json(rawMcp, "MCP"), env)
+    : mcpServersFromAggregators(env, stored);
   return {
     token,
     users,

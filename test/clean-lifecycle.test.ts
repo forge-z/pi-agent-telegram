@@ -53,6 +53,7 @@ test("polling readiness, health and graceful stop stay offline and create no top
   const f = await fixture();
   const methods: string[] = [];
   const menuLanguages: (string | undefined)[] = [];
+  const menus: string[][] = [];
   let starts = 0;
   f.app.tasks.start = () => {
     starts++;
@@ -62,9 +63,12 @@ test("polling readiness, health and graceful stop stay offline and create no top
       methods.push(method);
       if (method === "getWebhookInfo") return { url: "" };
       if (method === "setMyCommands") {
-        menuLanguages.push(
-          (payload as { language_code?: string }).language_code,
-        );
+        const body = payload as {
+          language_code?: string;
+          commands: { command: string }[];
+        };
+        menuLanguages.push(body.language_code);
+        menus.push(body.commands.map((command) => command.command));
         return true;
       }
       if (method === "getUpdates") {
@@ -89,27 +93,82 @@ test("polling readiness, health and graceful stop stay offline and create no top
     await new Promise((r) => setTimeout(r, 30));
     assert.equal(methods.length, count);
     assert.equal(f.app.store.all("SELECT * FROM conversations").length, 0);
+    const menuOrder = [
+      "model",
+      "thinking",
+      "crons",
+      "new",
+      "resume",
+      "stop",
+      "status",
+      "help",
+    ];
     assert.deepEqual(
       cleanCommands.map((c) => c.command),
-      [
-        "model",
-        "thinking",
-        "crons",
-        "stop",
-        "status",
-        "reload",
-        "new",
-        "resume",
-        "help",
-      ],
+      menuOrder,
     );
+    assert.ok(menus.length >= 2);
+    for (const menu of menus) assert.deepEqual(menu, menuOrder);
     // The base list and the Portuguese copy an earlier implementation wrote: a
     // client in that language must not keep the old commands.
     assert.deepEqual([...menuLanguages].sort(), [undefined, "pt"].sort());
+    const descriptions = cleanCommands
+      .map((command) => command.description)
+      .join("\n");
+    assert.match(descriptions, /Choose provider and model/);
+    assert.match(descriptions, /Resume a stuck task/);
+    assert.doesNotMatch(
+      descriptions,
+      /Escolher|Interromper|Começar|agendamentos|Ajuda/,
+    );
     assert.equal(
       methods.some((m) => /createForumTopic|deleteWebhook/.test(m)),
       false,
     );
+  } finally {
+    await polling.close();
+    await f.close();
+  }
+});
+test("/help lists the commands that remain and not the removed ones", async () => {
+  const f = await fixture();
+  const sent: { chat_id: string; text: string }[] = [];
+  const api: TelegramApi = {
+    call: async (method, payload) => {
+      if (method === "sendMessage") {
+        sent.push(payload as { chat_id: string; text: string });
+        return { message_id: 1 };
+      }
+      return {};
+    },
+  };
+  const polling = new TelegramPolling(f.app, api, config, { id: 123 });
+  try {
+    await polling.engine.receive({
+      update_id: 1,
+      message: {
+        message_id: 10,
+        from: { id: 42, is_bot: false },
+        chat: { id: -100123, type: "supergroup" },
+        text: "/help",
+        date: 1000,
+      },
+    });
+    await polling.engine.flush();
+    assert.equal(sent.length, 1);
+    assert.deepEqual(
+      sent[0].text
+        .split("\n")
+        .map((line) => /^\/([a-z]+)\b/.exec(line)?.[1])
+        .filter((command) => command !== undefined),
+      ["model", "thinking", "crons", "new", "resume", "stop", "status", "help"],
+    );
+    assert.match(sent[0].text, /^\/resume\b/m);
+    assert.doesNotMatch(sent[0].text, /^\/reload\b/m);
+    assert.match(sent[0].text, /provider and model/);
+    assert.doesNotMatch(sent[0].text, /provedor|esforço|agendamento/);
+    assert.doesNotMatch(sent[0].text, /^\/polling\b/m);
+    assert.doesNotMatch(sent[0].text, /^\/jobs\b/m);
   } finally {
     await polling.close();
     await f.close();
@@ -179,13 +238,13 @@ test("live mode warns once about an implicit model until a default is chosen", a
     assert.equal(app.settings.hasExplicitDefaults(), false);
     assert.match(
       app.settings.pendingModelNotice("conversation-a") ?? "",
-      /nenhum modelo padrão/,
+      /no default model/,
     );
     app.settings.markModelNoticeShown("conversation-a");
     assert.equal(app.settings.pendingModelNotice("conversation-a"), undefined);
     assert.match(
       app.settings.pendingModelNotice("conversation-b") ?? "",
-      /nenhum modelo padrão/,
+      /no default model/,
     );
     app.settings.saveDefaults({
       provider: initial.provider,
@@ -269,8 +328,6 @@ test("redaction covers API-key environment names and MCP token files", async () 
         {
           name: "executor",
           url: "https://example.test/mcp",
-          readTools: [],
-          actionTools: [],
           tokenFile,
         },
       ],

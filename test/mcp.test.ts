@@ -36,8 +36,6 @@ test("real MCP SDK connects in direct mode and calls discovered tools", async ()
       name: "mock",
       url: `http://127.0.0.1:${address.port}/mcp`,
       mode: "direct",
-      readTools: [],
-      actionTools: [],
     },
   ]);
   try {
@@ -56,8 +54,6 @@ test("real MCP SDK connects in direct mode and calls discovered tools", async ()
           {
             name: "unsafe",
             url: "http://remote.invalid/mcp",
-            readTools: [],
-            actionTools: [],
           },
         ]),
       /HTTPS/,
@@ -69,11 +65,9 @@ test("real MCP SDK connects in direct mode and calls discovered tools", async ()
             name: "old",
             url: "http://127.0.0.1:9/mcp",
             mode: "legacy",
-            readTools: [],
-            actionTools: [],
           } as unknown as McpConfig,
         ]),
-      /modo/,
+      /mode/,
     );
     assert.match(
       JSON.stringify(await gateway.callDirect("mock", "lookup", {})),
@@ -81,7 +75,7 @@ test("real MCP SDK connects in direct mode and calls discovered tools", async ()
     );
     await assert.rejects(
       gateway.callDirect("missing", "lookup", {}),
-      /restrições configuradas/,
+      /configured restrictions/,
     );
     await gateway.callDirect("mock", "create", {});
     assert.equal(reads, 1);
@@ -116,8 +110,6 @@ test("an MCP endpoint redirecting to another origin never receives the bearer to
     {
       name: "moved",
       url: `http://127.0.0.1:${address.port}/mcp`,
-      readTools: ["lookup"],
-      actionTools: [],
       token: "redirect-bearer-secret",
     },
   ]);
@@ -135,26 +127,27 @@ test("MCP configuration rejects unknown fields and malformed entries, naming the
   const base = {
     name: "alpha",
     url: "https://mcp.example/mcp",
-    readTools: [],
-    actionTools: [],
   };
   const invalid = (value: unknown) => () =>
     new McpGateway(value as McpConfig[]);
-  assert.throws(invalid({ servers: [base] }), /lista de servidores/);
-  assert.throws(invalid([base, null]), /deve ser um objeto \(servidor MCP 2\)/);
+  assert.throws(invalid({ servers: [base] }), /list of servers/);
+  assert.throws(
+    invalid([base, null]),
+    /each server must be an object \(MCP server 2\)/,
+  );
   assert.throws(
     invalid([base, { ...base, name: "beta", denyTools: ["delete"] }]),
-    /campo desconhecido: "denyTools" \(servidor MCP 2 "beta"\)/,
+    /unknown field: "denyTools" \(MCP server 2 "beta"\)/,
   );
   assert.throws(
     invalid([{ ...base, token: "first\nAuthorization: other" }]),
-    /token e tokenFile/,
+    /token and tokenFile/,
   );
-  assert.throws(invalid([{ ...base, tokenFile: 42 }]), /token e tokenFile/);
-  assert.throws(invalid([{ ...base, url: 7 }]), /nome e URL/);
+  assert.throws(invalid([{ ...base, tokenFile: 42 }]), /token and tokenFile/);
+  assert.throws(invalid([{ ...base, url: 7 }]), /name and URL/);
   assert.throws(
     invalid([{ ...base, name: "bad name" }]),
-    /confira nome, modo e listas de ferramentas \(servidor MCP 1\)$/,
+    /check the name, mode, and tool lists \(MCP server 1\)$/,
   );
   assert.doesNotThrow(invalid([{ ...base, token: undefined }]));
 });
@@ -172,8 +165,6 @@ test("an unreadable or multi-line MCP token file fails before sending, without e
   const config = (tokenFile: string): McpConfig => ({
     name: "files",
     url: `http://127.0.0.1:${address.port}/mcp`,
-    readTools: ["lookup"],
-    actionTools: [],
     tokenFile,
   });
   const missing = join(dir, "missing-token-secret-path");
@@ -181,8 +172,8 @@ test("an unreadable or multi-line MCP token file fails before sending, without e
   await writeFile(multiline, "first\nsecond\n");
   try {
     for (const [file, message] of [
-      [missing, /Arquivo de token MCP indisponível/],
-      [multiline, /Arquivo de token MCP inválido/],
+      [missing, /MCP token file unavailable/],
+      [multiline, /Invalid MCP token file/],
     ] as const) {
       const gateway = new McpGateway([config(file)]);
       try {
@@ -201,7 +192,7 @@ test("an unreadable or multi-line MCP token file fails before sending, without e
     assert.deepEqual(requests, []);
     assert.throws(
       () => new McpGateway([config(missing)]).credentialBinding("files"),
-      /Arquivo de token MCP indisponível/,
+      /MCP token file unavailable/,
     );
   } finally {
     await new Promise<void>((done) => server.close(() => done()));

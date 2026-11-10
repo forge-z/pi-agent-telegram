@@ -1,23 +1,15 @@
 # Resultado MCP incerto
 
-Quando o Pi-Agent perde o retorno de uma chamada MCP com efeito (timeout, queda de sessão, falha ao gravar o cartão de aprovação), a linha correspondente em `mcp_calls` fica com estado `uncertain`. Isso **persiste no volume SQLite** e sobrevive a redeploy.
+Quando uma escrita MCP perde o retorno (timeout, queda depois do envio, falha ao gravar o cartão), a linha em `mcp_calls` fica `uncertain`. Isso fica no SQLite e sobrevive a reinício. A chamada não é reenviada. A incerteza bloqueia novas ações **naquele servidor**; outro servidor da mesma conversa continua. Uma leitura continua disponível e **não** apaga a incerteza.
 
-## O que continua funcionando
+`/resume` marca todas as incertezas da conversa como `skipped` e registra no log. A resposta avisa, em inglês, que a chamada pode já ter sido executada (por exemplo, um e-mail pode ter saído) antes de o agente continuar. O mesmo comando também retoma uma tarefa estacionada por quedas, e faz as duas coisas numa resposta só quando as duas estão pendentes. `/status` lista cada incerteza e oferece o cartão de verificação. O cartão mostra servidor, ferramenta, alvo e parâmetros em texto. Se o conteúdo teve de ser ocultado, os botões de confirmação não aparecem e o texto aponta `/resume` como saída.
 
-- **Leituras** (`search`, `describe`, `call` com `kind: query`, ferramentas `get`/`list`/… e programas `execute` que só consultam via `tools.search` / `tools.describe` / `pick("…listRuns…")`) **não são bloqueadas**. Uma leitura bem-sucedida dispensa automaticamente o flag incerto da conversa.
-- **`/status`** lista chamadas incertas e oferece **Registrar verificação externa**.
-- O bot também envia um aviso no tópico (uma vez por chamada incerta) com o mesmo botão de registro.
+## O que conta como leitura
 
-## Como destravar sem repetir a ação
+Nomes que começam com `get`, `list`, `read`, `search`, `fetch`, `find`, `query`, `describe`, `show`, `view` ou `status`, mais um conjunto pequeno de caminhos conhecidos (`tools.instabox.machines.list`, `tools.tinyfish.fetch.root.fetchUrls` e os outros em `KNOWN_READS`). O mesmo coletor de caminhos vale para um `call` direto, um lote `calls` e um envelope `execution`. O lote só é leitura se todo caminho coletado for leitura. `resume` nunca é leitura: o modelo não pode chamar `resume`; só a decisão humana em `decide` despacha.
 
-1. **Verificar no serviço externo** (Executor, Gmail, etc.) se a ação rodou ou não.
-2. Em seguida, escolha uma opção:
-   - **Registrar verificação externa** no cartão (via `/status` ou o aviso automático) → “Verifiquei: ação concluída” ou “não executada”.
-   - **`/reload`** (atalho **`/destravar`**) no mesmo tópico → dispensa todos os resultados incertos **sem apagar o histórico** (o registro passa a `skipped` e aparece no log do processo).
+## O que não é incerteza
 
-`/stop` encerra esperas locais e aprovações pendentes; **não** remove um resultado incerto já gravado.
+`McpNotSentError` e `PolicyError` aconteceram antes do envio e ficam `failed`. Uma rejeição do Executor `InputInvalid` / `UnknownTool` (inclusive HTTP 422) sem `toolCalls` bem-sucedidos também fica `failed`, com um aviso de que nada foi despachado. Qualquer outro erro de escrita fica `uncertain`.
 
-## O que não fazer
-
-- Não confie em redeploy sozinho para limpar o estado: o volume mantém `uncertain`.
-- Não tente “reenviar” a mesma chamada com o mesmo `taskId`: o ledger recusa replay automático.
+Linhas antigas `mcp-stage:*` são apagadas na subida. Um `running` de leitura vira `failed`; um `running` de escrita vira `uncertain`.

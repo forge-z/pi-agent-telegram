@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { Store } from "../src/store.js";
 import {
   deterministicFailure,
@@ -16,8 +17,8 @@ import { buildReadInput } from "../src/job-manifest.js";
 import { isInputInvalid } from "../src/executor-result.js";
 import type { Runtime } from "../src/runtime.js";
 
-const TOOL = "tinyfish_mcp.user.personalTinyfishMcp.run_web_automation";
-const SERVER = "tinyfish_mcp.user.personalTinyfishMcp";
+const TOOL = "tinyfish_mcp.user.exampleTinyfishMcp.run_web_automation";
+const SERVER = "tinyfish_mcp.user.exampleTinyfishMcp";
 
 /** A normal reconcile manifest. The v1 ASYNC_JOB_TOOLS list no longer exists. */
 const RECONCILE_MANIFEST = {
@@ -85,7 +86,7 @@ async function fixture(
     ],
   };
   const dir = await mkdtemp(join(tmpdir(), "pi-pending-jobs-"));
-  const store = new Store(dir);
+  let store = new Store(dir);
   const submissions: {
     conversationId: string;
     text: string;
@@ -183,9 +184,18 @@ async function fixture(
       return {};
     },
   };
-  const jobs = new PendingJobs(app as unknown as Runtime, env);
+  let jobs = new PendingJobs(app as unknown as Runtime, env);
   return {
-    store,
+    get store() {
+      return store;
+    },
+    restart: () => {
+      jobs.close();
+      store.db.close();
+      store = new Store(dir);
+      app.store = store;
+      jobs = new PendingJobs(app as unknown as Runtime, env);
+    },
     setObserved: (value: unknown) => {
       observed = value;
       scriptedSet = false;
@@ -197,7 +207,9 @@ async function fixture(
     setCatalog: (value: unknown) => {
       catalog = value;
     },
-    jobs,
+    get jobs() {
+      return jobs;
+    },
     submissions,
     calls,
     app,
@@ -417,19 +429,341 @@ test("a failing reconcile read keeps the row open and retries", async () => {
     );
     for (let pass = 0; pass < 4; pass += 1) await f.jobs.tick();
     const after = f.store.get<{
-      attempts: number;
+      poll_attempts: number;
       delivered_at: number | null;
       next_poll_at: number;
-    }>("SELECT attempts, delivered_at, next_poll_at FROM pending_jobs")!;
-    assert.equal(after.attempts, 1, "o backoff impede outra leitura imediata");
+    }>("SELECT poll_attempts, delivered_at, next_poll_at FROM pending_jobs")!;
+    assert.equal(
+      after.poll_attempts,
+      1,
+      "o backoff impede outra leitura imediata",
+    );
     assert.equal(after.delivered_at, null);
     assert.ok(after.next_poll_at > Date.now());
     f.store.run("UPDATE pending_jobs SET next_poll_at=0");
     await f.jobs.tick();
     assert.equal(
-      f.store.get<{ attempts: number }>("SELECT attempts FROM pending_jobs")
-        ?.attempts,
+      f.store.get<{ poll_attempts: number }>(
+        "SELECT poll_attempts FROM pending_jobs",
+      )?.poll_attempts,
       2,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("poll errors do not exhaust delivery retries when the completed result first fails to submit", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const manifest = {
+    ...RECONCILE_MANIFEST,
+    observe: {
+      ...RECONCILE_MANIFEST.observe,
+      mode: "poll",
+      tool: `${SERVER}.get_status`,
+      args: { accountId: "acc-test", input: { id: "${id}" } },
+    },
+    poll: { backoff: [5, 15, 45], maxAttempts: 3 },
+  };
+  const f = await fixture([], [], {
+    ASYNC_JOB_MANIFESTS: JSON.stringify([manifest]),
+  });
+  try {
+    f.jobs.register(SERVER, "run_web_automation", "7", "Liste");
+    f.jobs.capture(SERVER, "run_web_automation", "7", "run-retries");
+    f.setObserved(new Error("503: transient provider failure"));
+    for (const delay of [5_000, 15_000, 45_000]) {
+      await f.jobs.tick();
+      t.mock.timers.tick(delay);
+    }
+    f.setObserved({
+      run_id: "run-retries",
+      status: "COMPLETED",
+      result: { answer: 42 },
+    });
+    const submit = f.app.submit;
+    f.app.submit = async () => {
+      throw new Error("local admission failed before delivery");
+    };
+    await f.jobs.tick();
+    const row = f.store.get<{
+      delivered_at: number | null;
+      outcome: string | null;
+      result: string;
+      next_poll_at: number;
+    }>("SELECT delivered_at, outcome, result, next_poll_at FROM pending_jobs")!;
+    assert.equal(
+      row.delivered_at,
+      null,
+      "a first delivery failure still has two retries",
+    );
+    assert.notEqual(row.outcome, "expired");
+    assert.equal(row.next_poll_at, Date.now() + 5_000);
+    assert.equal(row.result, '{"answer":42}');
+    f.app.submit = submit;
+    t.mock.timers.tick(5_000);
+    await f.jobs.tick();
+    assert.equal(f.submissions.length, 1);
+    assert.equal(
+      f.store.get<{ outcome: string }>("SELECT outcome FROM pending_jobs")
+        ?.outcome,
+      "delivered",
+    );
+    await f.jobs.tick();
+    assert.equal(f.submissions.length, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+const RETRY_MANIFEST = {
+  ...RECONCILE_MANIFEST,
+  observe: {
+    ...RECONCILE_MANIFEST.observe,
+    mode: "poll",
+    tool: `${SERVER}.get_status`,
+    args: { accountId: "acc-test", input: { id: "${id}" } },
+  },
+  poll: { backoff: [5, 15, 45], maxAttempts: 3 },
+};
+
+type RetryRow = {
+  attempts: number;
+  poll_attempts: number;
+  delivery_attempts: number;
+  next_poll_at: number;
+  delivered_at: number | null;
+  outcome: string | null;
+  result: string | null;
+};
+
+test("delivery failures keep their own budget and backoff across successful polls and restarts", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const f = await fixture([], [], {
+    ASYNC_JOB_MANIFESTS: JSON.stringify([RETRY_MANIFEST]),
+  });
+  try {
+    f.jobs.register(SERVER, "run_web_automation", "7", "Liste");
+    f.jobs.capture(SERVER, "run_web_automation", "7", "run-budget");
+    f.setObserved(new Error("503: temporary"));
+    await f.jobs.tick();
+    f.restart();
+    const afterPoll = f.store.get<RetryRow>("SELECT * FROM pending_jobs")!;
+    assert.equal(afterPoll.poll_attempts, 1);
+    assert.equal(afterPoll.delivery_attempts, 0);
+    assert.equal(afterPoll.next_poll_at, Date.now() + 5_000);
+    await f.jobs.tick();
+    assert.equal(
+      f.calls.length,
+      1,
+      "restart must respect the persisted due time",
+    );
+    t.mock.timers.tick(5_000);
+    await f.jobs.tick();
+    assert.equal(
+      f.store.get<RetryRow>("SELECT * FROM pending_jobs")!.next_poll_at,
+      Date.now() + 15_000,
+    );
+    t.mock.timers.tick(15_000);
+    f.setObserved({
+      run_id: "run-budget",
+      status: "COMPLETED",
+      result: { answer: 42 },
+    });
+    let deliveries = 0;
+    f.app.submit = async () => {
+      deliveries++;
+      throw new Error("local admission failed before delivery");
+    };
+    for (const [failures, delay] of [
+      [1, 5_000],
+      [2, 15_000],
+      [3, 45_000],
+    ]) {
+      await f.jobs.tick();
+      const row = f.store.get<RetryRow>("SELECT * FROM pending_jobs")!;
+      assert.equal(
+        row.poll_attempts,
+        0,
+        "a successful read clears only poll failures",
+      );
+      assert.equal(row.delivery_attempts, failures);
+      assert.equal(
+        row.attempts,
+        0,
+        "new failures do not alter legacy evidence",
+      );
+      assert.equal(row.result, '{"answer":42}');
+      if (failures < 3) {
+        assert.equal(row.delivered_at, null);
+        assert.equal(row.next_poll_at, Date.now() + delay);
+        f.restart();
+        await f.jobs.tick();
+        assert.equal(deliveries, failures, "no early delivery after restart");
+        t.mock.timers.tick(delay);
+      } else {
+        assert.equal(row.outcome, "expired");
+        assert.ok(row.delivered_at);
+      }
+    }
+    f.restart();
+    t.mock.timers.tick(60_000);
+    await f.jobs.tick();
+    assert.equal(deliveries, 3, "the delivery limit remains effective");
+  } finally {
+    await f.close();
+  }
+});
+
+for (const kind of [
+  "reconcile",
+  "poll",
+  "returned not-found",
+  "thrown not-found",
+] as const) {
+  test(`${kind} failures persist poll backoff without spending delivery budget`, async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+    const manifest =
+      kind === "reconcile"
+        ? { ...RECONCILE_MANIFEST, poll: RETRY_MANIFEST.poll }
+        : RETRY_MANIFEST;
+    const f = await fixture([], [], {
+      ASYNC_JOB_MANIFESTS: JSON.stringify([manifest]),
+    });
+    try {
+      f.jobs.register(SERVER, "run_web_automation", "7", "Liste");
+      if (kind !== "reconcile")
+        f.jobs.capture(SERVER, "run_web_automation", "7", "run-poll");
+      f.store.run(
+        "UPDATE pending_jobs SET created_at=?",
+        Date.now() - 6 * 60_000,
+      );
+      if (kind === "returned not-found")
+        f.setObserved({ error: "404: not found" });
+      else if (kind === "thrown not-found")
+        f.setObserved(new Error("404: not found"));
+      else
+        f.app.options.gateway.callDirect = async () => {
+          throw new Error("503: temporary");
+        };
+      for (const [failures, delay] of [
+        [1, 5_000],
+        [2, 15_000],
+        [3, 45_000],
+        [4, 45_000],
+      ]) {
+        await f.jobs.tick();
+        const row = f.store.get<RetryRow>("SELECT * FROM pending_jobs")!;
+        assert.equal(row.poll_attempts, failures);
+        assert.equal(row.delivery_attempts, 0);
+        assert.equal(row.delivered_at, null);
+        assert.equal(row.next_poll_at, Date.now() + delay);
+        f.restart();
+        await f.jobs.tick();
+        assert.equal(
+          f.store.get<RetryRow>("SELECT * FROM pending_jobs")!.poll_attempts,
+          failures,
+        );
+        t.mock.timers.tick(delay);
+      }
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+test("legacy migration seeds poll attempts and releases the row to normal polling", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-jobs-legacy-"));
+  const legacy = new DatabaseSync(join(dir, "app.sqlite"));
+  legacy.exec(`
+    CREATE TABLE pending_jobs(
+      id INTEGER PRIMARY KEY, integration TEXT NOT NULL, tool TEXT NOT NULL,
+      run_id TEXT, goal TEXT, conversation_id TEXT NOT NULL, created_at INTEGER NOT NULL,
+      delivered_at INTEGER, notified_at INTEGER, outcome TEXT, result TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0, next_poll_at INTEGER NOT NULL DEFAULT 0,
+      job_state TEXT, last_error TEXT);
+  `);
+  legacy
+    .prepare(
+      `INSERT INTO pending_jobs(id,integration,tool,run_id,goal,conversation_id,created_at,delivered_at,outcome,result,attempts,job_state,last_error)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    )
+    .run(
+      1,
+      SERVER,
+      TOOL,
+      "legacy-1",
+      "Liste",
+      "7",
+      Date.now(),
+      null,
+      null,
+      '{"saved":true}',
+      2,
+      "pending",
+      "old",
+    );
+  legacy.close();
+  const store = new Store(dir);
+  const jobs = new PendingJobs(
+    {
+      store,
+      options: { gateway: { callDirect: async () => ({}) } },
+      submit: async () => "sent",
+    } as unknown as Runtime,
+    { ASYNC_JOB_MANIFESTS: JSON.stringify([RETRY_MANIFEST]) },
+  );
+  try {
+    jobs.health();
+    const row = store.get<RetryRow>("SELECT * FROM pending_jobs WHERE id=1")!;
+    assert.equal(row.poll_attempts, 2);
+    assert.equal(row.delivery_attempts, 0);
+    assert.equal(row.attempts, 2);
+    assert.equal(row.delivered_at, null);
+    jobs.health();
+    assert.equal(
+      store.get<RetryRow>("SELECT * FROM pending_jobs WHERE id=1")!
+        .poll_attempts,
+      2,
+    );
+  } finally {
+    jobs.close();
+    store.db.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a permanent input error after transient polls closes once without retrying the action", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const f = await fixture([], [], {
+    ASYNC_JOB_MANIFESTS: JSON.stringify([RETRY_MANIFEST]),
+  });
+  try {
+    f.jobs.register(SERVER, "run_web_automation", "7", "Liste");
+    f.jobs.capture(SERVER, "run_web_automation", "7", "run-permanent");
+    f.setObserved(new Error("503: temporary"));
+    await f.jobs.tick();
+    t.mock.timers.tick(5_000);
+    f.setObserved(new Error("InputInvalid (HTTP 422): input is invalid"));
+    await f.jobs.tick();
+    const row = f.store.get<RetryRow>("SELECT * FROM pending_jobs")!;
+    assert.equal(row.outcome, "input_invalid");
+    assert.ok(row.delivered_at);
+    assert.equal(row.poll_attempts, 1);
+    assert.equal(row.delivery_attempts, 0);
+    assert.equal(f.submissions.length, 1);
+    f.restart();
+    t.mock.timers.tick(60_000);
+    await f.jobs.tick();
+    assert.equal(f.submissions.length, 1);
+    assert.equal(f.calls.length, 2);
+    assert.ok(
+      f.calls.every(
+        (call) =>
+          call.tool === "execute" &&
+          String(call.args.code).includes("get_status"),
+      ),
+      "only read tools were called",
     );
   } finally {
     await f.close();
@@ -585,11 +919,11 @@ test("a delivery that keeps failing expires instead of looping for ever", async 
       console.warn = warn;
     }
     const row = f.store.get<{
-      attempts: number;
+      delivery_attempts: number;
       outcome: string;
       delivered_at: number | null;
-    }>("SELECT attempts,outcome,delivered_at FROM pending_jobs")!;
-    assert.equal(row.attempts, 3);
+    }>("SELECT delivery_attempts,outcome,delivered_at FROM pending_jobs")!;
+    assert.equal(row.delivery_attempts, 3);
     assert.equal(row.outcome, "expired");
     assert.ok(row.delivered_at, "a linha fecha em vez de tentar para sempre");
     assert.ok(logged.some((line) => /desistindo/.test(line)));
@@ -641,7 +975,7 @@ test("a job called inside execute is registered from the code the model sent", a
     // The shape the agent really sends: the integration is called inside the sandbox.
     const opened = f.jobs.registerDelegated("7", {
       code: [
-        "const r = await tools.tinyfish_mcp.user.personalTinyfishMcp.run_web_automation({",
+        "const r = await tools.tinyfish_mcp.user.exampleTinyfishMcp.run_web_automation({",
         '  goal: "ETAPA3-2026-10-19 Liste os eventos",',
         "});",
       ].join("\n"),
@@ -703,7 +1037,7 @@ test("the poller reads runs through execute, with the integration path inside", 
     // The integration is a path inside the sandbox, not an MCP server name.
     assert.equal(call.tool, "execute");
     const code = String((call.args as { code?: string }).code ?? "");
-    assert.match(code, /tinyfish_mcp\.user\.personalTinyfishMcp\.list_runs/);
+    assert.match(code, /tinyfish_mcp\.user\.exampleTinyfishMcp\.list_runs/);
     assert.match(code, /"sort_direction":"asc"/);
     assert.equal(f.submissions.length, 1);
   } finally {
@@ -1343,7 +1677,7 @@ test("two poller passes on a timed-out row wake the user at most once", async ()
   try {
     f.jobs.register(SERVER, "run_web_automation", "7", "Liste");
     f.store.run(
-      "UPDATE pending_jobs SET created_at=?, next_poll_at=?, attempts=? WHERE id=1",
+      "UPDATE pending_jobs SET created_at=?, next_poll_at=?, poll_attempts=? WHERE id=1",
       Date.now() - 60 * 60_000,
       Date.now(),
       3,
@@ -1511,12 +1845,12 @@ test("a run completed in 42 seconds is delivered before any timeout", async () =
       data: {
         run_id: "run-42s",
         status: "COMPLETED",
-        result: { titulo: "Example Page" },
+        result: { titulo: "Usinagem360" },
       },
     });
     await f.jobs.tick();
     assert.equal(f.submissions.length, 1);
-    assert.match(f.submissions[0].text, /Example Page/);
+    assert.match(f.submissions[0].text, /Usinagem360/);
     assert.doesNotMatch(
       f.submissions[0].text,
       /TIMEOUT|ainda não terminou|continua rodando/,
@@ -1677,7 +2011,7 @@ test("status.json lido via content -> DONE entrega uma vez com o link do PR", as
       content: JSON.stringify({
         state: "DONE",
         result: {
-          pr: "https://example.com/pull/123",
+          pr: "https://github.com/example/repo/pull/123",
           branch: "agent/cj-done-1",
           summary: "Feature implementada com sucesso",
         },
@@ -1688,7 +2022,7 @@ test("status.json lido via content -> DONE entrega uma vez com o link do PR", as
     assert.equal(f.submissions.length, 1, "entrega exatamente uma vez");
     assert.match(
       f.submissions[0].text,
-      /https:\/\/example\.com\/pull\/123/,
+      /https:\/\/github\.com\/example\/repo\/pull\/123/,
       "resumo cita o link do PR",
     );
     assert.match(f.submissions[0].text, /Status: DONE/);
@@ -1801,7 +2135,7 @@ test("leitura que estoura o timeout não segura o próximo tick", async () => {
       path: "/data/home/jobs/cj-timeout-1/status.json",
       content: JSON.stringify({
         state: "DONE",
-        result: { pr: "https://example.com/pull/999" },
+        result: { pr: "https://github.com/example/repo/pull/999" },
       }),
     });
     // Forçar next_poll_at para agora
@@ -1817,7 +2151,7 @@ test("leitura que estoura o timeout não segura o próximo tick", async () => {
   }
 });
 
-test("aviso após 25 min (novo padrão de ASYNC_JOB_TIMEOUT_MIN)", async () => {
+test("aviso após 25 min (padrão de async_job.timeout_min)", async () => {
   const f = await fixture([], [], {
     INSTABOX_MACHINE_ID: "machine-123",
     INSTABOX_ACCOUNT_ID: "acc-test",
@@ -1853,6 +2187,101 @@ test("aviso após 25 min (novo padrão de ASYNC_JOB_TIMEOUT_MIN)", async () => {
     assert.match(f.submissions[0].text, /depois de 25 minutos/i);
   } finally {
     await f.close();
+  }
+});
+
+test("async job timeout and poll use config.yaml, with env as an override", async () => {
+  const lines: string[] = [];
+  const original = console.info;
+  console.info = (...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  };
+  const empty = await mkdtemp(join(tmpdir(), "pi-job-timing-empty-"));
+  const root = await mkdtemp(join(tmpdir(), "pi-job-timing-"));
+  await writeFile(
+    join(root, "config.yaml"),
+    ["async_job:", "  timeout_min: 10", "  poll_seconds: 8", ""].join("\n"),
+  );
+  const instabox = {
+    INSTABOX_MACHINE_ID: "machine-123",
+    INSTABOX_ACCOUNT_ID: "acc-test",
+    DATA_DIR: root,
+  };
+  const plain = await fixture([], [], { DATA_DIR: empty });
+  const custom = await fixture([], [], instabox);
+  const fromEnv = await fixture([], [], {
+    ...instabox,
+    ASYNC_JOB_TIMEOUT_MIN: "4",
+    ASYNC_JOB_POLL_SECONDS: "3",
+  });
+  try {
+    plain.jobs.start();
+    custom.jobs.start();
+    fromEnv.jobs.start();
+    assert.ok(lines.some((line) => line.includes("poll_interval=25s")));
+    assert.ok(lines.some((line) => line.includes("poll_interval=8s")));
+    assert.ok(lines.some((line) => line.includes("poll_interval=3s")));
+    plain.jobs.close();
+    custom.jobs.close();
+    fromEnv.jobs.close();
+
+    const running = {
+      path: "/data/home/jobs/cj-cfg/status.json",
+      content: JSON.stringify({ state: "RUNNING" }),
+    };
+    custom.jobs.registerKnown(
+      "chat-1",
+      "internal.instabox.codeTask",
+      "cj-cfg",
+      "tarefa longa",
+    );
+    custom.setObserved(running);
+    custom.store.run(
+      "UPDATE pending_jobs SET created_at=?",
+      Date.now() - 9 * 60_000,
+    );
+    await custom.jobs.tick();
+    assert.equal(custom.submissions.length, 0, "9 min ainda cabe em 10");
+    custom.store.run(
+      "UPDATE pending_jobs SET created_at=?, next_poll_at=?",
+      Date.now() - 11 * 60_000,
+      Date.now() - 1000,
+    );
+    await custom.jobs.tick();
+    assert.equal(custom.submissions.length, 1);
+    assert.match(custom.submissions[0].text, /depois de 10 minutos/i);
+
+    fromEnv.jobs.registerKnown(
+      "chat-1",
+      "internal.instabox.codeTask",
+      "cj-env",
+      "tarefa curta",
+    );
+    fromEnv.setObserved({
+      ...running,
+      path: "/data/home/jobs/cj-env/status.json",
+    });
+    fromEnv.store.run(
+      "UPDATE pending_jobs SET created_at=?",
+      Date.now() - 3 * 60_000,
+    );
+    await fromEnv.jobs.tick();
+    assert.equal(fromEnv.submissions.length, 0, "3 min ainda cabe em 4");
+    fromEnv.store.run(
+      "UPDATE pending_jobs SET created_at=?, next_poll_at=?",
+      Date.now() - 5 * 60_000,
+      Date.now() - 1000,
+    );
+    await fromEnv.jobs.tick();
+    assert.equal(fromEnv.submissions.length, 1);
+    assert.match(fromEnv.submissions[0].text, /depois de 4 minutos/i);
+  } finally {
+    console.info = original;
+    await plain.close();
+    await custom.close();
+    await fromEnv.close();
+    await rm(empty, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -1907,7 +2336,7 @@ test("status.json no envelope real do Executor entrega o PR e não expira", asyn
       content: JSON.stringify({
         state: "DONE",
         result: {
-          pr: "https://example.com/pull/7",
+          pr: "https://github.com/example/other/pull/7",
           summary: "pronto",
         },
       }),
@@ -1921,7 +2350,10 @@ test("status.json no envelope real do Executor entrega o PR e não expira", asyn
     assert.match(code, /await tools\.instabox\.machines\.readFiles\(/);
     assert.doesNotMatch(code, /==\s*null/);
     assert.equal(f.submissions.length, 1);
-    assert.match(f.submissions[0].text, /https:\/\/example\.com\/pull\/7/);
+    assert.match(
+      f.submissions[0].text,
+      /https:\/\/github\.com\/example\/other\/pull\/7/,
+    );
     assertNeverExpired(f.submissions, "sucesso não é resultado expirado");
   } finally {
     await f.close();
@@ -1979,6 +2411,139 @@ test("404 de status.json ausente fica em silêncio na carência e nunca diz expi
       "status.json ausente nunca produz o aviso de expirado",
     );
   } finally {
+    await f.close();
+  }
+});
+
+test("a poll error names the job, and a stuck missing status file ends at the timeout", async () => {
+  const errors: string[] = [];
+  const infos: string[] = [];
+  const warns: string[] = [];
+  const originalError = console.error;
+  const originalInfo = console.info;
+  const originalWarn = console.warn;
+  console.error = (...args: unknown[]) => {
+    errors.push(args.map(String).join(" "));
+  };
+  console.info = (...args: unknown[]) => {
+    infos.push(args.map(String).join(" "));
+  };
+  console.warn = (...args: unknown[]) => {
+    warns.push(args.map(String).join(" "));
+  };
+  const secret = "Bearer fixture sk-abcdefgh";
+  const f = await fixture([], [], {
+    INSTABOX_MACHINE_ID: "machine-123",
+    INSTABOX_ACCOUNT_ID: "acc-test",
+  });
+  try {
+    f.jobs.registerKnown(
+      "chat-1",
+      "internal.instabox.codeTask",
+      "cj-stuck-1",
+      "tarefa que não chegou a começar",
+    );
+    const detail =
+      `File not found: /data/home/jobs/cj-stuck-1/status.json ${secret} ` +
+      `${"y".repeat(300)} TAILMARKER`;
+    f.setResult(
+      executorFailed({
+        kind: "ToolCallFailed",
+        message: detail,
+        response: { code: "not_found", status: 404, message: "not_found" },
+      }),
+    );
+    await f.jobs.tick();
+    const rowId = f.store.get<{ id: number }>(
+      "SELECT id FROM pending_jobs",
+    )!.id;
+    const line = errors.find((item) => item.startsWith("jobs_poller: error "));
+    assert.ok(line, "cada erro do tick tem uma linha");
+    assert.equal(line.includes("\n"), false);
+    assert.match(line, new RegExp(`job=${rowId} manifest=`));
+    assert.match(line, /manifest=internal\.instabox\.codeTask/);
+    assert.match(line, /step=observe/);
+    const reason = line.slice(line.indexOf(" error=") + " error=".length);
+    assert.ok(reason.length > 0 && reason.length <= 200, reason);
+    assert.match(reason, /File not found/);
+    assert.doesNotMatch(reason, /sk-abcdefgh/);
+    assert.doesNotMatch(reason, /Bearer/);
+    assert.doesNotMatch(reason, /TAILMARKER/);
+    assert.ok(
+      infos.some((item) =>
+        /jobs_poller: tick rows_polled=1 delivered=0 errors=1/.test(item),
+      ),
+      "o resumo do tick continua",
+    );
+    assert.equal(f.submissions.length, 0, "silêncio dentro da carência");
+    assert.equal(
+      f.store.get<{ delivered_at: number | null }>(
+        "SELECT delivered_at FROM pending_jobs",
+      )?.delivered_at,
+      null,
+    );
+
+    f.store.run(
+      "UPDATE pending_jobs SET created_at=?, next_poll_at=?",
+      Date.now() - 4 * 60_000,
+      Date.now() - 1000,
+    );
+    await f.jobs.tick();
+    assert.equal(
+      f.submissions.length,
+      1,
+      "o aviso da carência segue o de hoje",
+    );
+    assert.match(f.submissions[0].text, /não pôde ser relido/);
+    assert.doesNotMatch(f.submissions[0].text, /expirado/i);
+    const mid = f.store.get<{
+      delivered_at: number | null;
+      outcome: string | null;
+    }>("SELECT delivered_at, outcome FROM pending_jobs")!;
+    assert.equal(
+      mid.delivered_at,
+      null,
+      "antes do timeout a linha segue aberta",
+    );
+    assert.equal(mid.outcome, null);
+
+    f.store.run(
+      "UPDATE pending_jobs SET created_at=?, next_poll_at=?",
+      Date.now() - 26 * 60_000,
+      Date.now() - 1000,
+    );
+    await f.jobs.tick();
+    const closed = f.store.get<{
+      delivered_at: number | null;
+      outcome: string | null;
+    }>("SELECT delivered_at, outcome FROM pending_jobs")!;
+    assert.ok(closed.delivered_at, "depois do timeout a linha fecha");
+    assert.equal(closed.outcome, "provider_timeout");
+    assert.equal(f.submissions.length, 1, "fechar não avisa de novo");
+    assert.doesNotMatch(f.submissions[0].text, /expirado/i);
+    assert.ok(
+      warns.some((item) => /outcome=provider_timeout/.test(item)),
+      "o fechamento fica no log do operador",
+    );
+    assert.ok(
+      warns.every(
+        (item) => !item.includes("sk-abcdefgh") && !item.includes("Bearer "),
+      ),
+    );
+
+    const logged = errors.length;
+    await f.jobs.tick();
+    assert.equal(errors.length, logged, "a linha fechada não erra de novo");
+    assert.equal(f.submissions.length, 1);
+    assert.ok(
+      infos.some((item) =>
+        /jobs_poller: tick rows_polled=0 delivered=0 errors=0/.test(item),
+      ),
+    );
+  } finally {
+    console.error = originalError;
+    console.info = originalInfo;
+    console.warn = originalWarn;
     await f.close();
   }
 });
@@ -2047,7 +2612,7 @@ test("DONE sem resultado ainda avisa que expirou de verdade", async () => {
 
 test("getRunById and listRuns are built as { accountId, input }", () => {
   const account = "acc_explicit_not_a_default";
-  const run = "00000000-0000-4000-8000-000000000001";
+  const run = "7cdceb90-bb6f-456c-86ef-4b6628a021a4";
   const byId = buildReadInput(
     {
       accountId: "${accountId}",
@@ -2067,7 +2632,7 @@ test("getRunById and listRuns are built as { accountId, input }", () => {
         query: { goal: "${goal}", limit: 20, sort_direction: "desc" },
       },
     },
-    { accountId: account, goal: "example-goal" },
+    { accountId: account, goal: "FECHAMENTO-2026-10-21" },
   );
   assert.equal(listed.ok, true);
   if (!listed.ok) return;
@@ -2075,7 +2640,7 @@ test("getRunById and listRuns are built as { accountId, input }", () => {
     accountId: account,
     input: {
       query: {
-        goal: "example-goal",
+        goal: "FECHAMENTO-2026-10-21",
         limit: 20,
         sort_direction: "desc",
       },
@@ -2085,12 +2650,12 @@ test("getRunById and listRuns are built as { accountId, input }", () => {
 
 test("a COMPLETED run is delivered from getRunById with the explicit account", async () => {
   const account = "acc_explicit_not_a_default";
-  const run = "00000000-0000-4000-8000-000000000001";
+  const run = "7cdceb90-bb6f-456c-86ef-4b6628a021a4";
   const f = await fixture([], [], {});
   try {
     assert.equal(
       f.jobs.registerDelegated("7", {
-        code: `await tools.tinyfish.agent.automation.runAsync({accountId:'${account}', input:{body:{goal:'example-goal'}}})`,
+        code: `await tools.tinyfish.agent.automation.runAsync({accountId:'${account}', input:{body:{goal:'FECHAMENTO-2026-10-21'}}})`,
       }),
       true,
     );
@@ -2127,7 +2692,7 @@ test("listRuns reconciliation sends { accountId, input: { query } }", async () =
   const f = await fixture([], [], {});
   try {
     f.jobs.registerDelegated("7", {
-      code: `await tools.tinyfish.agent.automation.runAsync({accountId:'${account}', input:{body:{goal:'example-goal'}}})`,
+      code: `await tools.tinyfish.agent.automation.runAsync({accountId:'${account}', input:{body:{goal:'FECHAMENTO-2026-10-21'}}})`,
     });
     await f.jobs.tick();
     const program = String(
@@ -2140,7 +2705,7 @@ test("listRuns reconciliation sends { accountId, input: { query } }", async () =
       accountId: account,
       input: {
         query: {
-          goal: "example-goal",
+          goal: "FECHAMENTO-2026-10-21",
           limit: 20,
           sort_direction: "desc",
         },
@@ -2240,7 +2805,7 @@ test("an unreadable shape does not open a row and disables the tool", async () =
       0,
     );
     assert.equal(errors.length, 1, "o alerta sai uma vez");
-    assert.match(errors[0]!, /desabilitado/);
+    assert.match(errors[0]!, /disabled/);
     assert.match(errors[0]!, /Expected object/);
   } finally {
     console.error = original;
@@ -2366,8 +2931,9 @@ test("cada tick publica contadores, inclusive quando não há linhas", async () 
 
 test("runAsync via execute entrega o resultado sem env de conta", async () => {
   const account = "acc_from_the_call";
-  const run = "11111111-2222-4333-8444-555555555555";
-  const goal = "abra https://example.com e devolva o titulo da pagina";
+  const run = "8871d083-2a94-45fb-ab51-e11e85cfebb8";
+  const goal =
+    "POS-PI-2026-10-21: abra https://example.com e devolva o titulo da pagina";
   const f = await fixture([], [], {});
   f.setCatalog({
     namespaces: [
@@ -2395,7 +2961,8 @@ test("runAsync via execute entrega o resultado sem env de conta", async () => {
         },
       ],
     };
-    assert.equal(f.jobs.beginDispatch("7", "executor", "execute", args), true);
+    const job = f.jobs.beginDispatch("7", "executor", "execute", args);
+    assert.equal(job, true);
     const dispatch = f.jobs.finishDispatch(
       "7",
       "executor",
@@ -2464,7 +3031,7 @@ test("runAsync via execute entrega o resultado sem env de conta", async () => {
 
 test("runAsync via call também entrega uma vez", async () => {
   const account = "acc_from_call";
-  const run = "11111111-2222-4333-8444-555555555555";
+  const run = "8871d083-2a94-45fb-ab51-e11e85cfebb8";
   const f = await fixture([], [], {});
   try {
     const args = {
@@ -2474,7 +3041,7 @@ test("runAsync via call também entrega uma vez", async () => {
         input: {
           body: {
             url: "https://example.com",
-            goal: "example via call",
+            goal: "POS-PI via call",
           },
         },
       },
@@ -2493,7 +3060,8 @@ test("runAsync via call também entrega uma vez", async () => {
         },
       ],
     };
-    assert.equal(f.jobs.beginDispatch("7", "executor", "call", args), true);
+    const job = f.jobs.beginDispatch("7", "executor", "call", args);
+    assert.equal(job, true);
     f.jobs.finishDispatch("7", "executor", "call", args, envelope);
     f.setObserved({
       run_id: run,
@@ -2547,12 +3115,12 @@ test("duas contas no catálogo sem conta na chamada fecham com ambiguous_account
 });
 
 test("o mesmo run_id real não é inserido duas vezes e várias linhas sem id convivem", async () => {
-  const run = "00000000-0000-4000-8000-000000000099";
+  const run = "c7f42ac4-f479-4ef1-9ad4-9fd0d7a82e1f";
   const account = "acc_from_the_call";
   const f = await fixture([], [], {});
   try {
     const args = {
-      code: `await tools.tinyfish.agent.automation.runAsync({accountId:'${account}', input:{body:{goal:'abra https://example.com e devolva o titulo'}}})`,
+      code: `await tools.tinyfish.agent.automation.runAsync({accountId:'${account}', input:{body:{goal:'POS-99: abra https://example.com e devolva o titulo'}}})`,
     };
     const envelope = {
       content: [
@@ -2568,7 +3136,8 @@ test("o mesmo run_id real não é inserido duas vezes e várias linhas sem id co
         },
       ],
     };
-    assert.equal(f.jobs.beginDispatch("7", "executor", "execute", args), true);
+    const job = f.jobs.beginDispatch("7", "executor", "execute", args);
+    assert.equal(job, true);
     // The poller can claim the id while execute is still in flight.
     f.store.run("UPDATE pending_jobs SET run_id=? WHERE run_id IS NULL", run);
     let thrown: unknown;

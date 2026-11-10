@@ -68,8 +68,6 @@ test("Durable registered MCP tools recover after idle expiry without manual refr
       name: "mock",
       url: `http://127.0.0.1:${address.port}/mcp`,
       mode: "direct",
-      readTools: [],
-      actionTools: [],
     },
   ]);
   const dir = await mkdtemp(join(tmpdir(), "mcp-runtime-recovery-"));

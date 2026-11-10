@@ -41,8 +41,8 @@ Faça isso uma vez, fora do Coolify, para não descobrir erro de configuração 
    o mesmo token (o app falha fechado se detectar webhook ou segundo consumidor).
 5. **Volume novo.** Não reuse um `pi_agent_tg_data` de outro bot: o app recusa subir com
    "Volume pertence a outro bot".
-6. Tenha em mãos: bot token, user IDs permitidos e, se houver, `EXECUTOR_MCP_URL` +
-   `EXECUTOR_TOKEN`. A chave do modelo entra depois, com `npm run setup` ou `npm run login`.
+6. Tenha em mãos o token do bot e os user IDs. Os dois entram no `npm run setup`,
+   junto da chave do modelo (ou `npm run login`) e, se houver, Executor ou Composio.
 
 ## 1. Criar o recurso
 
@@ -54,33 +54,27 @@ Faça isso uma vez, fora do Coolify, para não descobrir erro de configuração 
 
 ## 2. Variáveis de runtime
 
-### Obrigatórias (declaradas em `docker-compose.yml`)
+Nenhuma variável de ambiente é obrigatória para o container subir. O token do bot e os user IDs entram no `npm run setup` (token em entrada oculta; Enter mantém o valor já gravado, mostrado mascarado) e ficam no volume, na mesma base `credentials` / `meta` da chave do modelo e dos agregadores. Sem token no ambiente nem no volume, o processo registra o aviso e permanece no ar, saudável, em vez de cair em restart loop.
 
-Apenas duas variáveis são estritamente obrigatórias para o container subir saudável:
-
-- `TELEGRAM_BOT_TOKEN` — token do bot Telegram (gerado via @BotFather).
-- `TELEGRAM_ALLOWED_USERS` — user IDs numéricos de quem tem permissão para usar o bot.
-
-No `docker-compose.yml`, ambas usam a sintaxe `${VAR:?}`. De acordo com a documentação oficial do Coolify (seção _Docker Compose → Environment Variables_):
-
-- O Coolify lê o Compose e cria automaticamente no painel (aba **Environment Variables**) cada variável declarada com `${VAR}`.
-- O sufixo `:?` marca a variável como obrigatória: o Coolify a destaca na interface caso esteja vazia e bloqueia o deploy até que receba um valor válido.
+O `docker-compose.yml` não declara variáveis em `environment:`. Nada fica travado no painel do Coolify.
 
 ### Opcionais (adicionadas manualmente no painel do Coolify)
 
-Todas as demais variáveis são opcionais e **não** estão declaradas no bloco `environment:` do Compose:
+Todas as variáveis são opcionais. Quando definidas, vencem o valor gravado no volume:
 
+- `TELEGRAM_BOT_TOKEN` / `TELEGRAM_BOT_TOKEN_FILE` e `TELEGRAM_ALLOWED_USERS`: override do que o `npm run setup` gravou. Sem elas, vale o volume.
 - `LLM_BASE_URL` e `LLM_API_KEY`: não fazem parte do caminho oficial. Use `npm run setup` ou `npm run login`. Essas duas variáveis só ligam o provedor compatível `llm` (menu "Outro") e não substituem um setup oficial já gravado no volume.
-- `EXECUTOR_MCP_URL` e `EXECUTOR_TOKEN`: opcionais (em par). Sem elas, o bot sobe normalmente, apenas sem ferramentas externas MCP.
-- `TELEGRAM_ALLOWED_CHATS`: opcional (IDs negativos de grupos/supergrupos; por padrão copia `TELEGRAM_ALLOWED_USERS` para DMs).
-- `TZ`: opcional (fuso do relógio do container para logs, ex.: `America/Sao_Paulo`; omitido usa UTC). Agendamentos gravam seu próprio timezone IANA.
+- `EXECUTOR_MCP_URL` e `EXECUTOR_TOKEN`: opcionais (em par). O caminho normal é `npm run setup`, que pergunta Executor, Composio ou ambos e grava URL, chave e user id no volume. `COMPOSIO_MCP_URL`, `COMPOSIO_API_KEY` e `COMPOSIO_USER_ID` só substituem esse registro. Sem agregador, o bot sobe normalmente, apenas sem ferramentas externas MCP.
+- `TELEGRAM_ALLOWED_CHATS`: opcional (IDs negativos de grupos/supergrupos; por padrão copia os usuários permitidos para DMs). Continua só no ambiente.
+- `TZ`: opcional (fuso do relógio do container para logs, ex.: `America/Sao_Paulo`; omitido usa UTC). Agendamentos gravam seu próprio timezone IANA. O setup não grava `TZ`.
 - `LLM_MODELS`, `LLM_INPUT`, `VISION_*`, `AUDIO_*`, `ASYNC_JOB_*`, `INSTABOX_*`: opcionais para recursos específicos. A referência completa com exemplos está em [.env.example](.env.example).
 
 A única forma de o assistente alcançar algo fora da conversa é MCP: ele não tem shell,
 arquivo, patch nem browser, e não enxerga o host, o volume ou o código-fonte.
-[Executor](https://executor.sh) é a forma preferida de expor todos os MCPs num único
-endpoint autenticado — um `EXECUTOR_MCP_URL` + `EXECUTOR_TOKEN` já cobre toda a
-superfície de ferramentas. `NODE_ENV`, `DATA_DIR` e o SHA do commit não são
+[Executor](https://executor.sh) ou [Composio](https://composio.dev) expõem os MCPs num
+endpoint autenticado. Executor continua `Authorization: Bearer`. Composio Connect
+(`https://connect.composio.dev/mcp`) usa `x-consumer-api-key`; as outras URLs MCP
+da Composio usam `x-api-key` e o query `user_id`. `NODE_ENV`, `DATA_DIR` e o SHA do commit não são
 configuração: dois são fixados pela imagem (`Dockerfile`) e o SHA é injetado pela plataforma.
 
 Não existem mais variáveis de modelo: `MODEL_PROVIDER` e `MODEL_ID` saíram, e as chaves
@@ -93,7 +87,7 @@ No Coolify, **qualquer variável declarada no `docker-compose.yml` fica travada 
 
 Para resolver isso e manter o painel limpo:
 
-1. O `docker-compose.yml` mantém apenas as obrigatórias sob `environment:`.
+1. O `docker-compose.yml` não lista variáveis em `environment:`.
 2. O Compose inclui:
    ```yaml
    env_file:
@@ -111,7 +105,8 @@ Depois de atualizar o repositório e fazer o deploy desta versão:
 
 - O Coolify destrava a remoção dessas variáveis no painel porque elas não constam mais no `docker-compose.yml`.
 - **Apague no painel** as variáveis que o bot não lê mais: `ASYNC_JOB_TOOLS` e `EXECUTOR_ACCOUNT_ID`. A conta da leitura vem da chamada que criou o job. Não há migração manual; a coluna `pending_jobs.account_id` é criada no boot.
-- Variáveis opcionais que você realmente usa (ex.: `EXECUTOR_TOKEN`, `EXECUTOR_MCP_URL`, `TZ`) podem permanecer no painel: elas continuarão chegando ao container normalmente via `.env`.
+- Variáveis opcionais que você realmente usa (ex.: `TZ`) podem permanecer no painel: elas continuarão chegando ao container normalmente via `.env`.
+- Depois de rodar `npm run setup` neste container, `TELEGRAM_BOT_TOKEN` e `TELEGRAM_ALLOWED_USERS` podem sair do painel: o volume guarda os dois. Se continuarem definidas, vencem o volume.
 
 ### Variáveis fixas da imagem
 
@@ -163,10 +158,6 @@ build nem necessidade de **Source commit availability → Available during build
   rode duas instâncias contra o mesmo volume.
 - Antes de trocar de versão, faça backup do volume. Tópicos e conversas só são criados
   no primeiro uso — nada é criado no startup.
-- **Upgrade para o Pi 1.4.0.** O primeiro boot migra `/app/data/durable.sqlite` para o
-  schema 2 do pi-durable. Essa migração não tem rollback: a imagem anterior não lê o
-  schema 2. Faça backup do volume antes do deploy e, se precisar voltar, restaure o
-  backup junto com a imagem antiga. Esta release não adiciona outra migração.
 
 ## 5. Hardening e possíveis atritos
 
@@ -213,9 +204,7 @@ imagem.
 - Rebuild local: `npm run compose:up`, ou
   `SOURCE_COMMIT=$(git rev-parse HEAD) docker compose up -d --build`.
 - Rollback: selecione um commit anterior no Coolify e redeploy. Restaure o backup do
-  volume junto — o ledger SQLite é a única fonte de verdade das conversas. O primeiro
-  boot que levou o volume ao Pi 1.4 migrou `durable.sqlite` para o schema 2 sem caminho
-  de volta; a imagem anterior não abre esse arquivo. Esta release permanece no schema 2.
+  volume junto — o ledger SQLite é a única fonte de verdade das conversas.
 
 ## 9. Quando algo falha
 
@@ -234,8 +223,10 @@ O processo falha fechado e imprime uma mensagem segura (sem segredos). Localize 
 | `Catálogo de modelos indisponível em LLM_BASE_URL (catálogo inválido)…`                 | resposta fora de `{data:[{id}]}` ou lista                         | declare `LLM_MODELS`                                      |
 | `Nenhum modelo disponível. Verifique LLM_BASE_URL ou defina LLM_MODELS.`                | endpoint respondeu sem modelos                                    | declare `LLM_MODELS`                                      |
 | `LLM_MODELS inválido: …`                                                                | formato fora de `id` ou `id\|contextWindow\|maxTokens\|reasoning` | ajuste o formato                                          |
-| `Configure TELEGRAM_BOT_TOKEN ou TELEGRAM_BOT_TOKEN_FILE.`                              | token ausente ou fora de `123456:ABC…`                            | preencha o token do bot                                   |
-| `Configure TELEGRAM_ALLOWED_USERS (IDs numéricos …).`                                   | allowlist ausente ou não numérica                                 | informe user IDs                                          |
+| `Sem token do Telegram no ambiente nem no volume. Rode npm run setup…`                  | token ausente no ambiente e no volume                             | `npm run setup` no terminal do container                  |
+| `Configure TELEGRAM_BOT_TOKEN ou TELEGRAM_BOT_TOKEN_FILE.`                              | token fora de `123456:ABC…`                                       | corrija o token (ambiente ou setup)                       |
+| `Sem usuários permitidos do Telegram no ambiente nem no volume…`                        | allowlist ausente                                                 | `npm run setup` ou `TELEGRAM_ALLOWED_USERS`               |
+| `TELEGRAM_ALLOWED_USERS inválido: use IDs numéricos …`                                  | allowlist não numérica                                            | informe user IDs                                          |
 | `TELEGRAM_ALLOWED_CHATS contém <id>, que é o id do bot, não do chat.`                   | allowlist usando o id do bot                                      | omita `TELEGRAM_ALLOWED_CHATS` em DM                      |
 | `Volume pertence a outro bot. Use um volume separado.`                                  | volume reaproveitado                                              | aponte um volume novo                                     |
 | `Comando Telegram ignorado (allowlist ou tipo de chat): …` (warn)                       | update fora da allowlist ou tipo de chat não suportado            | revise `TELEGRAM_ALLOWED_USERS`/`_CHATS`                  |

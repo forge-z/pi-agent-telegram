@@ -113,8 +113,6 @@ function config(url: string, extra: Partial<McpConfig> = {}): McpConfig {
   return {
     name: "mock",
     url,
-    readTools: [],
-    actionTools: [],
     mode: "direct",
     ...extra,
   };
@@ -218,11 +216,11 @@ test("direct allow and deny policy supports omitted allowlists, deny-all, and de
     );
     await assert.rejects(
       none.callDirect("mock", "lookup", {}),
-      /restrições configuradas|não autorizada/i,
+      /configured restrictions|not authorized/i,
     );
     await assert.rejects(
       none.callDirect("mock", "execute", { code: "save" }),
-      /restrições configuradas|não autorizada/i,
+      /configured restrictions|not authorized/i,
     );
     assert.match(
       JSON.stringify(await deniedWrite.callDirect("mock", "lookup", {})),
@@ -230,7 +228,7 @@ test("direct allow and deny policy supports omitted allowlists, deny-all, and de
     );
     await assert.rejects(
       deniedWrite.callDirect("mock", "execute", { code: "save" }),
-      /restrições configuradas|não autorizada/i,
+      /configured restrictions|not authorized/i,
     );
     assert.deepEqual(counters, { reads: 2, writes: 1 });
   } finally {
@@ -263,7 +261,7 @@ test("catalog keeps healthy MCP servers available when another server fails", as
     assert.ok(catalog.find((entry) => entry.server === "mock")?.tools.length);
     assert.match(
       catalog.find((entry) => entry.server === "unavailable")?.error ?? "",
-      /falha|autenticação/i,
+      /fail|authentication/i,
     );
   } finally {
     await gateway.close();

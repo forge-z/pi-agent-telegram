@@ -1,46 +1,68 @@
 #!/usr/bin/env node
-/**
- * Set the global default model and effort from the container terminal, so a new
- * operator can start chatting without hunting through the Telegram menus.
- *
- * Global only, on purpose: the default lives in app.sqlite (meta), which a running
- * process reads when it opens the next conversation, so a write here takes effect
- * immediately. Per-conversation choices live in durable.sqlite and stay in Telegram
- * (/model), because a second writer there is not supported.
- *
- * Usage: npm run setup-model -- [--list] [--model <id>] [--effort <level>] [--dry-run]
- * Official path: a pi-ai provider id and a key stored under that id.
- * LLM_BASE_URL / LLM_API_KEY remain only for the compat reserve ("Outro").
- * Needs the build output: run `npm run build` first outside the container (the
- * runtime image already ships dist/).
- */
 import { createInterface } from "node:readline/promises";
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   clampThinkingLevel,
   getSupportedThinkingLevels,
 } from "@earendil-works/pi-ai/models";
 import {
+  COMPOSIO_CONNECT_URL,
   LLM_PROVIDER_ID,
   bootstrapModels,
+  composioAuthHeader,
+  composioSendsUserId,
   environmentModels,
+  mcpServersFromAggregators,
   officialModels,
   operatorSecret,
   SetupRequiredError,
+  validatePublicEndpoint,
 } from "../dist/src/config.js";
 import { PROVIDERS } from "../dist/src/providers.js";
 import {
+  officialProvider,
   resolveSetupChoice,
   setupChoices,
 } from "../dist/src/native-providers.js";
-import { probeImageSupport } from "../dist/src/vision.js";
+import { probeImageSupport, providerErrorHint } from "../dist/src/vision.js";
 import {
+  formatSetupMenu,
+  functionKeyId,
+  imageModelBelongsToProvider,
+  imageSectionPlan,
+  isChatModelId,
+  modelIdsFromListBody,
+  modelsForSection,
+  requestGatewayRestart,
+  SAVE_AND_BACK,
+  sectionSummary,
   migrateLegacyOfficialSetup,
+  modelAcceptsImages,
+  UNAVAILABLE_MODEL,
+  parseAggregatorChoice,
+  parseTelegramUserList,
+  readHiddenSecret as hidden,
+  readStoredAggregators,
   readStoredSetup,
+  readStoredTelegram,
+  routeAudioMenu,
+  routeGatewayMenu,
+  routeImageMenu,
+  routeMcpMenu,
+  routeSetupMenu,
+  routeTelegramMenu,
+  routeTextMenu,
+  secretPrompt,
   setupKey,
+  setupMenuStatus,
+  telegramChatsNote,
+  validAggregatorUserId,
+  validTelegramToken,
+  writeStoredAggregators,
   writeStoredSetup,
+  writeStoredTelegram,
 } from "../dist/src/setup.js";
 import {
   modelDefaultsConfirmedKey,
@@ -55,31 +77,42 @@ import {
 } from "../dist/src/subscription-login.js";
 
 const MODE = "live";
-const usage = `Uso: npm run setup -- [opções]
+const usage = `Usage: npm run setup -- [options]
 
-  Primeira execução (sem nada configurado): sem argumentos, num terminal, o menu
-  pergunta o provedor oficial, a chave, o modelo, o esforço, a visão e o áudio.
+  With no arguments, in a terminal, a menu edits one section at a time:
+  Setup gateway, text model, image model, audio model, MCP platform.
+  Save & exit writes the volume. Exit without saving leaves it unchanged.
 
-  --list                      mostra o estado atual
-  --provider <id|url>         chatgpt | openai-codex | id nativo do pi-ai
+  --list                      show the current state
+  --provider <id|url>         chatgpt | openai-codex | a pi-ai provider id
                               (anthropic, openai, google, groq, openrouter, xai,
                               deepseek, opencode, opencode-go, …)
-                              | gemini (alias de google) | opencode-zen (alias de opencode)
+                              | gemini (alias of google) | opencode-zen (alias of opencode)
                               | custom | URL
-  --key-stdin                 lê a chave do stdin (evita histórico e \`ps\`)
-  --model <id>                id do modelo no catálogo desse provedor
+  --key-stdin                 read the API key from stdin (keeps it out of history and ps)
+  --model <id>                model id in that provider's catalog
   --effort <level>            off|minimal|low|medium|high|xhigh|max
-  --vision <id|none>          modelo de visão (none desativa; vazio = do chat)
-  --audio <id|none>           modelo de transcrição (none desativa)
-  --audio-api <openai|gemini> formato da requisição de áudio
-  --audio-language <code>     idioma da transcrição (vazio = detectar)
-  --dry-run                   mostra o que seria gravado, sem escrever
+  --vision <id|none>          image model (none disables; omitted keeps the saved one)
+  --audio <id|none>           transcription model (none disables)
+  --audio-api <openai|gemini> audio request shape
+  --audio-language <code>     transcription language (empty = detect)
+  --dry-run                   show what would be written, without writing
+  --aggregators <choice>      executor | composio | both | none
+  --executor-url <url>        Executor MCP URL (with --aggregators)
+  --executor-token-stdin      Executor token from stdin
+  --composio-url <url>        Composio MCP URL (default: Connect)
+  --composio-user <id>        Composio user id
+  --composio-key-stdin        Composio key from stdin
+  --telegram-token-stdin      bot token from stdin
+  --telegram-users <ids>      comma-separated numeric user ids
+                              (empty keeps the saved list)
 
-A chave oficial entra por --key-stdin ou pelo menu (entrada oculta) e fica em
-credentials com o id do provedor. LLM_API_KEY ainda alimenta o caminho compatível
-("Outro") e pode ser lida por --provider quando --key-stdin não vem. LLM_BASE_URL
-e LLM_API_KEY não são obrigatórias e não substituem um setup oficial já gravado.
-Sem terminal (pipe, CI, docker exec sem -it) use as flags.`;
+A saved secret is never printed. Enter keeps it. One secret per stdin.
+TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USERS, COMPOSIO_* and EXECUTOR_* override
+the volume when set. TELEGRAM_ALLOWED_CHATS and TZ stay environment-only.
+LLM_API_KEY still feeds the compat reserve ("Other") and is read when
+--key-stdin is absent. LLM_BASE_URL and LLM_API_KEY are not required and do not
+replace a saved official setup. Without a terminal, use the flags.`;
 
 function fail(message, code = 1) {
   if (code === 0) console.log(message);
@@ -98,6 +131,14 @@ const options = {
   keyStdin: false,
   provider: undefined,
   dryRun: false,
+  aggregators: undefined,
+  executorUrl: undefined,
+  executorTokenStdin: false,
+  composioUrl: undefined,
+  composioUser: undefined,
+  composioKeyStdin: false,
+  telegramTokenStdin: false,
+  telegramUsers: undefined,
 };
 const argv = process.argv.slice(2);
 for (let index = 0; index < argv.length; index += 1) {
@@ -113,10 +154,19 @@ for (let index = 0; index < argv.length; index += 1) {
   else if (arg === "--audio-api") options.audioApi = argv[(index += 1)];
   else if (arg === "--audio-language")
     options.audioLanguage = argv[(index += 1)] ?? "";
+  else if (arg === "--aggregators") options.aggregators = argv[(index += 1)];
+  else if (arg === "--executor-url") options.executorUrl = argv[(index += 1)];
+  else if (arg === "--executor-token-stdin") options.executorTokenStdin = true;
+  else if (arg === "--composio-url") options.composioUrl = argv[(index += 1)];
+  else if (arg === "--composio-user") options.composioUser = argv[(index += 1)];
+  else if (arg === "--composio-key-stdin") options.composioKeyStdin = true;
+  else if (arg === "--telegram-token-stdin") options.telegramTokenStdin = true;
+  else if (arg === "--telegram-users")
+    options.telegramUsers = argv[(index += 1)] ?? "";
   else if (arg === "--help" || arg === "-h") {
     console.log(usage);
     process.exit(0);
-  } else fail(`Argumento desconhecido: ${arg}\n\n${usage}`, 2);
+  } else fail(`Unknown argument: ${arg}\n\n${usage}`, 2);
 }
 
 const dir = process.env.DATA_DIR?.trim() || "data";
@@ -137,11 +187,22 @@ function host(url) {
 }
 
 /** Model id from a numbered catalog entry or a typed id. */
-function pickFromCatalog(answer) {
-  const index = Number(answer);
-  return Number.isSafeInteger(index) && index >= 1 && index <= catalog.length
-    ? catalog[index - 1].id
-    : String(answer).trim();
+function officialIdForUrl(baseUrl) {
+  if (!baseUrl) return undefined;
+  let target = "";
+  try {
+    target = new URL(baseUrl).host.toLowerCase();
+  } catch {
+    return undefined;
+  }
+  return setupChoices().find((choice) => {
+    if (choice.kind !== "native" || !choice.baseUrl) return false;
+    try {
+      return new URL(choice.baseUrl).host.toLowerCase() === target;
+    } catch {
+      return false;
+    }
+  })?.id;
 }
 
 /** Transcription backends a chat endpoint cannot provide. */
@@ -151,32 +212,32 @@ const AUDIO_PROVIDERS = [
     api: "openai",
     baseUrl: "https://api.openai.com/v1",
     model: "whisper-1",
-    hint: "whisper-1 aceita ogg",
+    hint: "whisper-1 accepts ogg",
   },
   {
     name: "Groq",
     api: "openai",
     baseUrl: "https://api.groq.com/openai/v1",
     model: "whisper-large-v3-turbo",
-    hint: "barato e rápido",
+    hint: "fast",
   },
   {
     name: "Gemini",
     api: "gemini",
     baseUrl: "https://generativelanguage.googleapis.com/v1beta",
     model: "gemini-2.5-flash",
-    hint: "JSON com áudio inline",
+    hint: "inline audio JSON",
   },
   {
-    name: "Outro (endpoint próprio)",
+    name: "Other (custom endpoint)",
     api: "openai",
     baseUrl: "",
     model: "",
-    hint: "informe URL, formato e modelo",
+    hint: "enter the URL, format, and model",
   },
 ];
 
-/** Number from the audio list, or "outro" asking for endpoint and model. */
+/** Number from the audio list, or a custom endpoint. */
 function pickAudio(answer) {
   const index = Number(answer);
   if (
@@ -186,40 +247,6 @@ function pickAudio(answer) {
   )
     return AUDIO_PROVIDERS[index - 1];
   return undefined;
-}
-
-/** Reads a secret without echoing it: raw mode, so a screencast does not leak the key. */
-function hidden(question) {
-  return new Promise((resolve) => {
-    const stdin = process.stdin;
-    process.stdout.write(question);
-    let value = "";
-    stdin.setRawMode(true);
-    stdin.resume();
-    stdin.setEncoding("utf8");
-    const onData = (chunk) => {
-      for (const char of chunk) {
-        if (char === "\r" || char === "\n") {
-          stdin.setRawMode(false);
-          stdin.pause();
-          stdin.off("data", onData);
-          process.stdout.write("\n");
-          return resolve(value.trim());
-        }
-        if (char === "\u0003") {
-          stdin.setRawMode(false);
-          process.stdout.write("\n");
-          process.exit(1);
-        }
-        if (char === "\u007f" || char === "\b") {
-          value = value.slice(0, -1);
-          continue;
-        }
-        value += char;
-      }
-    };
-    stdin.on("data", onData);
-  });
 }
 
 /** URL root the app will use; a plain number picks from the curated list. */
@@ -236,21 +263,32 @@ function providerFromAnswer(answer) {
 
 /** Validates the key on the spot: a broken key is worth knowing before the model list. */
 async function listModels(baseUrl, apiKey) {
+  const root = baseUrl.replace(/\/+$/, "");
+  const gemini =
+    /generativelanguage\.googleapis\.com/.test(root) && !/\/openai/.test(root);
   try {
-    const response = await fetch(baseUrl.replace(/\/+$/, "") + "/models", {
-      headers: { authorization: `Bearer ${apiKey}` },
+    const response = await fetch(`${root}/models`, {
+      headers: gemini
+        ? { "x-goog-api-key": apiKey }
+        : { authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(20000),
     });
-    if (!response.ok) return { ok: false, detail: `HTTP ${response.status}` };
-    const body = await response.json();
-    const ids = (body?.data ?? []).map((model) => model.id);
+    const text = await response.text();
+    if (!response.ok) {
+      const hint = providerErrorHint(text);
+      return {
+        ok: false,
+        detail: `HTTP ${response.status}${hint ? `: ${hint}` : ""}`,
+      };
+    }
+    const ids = modelIdsFromListBody(JSON.parse(text));
     return ids.length
       ? { ok: true, ids }
-      : { ok: false, detail: "nenhum modelo listado" };
+      : { ok: false, detail: "no models listed" };
   } catch (error) {
     return {
       ok: false,
-      detail: error instanceof Error ? error.name : "sem resposta",
+      detail: error instanceof Error ? error.name : "no response",
     };
   }
 }
@@ -324,17 +362,17 @@ async function loadSubscriptionCatalog(readline, piProviderId) {
     if (!readline) {
       store.close();
       const err = new Error(
-        "Assinatura ChatGPT não autenticada. Rode `npm run login` ou `npm run setup` com terminal interativo (docker exec -it).",
+        "ChatGPT subscription is not authenticated. Run `npm run login`, or `npm run setup` in an interactive terminal (docker exec -it).",
       );
       err.code = "SUBSCRIPTION_LOGIN_REQUIRED";
       throw err;
     }
     const deviceAnswer = await readline.question(
-      "Login por código de dispositivo (recomendado em VPS)? [Y/n]: ",
+      "Device-code login (recommended on a VPS)? [Y/n]: ",
     );
     const deviceCodeOnly = !/^n/i.test(String(deviceAnswer).trim());
     console.log(
-      "Siga o login OAuth abaixo (código de dispositivo ou cole a URL de redirect se pedido).",
+      "Follow the OAuth login below (device code, or paste the redirect URL if asked).",
     );
     const interaction = oauthInteractionFromReadline(readline, {
       deviceCodeOnly,
@@ -353,17 +391,23 @@ async function loadSubscriptionCatalog(readline, piProviderId) {
   catalog = subscriptionChatCatalog(models, piProviderId);
   store.close();
   if (!catalog.length)
-    fail("Nenhum modelo de chat disponível para a assinatura autenticada.");
+    fail("No chat model is available for the authenticated subscription.");
 }
 
 function inferChatVision(entry) {
   const model = models.getModel(activeProviderId(), entry.id);
-  return Boolean(model?.input?.includes("image"));
+  return modelAcceptsImages(model?.input);
 }
 
-/** Endpoints that are not chat models, even when the provider lists them. */
-const NOT_CHAT =
-  /(tts|whisper|transcri|embedding|embed-|aqa|imagen|veo|dall-e|moderation|realtime)/i;
+function toCatalogEntry(model) {
+  return {
+    id: String(model.id).replace(/^models\//, ""),
+    efforts: getSupportedThinkingLevels(model),
+    input: model.input,
+    api: model.api,
+  };
+}
+
 /**
  * Registered after the provider and key are known: on a fresh volume nothing is stored
  * yet, so the catalog cannot be built first.
@@ -381,23 +425,19 @@ async function loadCatalog(baseUrl, apiKey) {
   } catch (error) {
     fail(
       error instanceof Error && error.message
-        ? `${error.message}\nSe for a primeira execução, informe o provedor e a chave.`
-        : "Falha no catálogo de modelos.",
+        ? `${error.message}\nOn a first run, choose the provider and the key.`
+        : "The model catalog failed.",
     );
   }
   catalog = models
     .getModels(LLM_PROVIDER_ID)
-    .filter((model) => !NOT_CHAT.test(model.id))
-    .map((model) => ({
-      // Gemini lists them as `models/gemini-...`; both forms work, the bare one reads better
-      id: model.id.replace(/^models\//, ""),
-      efforts: getSupportedThinkingLevels(model),
-    }));
+    .filter((model) => isChatModelId(model.id))
+    .map(toCatalogEntry);
   resolved.mode = "api";
   resolved.kind = "compat";
   resolved.piProviderId = LLM_PROVIDER_ID;
   if (!catalog.length)
-    fail("Nenhum modelo de chat no catálogo. Confira o provedor e a chave.");
+    fail("No chat model in the catalog. Check the provider and the key.");
 }
 
 /** Official catalog is static: no GET /models, and the key is not required to list it. */
@@ -409,7 +449,7 @@ function loadNativeCatalog(providerId) {
     store.close();
   }
   const provider = models.getProvider(providerId);
-  if (!provider) fail(`Provedor nativo desconhecido: ${providerId}.`);
+  if (!provider) fail(`Unknown native provider: ${providerId}.`);
   resolved.mode = "api";
   resolved.kind = "native";
   resolved.piProviderId = providerId;
@@ -417,13 +457,10 @@ function loadNativeCatalog(providerId) {
   resolved.baseUrl = provider.baseUrl ?? "";
   catalog = models
     .getModels(providerId)
-    .filter((model) => !NOT_CHAT.test(model.id))
-    .map((model) => ({
-      id: model.id.replace(/^models\//, ""),
-      efforts: getSupportedThinkingLevels(model),
-    }));
+    .filter((model) => isChatModelId(model.id))
+    .map(toCatalogEntry);
   if (!catalog.length)
-    fail("Nenhum modelo de chat no catálogo oficial desse provedor.");
+    fail("That provider's official catalog has no chat model.");
   if (!resolved.baseUrl) {
     const sample = models.getModel(providerId, catalog[0].id);
     resolved.baseUrl = sample?.baseUrl ?? "";
@@ -432,11 +469,17 @@ function loadNativeCatalog(providerId) {
 
 mkdirSync(dir, { recursive: true, mode: 0o700 });
 const db = new DatabaseSync(join(dir, "app.sqlite"));
+let dbClosed = false;
+function closeDb() {
+  if (dbClosed) return;
+  dbClosed = true;
+  db.close();
+}
 db.exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)");
 const migrated = migrateLegacyOfficialSetup(db, process.env, MODE);
 if (migrated)
   console.log(
-    `Volume migrado para o provedor oficial ${migrated.providerId}/${migrated.modelId}.`,
+    `Volume migrated to the official provider ${migrated.providerId}/${migrated.modelId}.`,
   );
 const defaultsKey = modelDefaultsKey(MODE);
 const confirmedKey = modelDefaultsConfirmedKey(MODE);
@@ -510,7 +553,7 @@ function warnEnvPrecedence(selection) {
     const saved = selection[kind]?.modelId;
     if (fromVars && saved && saved !== fromVars)
       console.log(
-        `! ${variable} está no ambiente (${fromVars}) e tem precedência: remova a variável para valer ${saved}.`,
+        `! ${variable} is set in the environment (${fromVars}) and wins. Unset it for ${saved} to apply.`,
       );
   }
 }
@@ -520,12 +563,12 @@ function functionLabel(selection, chatSees = resolved.chatVision) {
   const vision = selection.vision?.modelId
     ? `${selection.vision.modelId}${env.vision?.modelId === selection.vision.modelId ? " (env)" : ""}`
     : chatSees
-      ? "o modelo do chat (nativo)"
-      : "desativada";
+      ? "the text model"
+      : "off";
   const audio = selection.audio?.modelId
     ? `${selection.audio.modelId}${selection.audio.language ? ` (${selection.audio.language})` : ""}${env.audio?.modelId === selection.audio.modelId ? " (env)" : ""}`
-    : "não configurado";
-  return `imagem: ${vision} · áudio: ${audio}`;
+    : "not set";
+  return `image: ${vision} · audio: ${audio}`;
 }
 
 function save(settings) {
@@ -538,24 +581,26 @@ function save(settings) {
 function label(settings) {
   return settings
     ? `${settings.provider}/${settings.modelId} · ${settings.effort}`
-    : "nenhum escolhido (implícito: primeiro do catálogo)";
+    : "none chosen (implicit: first catalog model)";
 }
 function printState(baseUrl) {
   const provider = activeProviderId();
-  console.log(`Provedor: ${provider}`);
+  console.log(`Provider: ${provider}`);
   console.log(
     resolved.mode === "subscription"
-      ? "Autenticação: assinatura ChatGPT (OAuth no volume; equivalente a LLM_AUTH=chatgpt)"
+      ? "Authentication: ChatGPT subscription (OAuth on the volume; same as LLM_AUTH=chatgpt)"
       : resolved.kind === "native"
-        ? `Endereço: catálogo oficial${resolved.baseUrl ? ` (${resolved.baseUrl})` : ""}`
-        : `Endereço: ${baseUrl || process.env.LLM_BASE_URL?.trim() || "(não definido)"} (caminho compatível)`,
+        ? `Address: official catalog${resolved.baseUrl ? ` (${resolved.baseUrl})` : ""}`
+        : `Address: ${baseUrl || process.env.LLM_BASE_URL?.trim() || "(not set)"} (compat path)`,
   );
-  console.log(`Padrão global: ${label(current())}`);
-  console.log(`Funções: ${functionLabel(effectiveFunctions())}`);
-  console.log(`Catálogo (${catalog.length}):`);
+  console.log(`Global default: ${label(current())}`);
+  console.log(`Functions: ${functionLabel(effectiveFunctions())}`);
+  console.log(telegramLabel());
+  console.log(aggregatorLabel());
+  console.log(`Catalog (${catalog.length}):`);
   for (const entry of catalog)
     console.log(
-      `  ${provider}/${entry.id}  —  esforços: ${entry.efforts.join(" ")}`,
+      `  ${provider}/${entry.id}  —  effort: ${entry.efforts.join(" ")}`,
     );
 }
 function entryFor(input) {
@@ -568,9 +613,7 @@ function entryFor(input) {
       : raw;
   const entry = catalog.find((candidate) => candidate.id === id);
   if (!entry)
-    fail(
-      `Modelo desconhecido: ${raw || "(vazio)"}. Use --list para ver as opções.`,
-    );
+    fail(`Unknown model: ${raw || "(empty)"}. Use --list to see the options.`);
   return entry;
 }
 function effortFor(entry, input) {
@@ -584,9 +627,48 @@ function effortFor(entry, input) {
           "high",
         );
   if (!entry.efforts.includes(requested))
-    fail(`Esforço inválido para ${entry.id}: use ${entry.efforts.join("|")}.`);
+    fail(`Invalid effort for ${entry.id}: use ${entry.efforts.join("|")}.`);
   return requested;
 }
+function audioFields(audio) {
+  return {
+    modelId: audio.modelId,
+    api: audio.api ?? "openai",
+    baseUrl:
+      audio.baseUrl ||
+      process.env.AUDIO_BASE_URL?.trim() ||
+      (audio.api === "gemini"
+        ? "https://generativelanguage.googleapis.com/v1beta"
+        : "https://api.openai.com/v1"),
+    ...(audio.language ? { language: audio.language } : {}),
+  };
+}
+
+/** Vision and audio keys. An empty string lets writeStoredSetup drop a stale key. */
+function functionKeys(functions, apiKey) {
+  const chatHost = host(resolved.baseUrl);
+  return {
+    ...(functions.vision
+      ? {
+          vision:
+            resolved.visionKey ||
+            operatorSecret(process.env, "VISION_API_KEY") ||
+            apiKey ||
+            "",
+        }
+      : {}),
+    ...(functions.audio
+      ? {
+          audio:
+            resolved.audioKey ||
+            operatorSecret(process.env, "AUDIO_API_KEY") ||
+            (host(functions.audio.baseUrl) === chatHost ? apiKey : "") ||
+            "",
+        }
+      : {}),
+  };
+}
+
 function commitSubscription(entry, effort, functions = currentFunctions()) {
   const provider = resolved.piProviderId;
   const settings = { provider, modelId: entry.id, effort };
@@ -601,42 +683,24 @@ function commitSubscription(entry, effort, functions = currentFunctions()) {
       ? {}
       : { chatVision: resolved.chatVision }),
     ...(functions.vision ? { vision: functions.vision } : {}),
-    ...(functions.audio
-      ? {
-          audio: {
-            modelId: functions.audio.modelId,
-            api: functions.audio.api ?? "openai",
-            baseUrl:
-              process.env.AUDIO_BASE_URL?.trim() ||
-              (functions.audio.api === "gemini"
-                ? "https://generativelanguage.googleapis.com/v1beta"
-                : "https://api.openai.com/v1"),
-            ...(functions.audio.language
-              ? { language: functions.audio.language }
-              : {}),
-          },
-        }
-      : {}),
+    ...(functions.audio ? { audio: audioFields(functions.audio) } : {}),
   };
   if (options.dryRun) {
-    console.log(`(dry-run) gravaria ${label(settings)} como padrão global.`);
+    console.log(
+      `(dry-run) would save ${label(settings)} as the global default.`,
+    );
     return;
   }
   save(settings);
-  writeStoredSetup(db, record, {}, MODE);
-  const authStore = new Store(dir);
-  try {
-    writeChatgptAuthMode(authStore);
-  } finally {
-    authStore.close();
-  }
-  console.log(`Padrão global: ${label(settings)}`);
+  writeStoredSetup(db, record, functionKeys(functions), MODE);
+  writeChatgptAuthMode(new Store(dir));
+  console.log(`Global default: ${label(settings)}`);
   console.log(
-    `Configuração gravada no volume (${record.providerId}, authMode=chatgpt) — defina LLM_AUTH=chatgpt no deploy ou use só o registro do volume.`,
+    `Saved on the volume (${record.providerId}, authMode=chatgpt). LLM_AUTH=chatgpt is optional; the volume record is enough.`,
   );
-  console.log(`Banco: ${join(dir, "app.sqlite")}`);
+  console.log(`Database: ${join(dir, "app.sqlite")}`);
   console.log(
-    "Conversas novas usam esse padrão; /model no Telegram continua sobrepondo por conversa.",
+    "New conversations use this default. /model in Telegram still overrides one conversation.",
   );
 }
 
@@ -651,7 +715,7 @@ function commit(entry, effort, functions = currentFunctions()) {
   );
   const apiKey = resolved.apiKey || undefined;
   if (!apiKey || !baseUrl)
-    fail("Provedor ou chave ausente: o registro não seria utilizável.");
+    fail("Provider or key is missing: the record would not be usable.");
   const settings = { provider, modelId: entry.id, effort };
   const record = {
     providerId: resolved.kind === "native" ? provider : resolved.providerId,
@@ -664,25 +728,12 @@ function commit(entry, effort, functions = currentFunctions()) {
       ? {}
       : { chatVision: resolved.chatVision }),
     ...(functions.vision ? { vision: functions.vision } : {}),
-    ...(functions.audio
-      ? {
-          audio: {
-            modelId: functions.audio.modelId,
-            api: functions.audio.api ?? "openai",
-            baseUrl:
-              process.env.AUDIO_BASE_URL?.trim() ||
-              (functions.audio.api === "gemini"
-                ? "https://generativelanguage.googleapis.com/v1beta"
-                : "https://api.openai.com/v1"),
-            ...(functions.audio.language
-              ? { language: functions.audio.language }
-              : {}),
-          },
-        }
-      : {}),
+    ...(functions.audio ? { audio: audioFields(functions.audio) } : {}),
   };
   if (options.dryRun) {
-    console.log(`(dry-run) gravaria ${label(settings)} como padrão global.`);
+    console.log(
+      `(dry-run) would save ${label(settings)} as the global default.`,
+    );
     return;
   }
   save(settings);
@@ -713,234 +764,1414 @@ function commit(entry, effort, functions = currentFunctions()) {
     },
     MODE,
   );
-  console.log(`Padrão global: ${label(settings)}`);
+  console.log(`Global default: ${label(settings)}`);
   console.log(
     resolved.kind === "native"
-      ? `Configuração gravada no volume (${record.providerId}) — chave em credentials com esse id. LLM_* não é necessário.`
-      : `Configuração gravada no volume (${record.providerId}, caminho compatível) — as variáveis LLM_* deixam de ser necessárias.`,
+      ? `Saved on the volume (${record.providerId}). The key is in credentials under that id. LLM_* is not required.`
+      : `Saved on the volume (${record.providerId}, compat path). LLM_* is no longer required.`,
   );
-  console.log(`Banco: ${join(dir, "app.sqlite")}`);
+  console.log(`Database: ${join(dir, "app.sqlite")}`);
   console.log(
-    "Conversas novas usam esse padrão; /model no Telegram continua sobrepondo por conversa.",
+    "New conversations use this default. /model in Telegram still overrides one conversation.",
   );
 }
-async function runModelWizard(readline) {
-  if (!catalog.length) return fail("Nenhum modelo de chat neste provedor.");
-  const providerTag = activeProviderId();
-  console.log(`\nPadrão global atual: ${label(current())}`);
-  catalog.forEach((entry, index) =>
+function readBackendKeys() {
+  const read = (id) => {
+    const row = db
+      .prepare("SELECT value FROM credentials WHERE provider=?")
+      .get(id);
+    if (!row?.value) return undefined;
+    try {
+      return JSON.parse(row.value).key || undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  return {
+    vision: read(functionKeyId("vision")),
+    audio: read(functionKeyId("audio")),
+  };
+}
+
+function loadSession() {
+  const stored = readStoredSetup(dir);
+  const telegram = readStoredTelegram(dir);
+  const aggregators = readStoredAggregators(dir);
+  const functions = currentFunctions();
+  const keys = readBackendKeys();
+  const record = stored.record;
+  let vision = functions.vision ? { ...functions.vision } : undefined;
+  if (
+    record &&
+    vision?.modelId &&
+    !imageModelBelongsToProvider(record.providerId, vision.modelId, {
+      imageBaseUrl: vision.baseUrl,
+      textBaseUrl: record.baseUrl,
+    })
+  ) {
     console.log(
-      `  [${index + 1}] ${providerTag}/${entry.id}  (esforços: ${entry.efforts.join(" ")})`,
+      `Image model ${vision.modelId} does not belong to ${record.providerId}. It will not be used.`,
+    );
+    vision = undefined;
+  }
+  const choice = record ? resolveSetupChoice(record.providerId) : undefined;
+  return {
+    telegram: {
+      hasToken: Boolean(telegram.token),
+      users: telegram.users ? [...telegram.users] : undefined,
+      newToken: undefined,
+    },
+    text: {
+      providerId: record?.providerId,
+      baseUrl: record?.baseUrl || "",
+      modelId: record?.modelId,
+      effort: record?.effort,
+      authMode: record?.authMode,
+      kind:
+        record?.authMode === "chatgpt"
+          ? "subscription"
+          : choice?.kind || "compat",
+      apiKey: stored.apiKey,
+      newKey: undefined,
+      chatVision: record?.chatVision,
+    },
+    image: {
+      choice: undefined,
+      vision,
+      key: keys.vision,
+      newKey: undefined,
+      sameAsText: !vision?.baseUrl,
+      listedIds: undefined,
+    },
+    audio: {
+      audio: functions.audio ? { ...functions.audio } : undefined,
+      key: keys.audio,
+      newKey: undefined,
+      off: false,
+    },
+    mcp: {
+      choice: aggregators.record?.choice,
+      executorUrl: aggregators.record?.executor?.url,
+      composioUrl: aggregators.record?.composio?.url,
+      composioUser: aggregators.record?.composio?.userId,
+      executorToken: aggregators.executorToken,
+      composioKey: aggregators.composioKey,
+      newExecutor: undefined,
+      newComposio: undefined,
+    },
+  };
+}
+
+function sessionRecord(session) {
+  const text = session.text;
+  if (!text.modelId) return undefined;
+  const selection = selectionOf(session);
+  return {
+    providerId: text.providerId || "",
+    baseUrl: text.baseUrl || "",
+    modelId: text.modelId,
+    ...(text.effort ? { effort: text.effort } : {}),
+    ...(text.authMode ? { authMode: text.authMode } : {}),
+    ...(text.chatVision === undefined ? {} : { chatVision: text.chatVision }),
+    ...selection,
+  };
+}
+
+function summaryOf(session) {
+  return sectionSummary({
+    env: process.env,
+    setup: sessionRecord(session),
+    keys: {
+      vision:
+        session.image.choice === "off" || session.image.choice === "text"
+          ? undefined
+          : session.image.newKey || session.image.key,
+      audio: session.audio.off
+        ? undefined
+        : session.audio.newKey || session.audio.key,
+    },
+  });
+}
+
+function sessionStatus(session, summary) {
+  const textReady = Boolean(
+    session.text.modelId &&
+    (session.text.authMode === "chatgpt" ||
+      session.text.apiKey ||
+      session.text.newKey),
+  );
+  const mcpOn = Boolean(session.mcp.choice && session.mcp.choice !== "none");
+  return setupMenuStatus({
+    gateway: Boolean(
+      (session.telegram.hasToken || session.telegram.newToken) &&
+      session.telegram.users?.length,
+    ),
+    text: textReady,
+    image: summary.imageOn && session.image.choice !== "off",
+    audio: summary.audioOn && !session.audio.off,
+    mcp: mcpOn,
+  });
+}
+
+function printMain(session) {
+  const summary = summaryOf(session);
+  console.log(
+    `\n${formatSetupMenu(sessionStatus(session, summary), {
+      text: session.text.modelId
+        ? `${session.text.providerId}/${session.text.modelId}`
+        : "",
+      image: summary.imageOn ? summary.image : "",
+      audio: summary.audioOn ? summary.audio : "",
+      mcp: session.mcp.choice || "",
+    })}`,
+  );
+}
+
+function printSectionEnd() {
+  console.log("b - Back");
+  console.log(`s - ${SAVE_AND_BACK}`);
+}
+
+async function askSecret(readline, label, saved) {
+  readline.pause();
+  try {
+    return (await hidden(secretPrompt(label, saved))).trim();
+  } finally {
+    readline.resume();
+  }
+}
+
+function selectionOf(session) {
+  const vision =
+    session.image.choice === "text" || session.image.choice === "off"
+      ? undefined
+      : session.image.vision;
+  const audio = session.audio.off ? undefined : session.audio.audio;
+  return {
+    ...(vision?.modelId ? { vision } : {}),
+    ...(audio?.modelId ? { audio } : {}),
+  };
+}
+
+async function ensureCatalog(session, readline) {
+  const text = session.text;
+  if (!text.providerId) return false;
+  const providerId = text.providerId;
+  const same =
+    catalog.length &&
+    (text.authMode === "chatgpt"
+      ? resolved.mode === "subscription" && resolved.piProviderId === providerId
+      : text.kind === "native"
+        ? resolved.kind === "native" && resolved.piProviderId === providerId
+        : resolved.kind === "compat" && resolved.baseUrl === text.baseUrl);
+  if (same) return true;
+  if (text.authMode === "chatgpt") {
+    try {
+      await loadSubscriptionCatalog(
+        readline,
+        providerId === "openai" ? "openai" : "openai-codex",
+      );
+      return catalog.length > 0;
+    } catch (error) {
+      console.log(
+        error instanceof Error
+          ? error.message
+          : "Subscription catalog is unavailable.",
+      );
+      return false;
+    }
+  }
+  const key = text.newKey || text.apiKey;
+  if (text.kind === "native") {
+    if (!key) return false;
+    resolved.apiKey = key;
+    loadNativeCatalog(providerId);
+    return catalog.length > 0;
+  }
+  if (!text.baseUrl || !key) return false;
+  resolved.baseUrl = text.baseUrl;
+  resolved.apiKey = key;
+  resolved.providerId = providerIdFor(text.baseUrl);
+  await loadCatalog(text.baseUrl, key);
+  return catalog.length > 0;
+}
+
+async function detectChatVision(session) {
+  if (!session.text.modelId) return undefined;
+  const id = session.text.modelId;
+  if (session.text.authMode === "chatgpt" || session.text.kind === "native") {
+    const model = models?.getModel(activeProviderId(), id);
+    session.text.chatVision = modelAcceptsImages(model?.input);
+    console.log(
+      session.text.chatVision
+        ? `Text model ${id} accepts images (pi-ai catalog).`
+        : `Text model ${id} does not accept images (pi-ai catalog).`,
+    );
+    return session.text.chatVision;
+  }
+  const key = session.text.newKey || session.text.apiKey;
+  if (!key || !session.text.baseUrl) {
+    console.log(
+      "A text provider and API key are required to test image input.",
+    );
+    return undefined;
+  }
+  const probe = await probeImageSupport({
+    modelId: id,
+    baseUrl: session.text.baseUrl,
+    apiKey: key,
+  });
+  session.text.chatVision = probe.verdict === "vision";
+  const name =
+    probe.verdict === "vision"
+      ? "accepts images"
+      : probe.verdict === "text"
+        ? "does not accept images"
+        : "image support could not be confirmed";
+  console.log(
+    `Text model ${id}: ${name}${probe.detail ? ` (${probe.detail})` : ""}.`,
+  );
+  return session.text.chatVision;
+}
+
+async function persistSetup(readline, session) {
+  const text = session.text;
+  if (
+    !text.modelId ||
+    !(text.authMode === "chatgpt" || text.apiKey || text.newKey)
+  )
+    return "Choose a text provider, model, and key first.";
+  const separate = session.image.vision;
+  if (
+    session.image.choice === "separate" &&
+    separate?.modelId &&
+    session.image.sameAsText &&
+    text.providerId &&
+    !imageModelBelongsToProvider(text.providerId, separate.modelId, {
+      imageBaseUrl: separate.baseUrl,
+      textBaseUrl: text.baseUrl,
+    })
+  )
+    return `${separate.modelId} does not belong to ${text.providerId}. Choose a model from that provider.`;
+  if (!(await ensureCatalog(session, readline)))
+    return "The model catalog could not be loaded.";
+  const entry = catalog.find((item) => item.id === text.modelId);
+  if (!entry) return `Unknown model: ${text.modelId}.`;
+  if (text.chatVision === undefined) await detectChatVision(session);
+  const effort =
+    text.effort && entry.efforts.includes(text.effort)
+      ? text.effort
+      : effortFor(entry, "");
+  resolved.chatVision = text.chatVision;
+  resolved.visionKey =
+    session.image.choice === "text" || session.image.choice === "off"
+      ? ""
+      : session.image.newKey ||
+        (session.image.sameAsText ? "" : session.image.key) ||
+        "";
+  resolved.audioKey = session.audio.off
+    ? ""
+    : session.audio.newKey || session.audio.key || "";
+  commit(entry, effort, selectionOf(session));
+  return "";
+}
+
+async function testTelegram(draft) {
+  const token = draft.newToken || readStoredTelegram(dir).token;
+  if (!token) {
+    console.log("Set a bot token first.");
+    return;
+  }
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${token}/getMe`, {
+      signal: AbortSignal.timeout(20000),
+    });
+    const body = await response.text();
+    const hint = providerErrorHint(body);
+    let username = "";
+    try {
+      username = JSON.parse(body)?.result?.username || "";
+    } catch {
+      username = "";
+    }
+    if (!response.ok || !username) {
+      console.log(
+        `Telegram test failed: HTTP ${response.status}${hint ? `: ${hint}` : ""}.`,
+      );
+      return;
+    }
+    console.log(`Connected as @${username}.`);
+  } catch {
+    console.log("Telegram test failed: no response.");
+  }
+}
+
+async function gatewayMenu(readline, session) {
+  for (;;) {
+    console.log("\nSetup gateway");
+    console.log("1 - Telegram");
+    printSectionEnd();
+    const action = routeGatewayMenu(await readline.question("Choice: "));
+    if (!action) {
+      console.log("Unknown choice.");
+      continue;
+    }
+    if (action === "back" || action === "save") return;
+    await telegramMenu(readline, session);
+  }
+}
+
+async function telegramMenu(readline, session) {
+  const draft = structuredClone(session.telegram);
+  for (;;) {
+    console.log("\nTelegram");
+    console.log(
+      draft.hasToken || draft.newToken
+        ? "Bot token: [saved]"
+        : "Bot token: not set",
+    );
+    console.log(`Allowed users: ${draft.users?.join(", ") || "not set"}`);
+    console.log(telegramChatsNote(process.env.TELEGRAM_ALLOWED_CHATS));
+    console.log("1 - Bot token");
+    console.log("2 - Allowed user ids");
+    console.log("t - Test connection (getMe)");
+    printSectionEnd();
+    const action = routeTelegramMenu(await readline.question("Choice: "));
+    if (!action) {
+      console.log("Unknown choice.");
+      continue;
+    }
+    if (action === "back") return;
+    if (action === "save") {
+      const tokenOk = Boolean(draft.newToken || draft.hasToken);
+      if (!tokenOk || !draft.users?.length) {
+        console.log("A bot token and allowed user ids are both required.");
+        continue;
+      }
+      persistTelegram(draft.users, draft.newToken);
+      session.telegram = draft;
+      return;
+    }
+    if (action === "token") {
+      const typed = await askSecret(
+        readline,
+        "Bot token",
+        Boolean(draft.hasToken || draft.newToken),
+      );
+      if (!typed) continue;
+      if (!validTelegramToken(typed)) {
+        console.log("Invalid bot token. Use the form 123456:ABC…");
+        continue;
+      }
+      draft.newToken = typed;
+      draft.hasToken = true;
+      continue;
+    }
+    if (action === "users") {
+      const current = draft.users?.join(",") || "";
+      const answer = (
+        await readline.question(
+          `Allowed user ids, comma-separated${current ? ` [${current}]` : ""}: `,
+        )
+      ).trim();
+      const users = parseTelegramUserList(answer || current);
+      if (!users) {
+        console.log("Enter numeric user ids separated by commas.");
+        continue;
+      }
+      draft.users = users;
+      continue;
+    }
+    await testTelegram(draft);
+  }
+}
+
+async function configureTextProvider(readline, draft) {
+  console.log(
+    "Official pi-ai providers. The key is stored on the volume under the provider id.",
+  );
+  console.log("  [0] ChatGPT (Plus/Pro subscription — OAuth, no API key)");
+  const menu = setupChoices();
+  menu.forEach((entry, index) =>
+    console.log(
+      `  [${index + 1}] ${entry.name}${entry.hint ? ` — ${entry.hint}` : ""}`,
     ),
   );
-  const answer = (
-    await readline.question("\nModelo (número ou id, q cancela): ")
+  const defaultHint =
+    draft.authMode === "chatgpt" ? "0" : draft.providerId || "1";
+  const providerAnswer = (
+    await readline.question(`\nProvider [${defaultHint}]: `)
   ).trim();
-  if (!answer || answer === "q") return fail("Cancelado.", 0);
-  const index = Number(answer);
-  const entry =
-    Number.isSafeInteger(index) && index >= 1 && index <= catalog.length
-      ? catalog[index - 1]
-      : entryFor(answer);
-  console.log(`\nEsforços de ${entry.id}: ${entry.efforts.join(" ")}`);
-  const effort = effortFor(entry, await readline.question("Esforço: "));
-  const prefill = effectiveFunctions();
-  const stored = currentFunctions();
-  if (resolved.mode === "subscription" || resolved.kind === "native") {
-    resolved.chatVision = inferChatVision(entry);
-    console.log(
-      `\nModelo do chat: ${
-        resolved.chatVision
-          ? "lê imagens (catálogo pi-ai)"
-          : "NÃO lê imagens (catálogo pi-ai)"
-      }`,
-    );
-  } else {
-    const chatProbe = await probeImageSupport({
-      modelId: entry.id,
-      baseUrl: resolved.baseUrl,
-      apiKey: resolved.apiKey,
-    });
-    resolved.chatVision = chatProbe.verdict === "vision";
-    console.log(
-      `\nModelo do chat: ${
-        resolved.chatVision
-          ? "lê imagens"
-          : chatProbe.verdict === "text"
-            ? "NÃO lê imagens"
-            : "não foi possível confirmar se lê imagens"
-      }${chatProbe.detail ? ` (${chatProbe.detail})` : ""}`,
-    );
+  const chosen = providerAnswer || String(defaultHint);
+  if (
+    isSubscriptionChoice(chosen) ||
+    (!providerAnswer && draft.authMode === "chatgpt")
+  ) {
+    let piProviderId =
+      draft.authMode === "chatgpt" &&
+      (draft.providerId === "openai" || draft.providerId === "openai-codex")
+        ? draft.providerId
+        : "openai";
+    const named =
+      providerAnswer &&
+      providerAnswer !== "0" &&
+      providerAnswer !== "chatgpt" &&
+      providerAnswer !== "subscription";
+    if (named) piProviderId = subscriptionPiProvider(providerAnswer);
+    else {
+      const subFlow = (
+        await readline.question(
+          "Subscription [1] Sign in with ChatGPT (openai) [2] legacy Codex (openai-codex) [1]: ",
+        )
+      ).trim();
+      piProviderId = subFlow === "2" ? "openai-codex" : "openai";
+    }
+    await loadSubscriptionCatalog(readline, piProviderId);
+    draft.providerId = resolved.providerId;
+    draft.baseUrl = resolved.baseUrl;
+    draft.authMode = "chatgpt";
+    draft.kind = "subscription";
+    draft.apiKey = undefined;
+    draft.newKey = undefined;
+    draft.chatVision = undefined;
+    if (!catalog.some((entry) => entry.id === draft.modelId))
+      draft.modelId = undefined;
+    return;
   }
-  console.log(
-    `\nIMAGEM — ${resolved.chatVision ? "Enter mantém o do chat, " : ""}"-" desativa. Modelos do mesmo provedor:`,
-  );
-  catalog.forEach((entry, index) =>
-    console.log(`  [${index + 1}] ${entry.id}`),
-  );
-  const visionAnswer = (
-    await readline.question(
-      `Modelo de visão [${prefill.vision?.modelId ?? "usa o do chat"}] (ou "o" para outro provedor): `,
-    )
-  ).trim();
-  let vision = stored.vision;
-  let visionBase = resolved.baseUrl;
-  let visionKey = resolved.apiKey;
-  if (visionAnswer === "-") vision = undefined;
-  else if (visionAnswer === "o") {
-    // Another provider: pick from the curated list instead of typing a URL.
-    PROVIDERS.forEach((entry, index) =>
-      console.log(
-        `  [${index + 1}] ${entry.name}${entry.hint ? ` — ${entry.hint}` : ""}`,
-      ),
+  const picked = resolveSetupChoice(chosen);
+  if (!picked) {
+    console.log("Unknown provider. Use a number, an id, or a base URL.");
+    return;
+  }
+  if (picked.kind === "native") {
+    const same = resolveSetupChoice(draft.providerId ?? "")?.id === picked.id;
+    let apiKey = same ? draft.newKey || draft.apiKey : undefined;
+    if (!apiKey) apiKey = await askSecret(readline, "API key", false);
+    if (!apiKey) {
+      console.log("API key is missing.");
+      return;
+    }
+    resolved.apiKey = apiKey;
+    loadNativeCatalog(picked.id);
+    draft.providerId = picked.id;
+    draft.baseUrl = resolved.baseUrl;
+    draft.kind = "native";
+    draft.authMode = undefined;
+    draft.newKey = apiKey;
+    draft.apiKey = apiKey;
+    draft.chatVision = undefined;
+    if (!catalog.some((entry) => entry.id === draft.modelId))
+      draft.modelId = undefined;
+    console.log(
+      `Key saved for ${picked.id} — ${catalog.length} models in the official catalog.`,
     );
-    const providerAnswer = (
+    return;
+  }
+  let pickedUrl = picked.baseUrl;
+  if (!pickedUrl)
+    pickedUrl = (
       await readline.question(
-        `Provedor de visão [${PROVIDERS.length} = outro endpoint]: `,
+        "Provider base URL (for example https://my-provider/v1): ",
       )
     ).trim();
-    const picked = providerFromAnswer(providerAnswer);
-    if (!picked) return fail("Provedor de visão inválido.");
-    let base = picked.baseUrl;
-    if (!base)
-      base = (
-        await readline.question("URL raiz do provedor de visão: ")
-      ).trim();
-    if (!base) return fail("Visão desativada: sem endpoint.");
-    visionBase = base;
-    if (host(base) === host(resolved.baseUrl) && resolved.apiKey)
-      visionKey = resolved.apiKey;
-    else {
-      readline.pause();
-      visionKey = await hidden(
-        `Chave de ${PROVIDERS.find((entry) => entry.id === picked.id)?.name ?? "visão"} (não aparece): `,
-      );
-      readline.resume();
+  if (!pickedUrl) {
+    console.log("Provider URL is missing.");
+    return;
+  }
+  let apiKey =
+    host(pickedUrl) === host(draft.baseUrl)
+      ? draft.newKey || draft.apiKey
+      : undefined;
+  if (!apiKey) apiKey = await askSecret(readline, "API key", false);
+  if (!apiKey) {
+    console.log("API key is missing.");
+    return;
+  }
+  for (let attempt = 0; ; attempt += 1) {
+    const check = await listModels(pickedUrl, apiKey);
+    if (check.ok) {
+      console.log(`Key accepted — ${check.ids.length} models listed.`);
+      break;
     }
-    if (!visionKey) return fail("Visão desativada: sem chave.");
-    // Its own model list, so the id is not typed from memory either.
-    const listed = await listModels(base, visionKey);
-    if (listed.ok) {
-      const ids = listed.ids
-        .filter((id) => !NOT_CHAT.test(id))
-        .map((id) => id.replace(/^models\//, ""));
-      ids
-        .slice(0, 25)
-        .forEach((id, index) => console.log(`  [${index + 1}] ${id}`));
-      const modelAnswer = (
-        await readline.question("Modelo de visão (número ou id): ")
-      ).trim();
-      const index = Number(modelAnswer);
-      vision = {
-        modelId:
-          Number.isSafeInteger(index) && index >= 1 && index <= ids.length
-            ? ids[index - 1]
-            : modelAnswer,
-        baseUrl: base,
-      };
-    } else {
-      console.log(`  ! não consegui listar (${listed.detail})`);
-      vision = { modelId: "", baseUrl: base };
+    console.log(`${pickedUrl} rejected the key (${check.detail}).`);
+    if (attempt >= 2) {
+      console.log("Invalid API key.");
+      return;
     }
-  } else if (visionAnswer) vision = { modelId: pickFromCatalog(visionAnswer) };
-  if (vision) {
-    if (!vision.modelId) {
-      vision.modelId = (
-        await readline.question("Modelo de visão (id): ")
-      ).trim();
-      if (!vision.modelId) return fail("Visão desativada: sem modelo.");
+    apiKey = await askSecret(readline, "API key", false);
+    if (!apiKey) return;
+  }
+  resolved.baseUrl = pickedUrl;
+  resolved.apiKey = apiKey;
+  resolved.providerId = providerIdFor(pickedUrl);
+  await loadCatalog(pickedUrl, apiKey);
+  draft.providerId = resolved.providerId;
+  draft.baseUrl = pickedUrl;
+  draft.kind = "compat";
+  draft.authMode = undefined;
+  draft.newKey = apiKey;
+  draft.apiKey = apiKey;
+  draft.chatVision = undefined;
+  if (!catalog.some((entry) => entry.id === draft.modelId))
+    draft.modelId = undefined;
+}
+
+async function configureTextModel(readline, draft) {
+  if (!catalog.length) {
+    console.log("Choose a provider first.");
+    return;
+  }
+  const picked = await pickListedModel(
+    readline,
+    catalog,
+    draft.modelId,
+    `${activeProviderId()}/`,
+  );
+  if (!catalog.some((entry) => entry.id === picked)) {
+    console.log(`Unknown model: ${picked}.`);
+    return;
+  }
+  draft.modelId = picked;
+  draft.chatVision = undefined;
+}
+
+async function configureEffort(readline, draft) {
+  const entry = catalog.find((item) => item.id === draft.modelId);
+  if (!entry) {
+    console.log("Choose a model first.");
+    return;
+  }
+  console.log(`Effort for ${entry.id}: ${entry.efforts.join(" ")}`);
+  const answer = (
+    await readline.question(
+      `Effort${draft.effort ? ` [${draft.effort}]` : ""}: `,
+    )
+  ).trim();
+  if (answer && !entry.efforts.includes(answer)) {
+    console.log(`Invalid effort. Use ${entry.efforts.join("|")}.`);
+    return;
+  }
+  draft.effort = answer || draft.effort || effortFor(entry, "");
+}
+
+async function testText(draft) {
+  if (!draft.modelId) {
+    console.log("Choose a model first.");
+    return;
+  }
+  if (draft.authMode === "chatgpt") {
+    if (!models) {
+      console.log("Choose the ChatGPT provider first.");
+      return;
     }
-    resolved.visionKey = visionKey;
-    // Ask the chosen model itself, so the operator sees the truth before saving.
-    const verdict = await probeImageSupport({
-      modelId: vision.modelId,
-      baseUrl: visionBase,
-      apiKey: visionKey,
-    });
-    const label = {
-      vision: "lê imagens",
-      text: "só texto",
-      unknown: "não confirmado",
-    }[verdict.verdict];
+    const ok = await models.checkAuth(draft.providerId);
     console.log(
-      `  ${verdict.verdict === "vision" ? "✔" : verdict.verdict === "text" ? "✘" : "?"} ${vision.modelId}: ${label}${verdict.detail ? ` (${verdict.detail})` : ""}`,
+      ok
+        ? "Subscription is authenticated."
+        : "Subscription is not authenticated.",
     );
-    if (verdict.verdict !== "vision") {
-      const keep = (
-        await readline.question("  Usar mesmo assim? [y/N] ")
-      ).trim();
-      if (!/^y(es)?$/i.test(keep)) vision = undefined;
+    return;
+  }
+  const key = draft.newKey || draft.apiKey;
+  if (!key || !draft.baseUrl) {
+    console.log("A provider and API key are required before a test.");
+    return;
+  }
+  const listed = await listModels(draft.baseUrl, key);
+  if (!listed.ok) {
+    console.log(`Text model test failed: ${listed.detail}.`);
+    return;
+  }
+  const ids = listed.ids.map((id) => id.replace(/^models\//, ""));
+  console.log(
+    ids.includes(draft.modelId)
+      ? `Text model test passed. ${draft.modelId} is listed (${ids.length} models).`
+      : `Key accepted (${ids.length} models). ${draft.modelId} was not in the list; the official catalog may still serve it.`,
+  );
+}
+
+async function textMenu(readline, session) {
+  const draft = structuredClone(session.text);
+  for (;;) {
+    const keySaved = Boolean(draft.newKey || draft.apiKey);
+    console.log("\nText model");
+    console.log(`Provider: ${draft.providerId || "not set"}`);
+    console.log(`Model: ${draft.modelId || "not set"}`);
+    console.log(
+      draft.authMode === "chatgpt"
+        ? "API key: ChatGPT subscription (OAuth)"
+        : `API key: ${keySaved ? "[saved]" : "not set"}`,
+    );
+    console.log(`Effort: ${draft.effort || "not set"}`);
+    console.log("1 - Provider");
+    console.log("2 - Model");
+    console.log("3 - API key");
+    console.log("4 - Effort");
+    console.log("t - Test");
+    printSectionEnd();
+    const action = routeTextMenu(await readline.question("Choice: "));
+    if (!action) {
+      console.log("Unknown choice.");
+      continue;
+    }
+    if (action === "back") return;
+    if (action === "save") {
+      const previous = session.text;
+      session.text = draft;
+      const error = await persistSetup(
+        draft.authMode === "chatgpt" ? readline : undefined,
+        session,
+      );
+      if (error) {
+        session.text = previous;
+        console.log(error);
+        continue;
+      }
+      return;
+    }
+    if (action === "provider") await configureTextProvider(readline, draft);
+    else if (action === "model") {
+      await ensureCatalog({ text: draft }, undefined);
+      await configureTextModel(readline, draft);
+    } else if (action === "key") {
+      if (draft.authMode === "chatgpt") {
+        console.log(
+          "The ChatGPT subscription uses OAuth, not an API key. Choose the provider to sign in.",
+        );
+        continue;
+      }
+      const typed = await askSecret(
+        readline,
+        "API key",
+        Boolean(draft.newKey || draft.apiKey),
+      );
+      if (!typed) continue;
+      draft.newKey = typed;
+      draft.apiKey = typed;
+      resolved.apiKey = typed;
+    } else if (action === "effort") await configureEffort(readline, draft);
+    else await testText(draft);
+  }
+}
+
+function textProviderModels() {
+  return catalog.map((entry) => ({
+    id: entry.id,
+    input: entry.input,
+    api: entry.api,
+    acceptsImages: modelAcceptsImages(entry.input),
+  }));
+}
+
+async function discoverModels({ providerId, baseUrl, apiKey }) {
+  const rows = [];
+  const seen = new Set();
+  const add = (entry) => {
+    const id = String(entry.id || "").replace(/^models\//, "");
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    rows.push({ ...entry, id });
+  };
+  if (providerId && officialProvider(providerId)) {
+    const store = new Store(dir);
+    try {
+      const registry = officialModels(new SqlCredentials(store));
+      for (const model of registry.getModels(providerId))
+        add(toCatalogEntry(model));
+    } finally {
+      store.close();
     }
   }
+  if (baseUrl && apiKey) {
+    const listed = await listModels(baseUrl, apiKey);
+    if (listed.ok) {
+      const live = new Set(listed.ids);
+      const known = rows.filter((row) => live.has(row.id));
+      rows.length = 0;
+      seen.clear();
+      for (const row of known) add(row);
+      for (const id of listed.ids) add({ id });
+    }
+  }
+  return rows;
+}
 
-  // 4/4 audio: its own provider, because a chat endpoint does not transcribe
-  console.log('\nÁUDIO — Enter desativa, "-" desativa');
+async function pickListedModel(readline, entries, current, prefix = "") {
+  const ids = entries.map((entry) => entry.id);
+  entries.forEach((entry, index) =>
+    console.log(
+      `  [${index + 1}] ${prefix}${entry.id}${entry.efforts?.length ? `  (effort: ${entry.efforts.join(" ")})` : ""}`,
+    ),
+  );
+  if (!ids.length) console.log("No models listed. Enter a model id.");
+  const bare = current?.replace(/^models\//, "");
+  const known = Boolean(bare && ids.includes(bare));
+  if (bare && ids.length && !known)
+    console.log(`${bare}: ${UNAVAILABLE_MODEL}`);
+  const hint = known ? bare : ids[0];
+  const answer = (
+    await readline.question(`Model${hint ? ` [${hint}]` : ""}: `)
+  ).trim();
+  if (!answer) return hint || bare || "";
+  const index = Number(answer);
+  const picked =
+    Number.isSafeInteger(index) && ids[index - 1]
+      ? ids[index - 1]
+      : answer.replace(/^models\//, "");
+  return picked;
+}
+
+async function pickImageProvider(readline, session, draft) {
+  console.log("Image provider");
+  console.log("  [0] Same as the text provider (reuses its API key)");
+  PROVIDERS.forEach((entry, index) =>
+    console.log(
+      `  [${index + 1}] ${entry.name}${entry.hint ? ` — ${entry.hint}` : ""}`,
+    ),
+  );
+  const answer = (await readline.question("Provider: ")).trim();
+  if (!answer) return;
+  if (answer === "0") {
+    const stored = draft.vision?.modelId;
+    const storedOk =
+      stored &&
+      session.text.providerId &&
+      imageModelBelongsToProvider(session.text.providerId, stored, {
+        imageBaseUrl: draft.vision?.baseUrl,
+        textBaseUrl: session.text.baseUrl,
+      });
+    const imageModels = modelsForSection(textProviderModels(), "image");
+    const plan = imageSectionPlan({
+      chatSeesImages: false,
+      textModelId: session.text.modelId,
+      providerModels: imageModels.map((model) => ({
+        id: model.id,
+        acceptsImages: modelAcceptsImages(model.input) || !model.input?.length,
+      })),
+      storedModelId: storedOk ? stored : undefined,
+    });
+    if (plan.ignoredForeignModel && stored)
+      console.log(
+        `${stored} is not a ${session.text.providerId} model. Default is ${plan.modelId}.`,
+      );
+    draft.choice = "separate";
+    draft.sameAsText = true;
+    draft.vision = { modelId: plan.modelId || "" };
+    draft.listed = imageModels;
+    draft.newKey = undefined;
+    console.log(
+      plan.modelId
+        ? `Default image model: ${plan.modelId}. Open Model to pick from the list.`
+        : "Choose a model from this provider.",
+    );
+    return;
+  }
+  const picked = providerFromAnswer(answer);
+  if (!picked) {
+    console.log("Unknown image provider.");
+    return;
+  }
+  let base = picked.baseUrl;
+  if (!base)
+    base = (await readline.question("Image provider base URL: ")).trim();
+  if (!base) {
+    console.log("Image provider URL is missing.");
+    return;
+  }
+  const same = host(base) === host(session.text.baseUrl);
+  let key = same ? session.text.newKey || session.text.apiKey : "";
+  if (!key) {
+    const typed = await askSecret(
+      readline,
+      "Image API key",
+      Boolean(draft.key || draft.newKey),
+    );
+    key = typed || draft.newKey || draft.key || "";
+    if (typed) draft.newKey = typed;
+  }
+  if (!key) {
+    console.log("Image API key is missing.");
+    return;
+  }
+  draft.choice = "separate";
+  draft.sameAsText = same;
+  const imageModels = modelsForSection(
+    await discoverModels({
+      providerId: officialIdForUrl(base),
+      baseUrl: base,
+      apiKey: key,
+    }),
+    "image",
+  );
+  draft.listed = imageModels;
+  const plan = imageSectionPlan({
+    chatSeesImages: false,
+    providerModels: imageModels.map((model) => ({
+      id: model.id,
+      acceptsImages: modelAcceptsImages(model.input) || !model.input?.length,
+    })),
+  });
+  draft.vision = { modelId: plan.modelId || "", baseUrl: base };
+  if (!imageModels.length)
+    console.log("Could not list image models. Enter a model id.");
+  console.log(
+    draft.vision.modelId
+      ? `Default image model: ${draft.vision.modelId}. Open Model to pick from the list.`
+      : "Enter a model id from this provider.",
+  );
+}
+
+async function pickImageModel(readline, session, draft) {
+  if (draft.choice !== "separate") {
+    console.log("Choose a provider first.");
+    return;
+  }
+  let entries = draft.listed || [];
+  if (!entries.length) {
+    const base = draft.vision?.baseUrl || session.text.baseUrl;
+    const key =
+      draft.newKey ||
+      (draft.sameAsText
+        ? session.text.newKey || session.text.apiKey
+        : draft.key) ||
+      session.text.newKey ||
+      session.text.apiKey;
+    entries = draft.sameAsText
+      ? modelsForSection(textProviderModels(), "image")
+      : modelsForSection(
+          await discoverModels({
+            providerId: officialIdForUrl(base),
+            baseUrl: base,
+            apiKey: key,
+          }),
+          "image",
+        );
+    draft.listed = entries;
+  }
+  const modelId = await pickListedModel(
+    readline,
+    entries,
+    draft.vision?.modelId,
+  );
+  if (!modelId) {
+    console.log("Model id is missing.");
+    return;
+  }
+  draft.vision = { ...(draft.vision || {}), modelId };
+}
+
+async function testImage(session, draft, chatSeesImages) {
+  const usingText =
+    draft.choice !== "separate" && (chatSeesImages || draft.choice === "text");
+  if (usingText) {
+    console.log(
+      session.text.chatVision
+        ? `Image test: ${session.text.modelId} accepts images, so image input uses the text model.`
+        : `Image test: ${session.text.modelId} does not accept images.`,
+    );
+    return;
+  }
+  const vision = draft.vision;
+  if (!vision?.modelId) {
+    console.log("Choose an image model first.");
+    return;
+  }
+  if (
+    draft.sameAsText &&
+    session.text.providerId &&
+    !imageModelBelongsToProvider(session.text.providerId, vision.modelId, {
+      imageBaseUrl: vision.baseUrl,
+      textBaseUrl: session.text.baseUrl,
+    })
+  ) {
+    console.log(
+      `${vision.modelId} does not belong to ${session.text.providerId}. The test was not sent.`,
+    );
+    return;
+  }
+  const base = vision.baseUrl || session.text.baseUrl;
+  const key =
+    draft.newKey ||
+    (draft.sameAsText
+      ? session.text.newKey || session.text.apiKey
+      : draft.key) ||
+    session.text.newKey ||
+    session.text.apiKey;
+  if (!base || !key) {
+    console.log("An image provider and API key are required before a test.");
+    return;
+  }
+  const verdict = await probeImageSupport({
+    modelId: vision.modelId,
+    baseUrl: base,
+    apiKey: key,
+  });
+  const label = {
+    vision: "accepts images",
+    text: "text only",
+    unknown: "not confirmed",
+  }[verdict.verdict];
+  console.log(
+    `${vision.modelId}: ${label}${verdict.detail ? ` (${verdict.detail})` : ""}.`,
+  );
+}
+
+async function imageMenu(readline, session) {
+  if (!session.text.modelId) {
+    console.log(
+      "Set a text model first. Image input depends on whether that model accepts images.",
+    );
+    return;
+  }
+  if (!(await ensureCatalog(session, undefined))) {
+    console.log("The text model catalog could not be loaded.");
+    return;
+  }
+  const sees = await detectChatVision(session);
+  if (sees === undefined) return;
+  const draft = structuredClone(session.image);
+  if (
+    draft.vision?.modelId &&
+    draft.choice !== "off" &&
+    draft.choice !== "text"
+  )
+    draft.choice = "separate";
+  else if (sees && draft.choice !== "separate") draft.choice = "text";
+  for (;;) {
+    console.log("\nImage model");
+    if (sees && draft.choice !== "separate") {
+      console.log(`Text model ${session.text.modelId} accepts images.`);
+      console.log(
+        "Image input uses that model. No separate image model is required.",
+      );
+      console.log("1 - Use the text model");
+      console.log("2 - Choose a separate image model");
+      console.log("t - Test");
+    } else {
+      console.log(
+        sees
+          ? `A separate image model overrides nothing while ${session.text.modelId} accepts images. Pick one only if you want it stored.`
+          : `Text model ${session.text.modelId} does not accept images.`,
+      );
+      if (!sees)
+        console.log(
+          "Choose an image provider, then a model from that provider.",
+        );
+      console.log(`Image model: ${draft.vision?.modelId || "not set"}`);
+      if (sees) console.log("text - Use the text model");
+      console.log("1 - Provider");
+      console.log("2 - Model");
+      console.log("3 - API key");
+      console.log("t - Test");
+      console.log("- - Disable");
+    }
+    printSectionEnd();
+    const action = routeImageMenu(
+      await readline.question("Choice: "),
+      sees && draft.choice !== "separate",
+    );
+    if (!action) {
+      console.log("Unknown choice.");
+      continue;
+    }
+    if (action === "back") return;
+    if (action === "save") {
+      if (
+        !sees &&
+        draft.choice !== "off" &&
+        draft.choice !== "text" &&
+        !draft.vision?.modelId
+      ) {
+        console.log("Choose an image provider and a model, or disable image.");
+        continue;
+      }
+      const previous = session.image;
+      session.image = draft;
+      const error = await persistSetup(undefined, session);
+      if (error) {
+        session.image = previous;
+        console.log(error);
+        continue;
+      }
+      return;
+    }
+    if (action === "use-text") {
+      draft.choice = "text";
+      draft.vision = undefined;
+      console.log(`Image model: ${session.text.modelId} (the text model).`);
+    } else if (action === "disable") {
+      draft.choice = "off";
+      draft.vision = undefined;
+      console.log("Image model disabled.");
+    } else if (action === "separate" || action === "provider")
+      await pickImageProvider(readline, session, draft);
+    else if (action === "model") await pickImageModel(readline, session, draft);
+    else if (action === "key") {
+      const typed = await askSecret(
+        readline,
+        "Image API key",
+        Boolean(draft.newKey || draft.key),
+      );
+      if (typed) {
+        draft.newKey = typed;
+        draft.sameAsText = false;
+      }
+    } else if (action === "test") await testImage(session, draft, sees);
+  }
+}
+
+async function configureAudioProvider(readline, session, draft) {
   AUDIO_PROVIDERS.forEach((entry, index) =>
     console.log(
       `  [${index + 1}] ${entry.name}${entry.model ? ` — ${entry.model}` : ""}${entry.hint ? ` (${entry.hint})` : ""}`,
     ),
   );
-  const audioAnswer = (
-    await readline.question(
-      `Transcrição [${prefill.audio ? `${prefill.audio.modelId}` : "desativada"}]: `,
-    )
-  ).trim();
-  let audio = stored.audio;
-  if (audioAnswer === "-") audio = undefined;
-  else if (audioAnswer) {
-    const picked = pickAudio(audioAnswer);
-    if (!picked) return fail("Opção de áudio inválida.");
-    let base = picked.baseUrl;
-    let api = picked.api;
-    let model = picked.model;
-    if (!base) {
-      base = (
-        await readline.question("Endpoint de transcrição (URL raiz): ")
-      ).trim();
-      const format = (
-        await readline.question(
-          "Formato [1] OpenAI multipart [2] Gemini JSON [1]: ",
-        )
-      ).trim();
-      api = format === "2" ? "gemini" : "openai";
-      model = (await readline.question("Modelo de transcrição (id): ")).trim();
-      if (!base || !model)
-        return fail("Áudio desativado: faltou endpoint ou modelo.");
-    }
-    let audioKey = host(base) === host(resolved.baseUrl) ? resolved.apiKey : "";
-    if (!audioKey) {
-      readline.pause();
-      audioKey = await hidden(`Chave da ${picked.name} (não aparece): `);
-      readline.resume();
-    }
-    if (!audioKey) return fail("Áudio desativado: sem chave.");
-    resolved.audioKey = audioKey;
-    const language = (
-      await readline.question(`Idioma [${prefill.audio?.language || "auto"}]: `)
-    ).trim();
-    audio = {
-      modelId: model,
-      api,
-      baseUrl: base,
-      ...(language ? { language } : {}),
-    };
-    console.log(
-      "  ⚠ o modelo precisa aceitar ogg (whisper-1, Gemini e Groq aceitam)",
-    );
+  const picked = pickAudio((await readline.question("Provider: ")).trim());
+  if (!picked) {
+    console.log("Unknown audio provider.");
+    return;
   }
-  const selection = {
-    ...(vision ? { vision } : {}),
-    ...(audio ? { audio } : {}),
+  let base = picked.baseUrl;
+  let api = picked.api;
+  let model = picked.model;
+  if (!base) {
+    base = (await readline.question("Transcription base URL: ")).trim();
+    const format = (
+      await readline.question(
+        "Format [1] OpenAI multipart [2] Gemini JSON [1]: ",
+      )
+    ).trim();
+    api = format === "2" ? "gemini" : "openai";
+    model = (await readline.question("Transcription model id: ")).trim();
+    if (!base || !model) {
+      console.log("Audio needs a URL and a model.");
+      return;
+    }
+  }
+  const same = host(base) === host(session.text.baseUrl);
+  let key = same ? session.text.newKey || session.text.apiKey : "";
+  if (!key) {
+    const typed = await askSecret(
+      readline,
+      "Audio API key",
+      Boolean(draft.newKey || draft.key),
+    );
+    key = typed || draft.newKey || draft.key || "";
+    if (typed) draft.newKey = typed;
+  }
+  if (!key) {
+    console.log("Audio API key is missing.");
+    return;
+  }
+  const entries = modelsForSection(
+    await discoverModels({
+      providerId: api === "gemini" ? "google" : officialIdForUrl(base),
+      baseUrl: base,
+      apiKey: key,
+    }),
+    "audio",
+  );
+  const presetOk = Boolean(
+    model && entries.some((entry) => entry.id === model),
+  );
+  if (model && entries.length && !presetOk)
+    console.log(`${model}: ${UNAVAILABLE_MODEL}`);
+  draft.off = false;
+  draft.listed = entries;
+  draft.audio = {
+    modelId: presetOk ? model : entries[0]?.id || model,
+    api,
+    baseUrl: base,
+    ...(draft.audio?.language ? { language: draft.audio.language } : {}),
   };
-  console.log(`\n${functionLabel(selection)}`);
-  const confirm = (
-    await readline.question(`Gravar chat ${entry.id} · ${effort}? [y/N] `)
-  ).trim();
-  if (!/^y(es)?$/i.test(confirm)) return fail("Cancelado.", 0);
-  commit(entry, effort, selection);
-  if (options.dryRun)
-    console.log(`(dry-run) gravaria ${functionLabel(selection)}.`);
-  else console.log(`Funções: ${functionLabel(selection)}`);
+  console.log(
+    "The model must accept OGG/Opus (whisper-1, Gemini, and Groq do). Voice notes are transcribed at runtime. Open Model to pick from the list.",
+  );
+}
+
+async function testAudio(session, draft) {
+  const audio = draft.audio;
+  if (draft.off || !audio?.modelId || !audio.baseUrl) {
+    console.log("Choose an audio provider and model first.");
+    return;
+  }
+  const key =
+    draft.newKey ||
+    draft.key ||
+    (host(audio.baseUrl) === host(session.text.baseUrl)
+      ? session.text.newKey || session.text.apiKey
+      : "");
+  if (!key) {
+    console.log("Audio API key is missing.");
+    return;
+  }
+  try {
+    const response = await fetch(
+      `${audio.baseUrl.replace(/\/+$/, "")}/models`,
+      {
+        headers:
+          audio.api === "gemini"
+            ? { "x-goog-api-key": key }
+            : { authorization: `Bearer ${key}` },
+        signal: AbortSignal.timeout(20000),
+      },
+    );
+    const body = await response.text();
+    const hint = providerErrorHint(body);
+    if (!response.ok) {
+      console.log(
+        `Audio test failed: HTTP ${response.status}${hint ? `: ${hint}` : ""}.`,
+      );
+      return;
+    }
+    console.log(
+      `Audio endpoint accepted the key. Voice notes use ${audio.modelId}. The model must accept OGG/Opus.`,
+    );
+  } catch {
+    console.log("Audio test failed: no response.");
+  }
+}
+
+async function audioMenu(readline, session) {
+  const draft = structuredClone(session.audio);
+  for (;;) {
+    console.log("\nAudio model");
+    console.log(
+      "Used for Telegram voice notes. The runtime transcribes them with this model.",
+    );
+    console.log(
+      `Provider model: ${draft.off ? "disabled" : draft.audio?.modelId || "not set"}`,
+    );
+    console.log(
+      `API key: ${draft.newKey || draft.key ? "[saved]" : host(draft.audio?.baseUrl) === host(session.text.baseUrl) && (session.text.apiKey || session.text.newKey) ? "[reused from text model]" : "not set"}`,
+    );
+    console.log(`Language: ${draft.audio?.language || "auto"}`);
+    console.log("1 - Provider");
+    console.log("2 - Model");
+    console.log("3 - API key");
+    console.log("4 - Language");
+    console.log("t - Test");
+    console.log("- - Disable");
+    printSectionEnd();
+    const action = routeAudioMenu(await readline.question("Choice: "));
+    if (!action) {
+      console.log("Unknown choice.");
+      continue;
+    }
+    if (action === "back") return;
+    if (action === "save") {
+      const previous = session.audio;
+      session.audio = draft;
+      const error = await persistSetup(undefined, session);
+      if (error) {
+        session.audio = previous;
+        console.log(error);
+        continue;
+      }
+      return;
+    }
+    if (action === "provider")
+      await configureAudioProvider(readline, session, draft);
+    else if (action === "model") {
+      if (!draft.audio?.baseUrl) {
+        console.log("Choose a provider first.");
+        continue;
+      }
+      const key =
+        draft.newKey ||
+        draft.key ||
+        (host(draft.audio.baseUrl) === host(session.text.baseUrl)
+          ? session.text.newKey || session.text.apiKey
+          : "");
+      const entries =
+        draft.listed ||
+        modelsForSection(
+          await discoverModels({
+            providerId:
+              draft.audio.api === "gemini"
+                ? "google"
+                : officialIdForUrl(draft.audio.baseUrl),
+            baseUrl: draft.audio.baseUrl,
+            apiKey: key,
+          }),
+          "audio",
+        );
+      draft.listed = entries;
+      const modelId = await pickListedModel(
+        readline,
+        entries,
+        draft.audio.modelId,
+      );
+      if (modelId) draft.audio = { ...draft.audio, modelId };
+    } else if (action === "key") {
+      const typed = await askSecret(
+        readline,
+        "Audio API key",
+        Boolean(draft.newKey || draft.key),
+      );
+      if (typed) draft.newKey = typed;
+    } else if (action === "language") {
+      if (!draft.audio) {
+        console.log("Choose a provider first.");
+        continue;
+      }
+      const current = draft.audio.language || "auto";
+      const answer = (
+        await readline.question(`Language [${current}]: `)
+      ).trim();
+      const language = answer && answer !== "auto" ? answer : "";
+      draft.audio = { ...draft.audio };
+      if (language) draft.audio.language = language;
+      else delete draft.audio.language;
+    } else if (action === "disable") {
+      draft.off = true;
+      draft.audio = undefined;
+      console.log("Audio model disabled.");
+    } else await testAudio(session, draft);
+  }
+}
+
+async function mcpFields(readline, draft) {
+  if (draft.choice === "executor" || draft.choice === "both") {
+    const current =
+      process.env.EXECUTOR_MCP_URL?.trim() || draft.executorUrl || "";
+    draft.executorUrl =
+      (
+        await readline.question(
+          `Executor URL${current ? ` [${current}]` : ""}: `,
+        )
+      ).trim() || current;
+    const typed = await askSecret(
+      readline,
+      "Executor token",
+      Boolean(draft.executorToken || draft.newExecutor),
+    );
+    if (typed) draft.newExecutor = typed;
+  }
+  if (draft.choice === "composio" || draft.choice === "both") {
+    const current =
+      process.env.COMPOSIO_MCP_URL?.trim() ||
+      draft.composioUrl ||
+      COMPOSIO_CONNECT_URL;
+    draft.composioUrl =
+      (await readline.question(`Composio MCP URL [${current}]: `)).trim() ||
+      current;
+    const currentUser =
+      process.env.COMPOSIO_USER_ID?.trim() || draft.composioUser || "";
+    draft.composioUser =
+      (
+        await readline.question(
+          `User id${currentUser ? ` [${currentUser}]` : ""}: `,
+        )
+      ).trim() || currentUser;
+    const typed = await askSecret(
+      readline,
+      "Composio key",
+      Boolean(draft.composioKey || draft.newComposio),
+    );
+    if (typed) draft.newComposio = typed;
+  }
+  if (draft.choice === "none")
+    console.log(
+      "MCP platform set to none. Saved Executor and Composio credentials are kept.",
+    );
+}
+
+function saveMcp(draft) {
+  if (!draft.choice) return "Choose Executor, Composio, both, or none.";
+  const built = aggregatorFields({
+    choice: draft.choice,
+    executorUrl: draft.executorUrl,
+    executorToken: draft.newExecutor || draft.executorToken,
+    composioUrl: draft.composioUrl,
+    composioUser: draft.composioUser,
+    composioKey: draft.newComposio || draft.composioKey,
+  });
+  if (built.error) return built.error;
+  persistAggregators(built.record, {
+    ...(draft.newExecutor ? { executor: draft.newExecutor } : {}),
+    ...(draft.newComposio ? { composio: draft.newComposio } : {}),
+  });
+  return "";
+}
+
+async function mcpMenu(readline, session) {
+  const draft = structuredClone(session.mcp);
+  for (;;) {
+    console.log("\nMCP platform");
+    console.log(
+      "Switching platform keeps the other credential. None turns both off without deleting keys.",
+    );
+    console.log(`Choice: ${draft.choice || "not set"}`);
+    console.log("1 - Executor");
+    console.log("2 - Composio");
+    console.log("3 - Both");
+    console.log("4 - None");
+    printSectionEnd();
+    const action = routeMcpMenu(await readline.question("Choice: "));
+    if (!action) {
+      console.log("Unknown choice. Use 1, 2, 3, 4, or s.");
+      continue;
+    }
+    if (action === "back") return;
+    if (action === "save") {
+      const error = saveMcp(draft);
+      if (error) {
+        console.log(error);
+        continue;
+      }
+      session.mcp = draft;
+      return;
+    }
+    draft.choice = action;
+    await mcpFields(readline, draft);
+  }
+}
+
+function processRows() {
+  let entries = [];
+  try {
+    entries = readdirSync("/proc");
+  } catch {
+    return [];
+  }
+  const rows = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      rows.push({
+        pid: Number(entry),
+        command: readFileSync(`/proc/${entry}/cmdline`, "utf8"),
+      });
+    } catch {
+      /* The process exited between readdir and read. */
+    }
+  }
+  return rows;
+}
+
+function restartGateway() {
+  closeDb();
+  let result;
+  try {
+    result = requestGatewayRestart(processRows(), process.pid);
+  } catch (error) {
+    console.log(
+      error instanceof Error
+        ? `Gateway was not restarted: ${error.message}`
+        : "Gateway was not restarted.",
+    );
+    return;
+  }
+  if (!result.restarted) {
+    console.log(
+      "Saved. No gateway is running in this container. Start it to apply the volume. Changing environment variables (TZ, TELEGRAM_*, LLM_*, EXECUTOR_*, COMPOSIO_*, CONFIG_FILE) still needs a new container.",
+    );
+    return;
+  }
+  console.log(
+    `Gateway process ${result.pid} was asked to exit (SIGTERM). The container restart policy starts it again and it re-reads app.sqlite and config.yaml. Redeploying the image is not required. Environment variable changes still need a new container.`,
+  );
 }
 
 async function interactive() {
@@ -948,161 +2179,60 @@ async function interactive() {
     input: process.stdin,
     output: process.stdout,
   });
+  const session = loadSession();
+  console.log(
+    "Enter keeps a saved value. Secrets stay hidden. Save and back writes that section. Save and restart gateway reloads the running bot from the volume.",
+  );
   try {
-    const before = readStoredSetup(dir);
-    let baseUrl = process.env.LLM_BASE_URL?.trim() || before.record?.baseUrl;
-    let apiKey = operatorSecret(process.env, "LLM_API_KEY") ?? before.apiKey;
-
-    console.log(
-      "Provedores oficiais do pi-ai. A chave fica no volume, no id do provedor.",
-    );
-    console.log(
-      "  [0] ChatGPT (assinatura Plus/Pro — OAuth, sem chave de API)",
-    );
-    const menu = setupChoices();
-    menu.forEach((entry, index) =>
-      console.log(
-        `  [${index + 1}] ${entry.name}${entry.hint ? ` — ${entry.hint}` : ""}`,
-      ),
-    );
-    const storedNative =
-      before.record &&
-      before.record.authMode !== "chatgpt" &&
-      resolveSetupChoice(before.record.providerId)?.kind === "native"
-        ? resolveSetupChoice(before.record.providerId)
-        : undefined;
-    const defaultHint =
-      before.record?.authMode === "chatgpt"
-        ? "0"
-        : storedNative
-          ? storedNative.id
-          : baseUrl
-            ? `atual: ${baseUrl}`
-            : "1";
-    const providerAnswer = (
-      await readline.question(`\nProvedor [${defaultHint}]: `)
-    ).trim();
-
-    const useSubscription =
-      isSubscriptionChoice(providerAnswer) ||
-      (!providerAnswer && before.record?.authMode === "chatgpt");
-
-    if (useSubscription) {
-      let piProviderId = "openai";
-      if (
-        before.record?.authMode === "chatgpt" &&
-        (before.record.providerId === "openai" ||
-          before.record.providerId === "openai-codex")
-      ) {
-        piProviderId = before.record.providerId;
+    for (;;) {
+      printMain(session);
+      const action = routeSetupMenu(await readline.question("Choice: "));
+      if (!action) {
+        console.log("Unknown choice.");
+        continue;
       }
-      if (
-        providerAnswer &&
-        providerAnswer !== "0" &&
-        providerAnswer !== "chatgpt" &&
-        providerAnswer !== "subscription"
-      ) {
-        piProviderId = subscriptionPiProvider(providerAnswer);
-      } else if (
-        !providerAnswer &&
-        before.record?.authMode === "chatgpt" &&
-        before.record.providerId
-      ) {
-        piProviderId = before.record.providerId;
-      } else if (!providerAnswer && before.record?.authMode !== "chatgpt") {
-        const subFlow = (
-          await readline.question(
-            "Assinatura [1] Sign in with ChatGPT (openai) [2] Codex legado (openai-codex) [1]: ",
-          )
-        ).trim();
-        piProviderId = subFlow === "2" ? "openai-codex" : "openai";
-      } else if (providerAnswer === "0" || providerAnswer === "chatgpt") {
-        const subFlow = (
-          await readline.question(
-            "Assinatura [1] Sign in with ChatGPT (openai) [2] Codex legado (openai-codex) [1]: ",
-          )
-        ).trim();
-        piProviderId = subFlow === "2" ? "openai-codex" : "openai";
+      if (action === "exit") {
+        console.log(
+          "Exited without saving this visit. Sections already saved stay on the volume.",
+        );
+        return;
       }
-      await loadSubscriptionCatalog(readline, piProviderId);
-      await runModelWizard(readline);
-      return;
-    }
-
-    const picked = providerAnswer
-      ? resolveSetupChoice(providerAnswer)
-      : storedNative;
-    if (providerAnswer && !picked)
-      return fail("Provedor inválido: use o número, o id ou a URL raiz.");
-    if (!picked && !baseUrl)
-      return fail("Informe o provedor (número, id ou URL).");
-
-    if (picked?.kind === "native") {
-      const same =
-        resolveSetupChoice(before.record?.providerId ?? "")?.id === picked.id;
-      apiKey = same ? (before.apiKey ?? apiKey) : undefined;
-      if (!apiKey) {
-        readline.pause();
-        apiKey = await hidden("Chave de API (não aparece): ");
-        readline.resume();
+      if (action === "restart") {
+        const textReady = Boolean(
+          session.text.modelId &&
+          (session.text.authMode === "chatgpt" ||
+            session.text.apiKey ||
+            session.text.newKey),
+        );
+        if (textReady) {
+          const error = await persistSetup(
+            session.text.authMode === "chatgpt" ? readline : undefined,
+            session,
+          );
+          if (error) {
+            console.log(error);
+            continue;
+          }
+        }
+        restartGateway();
+        return;
       }
-      if (!apiKey) return fail("Chave ausente.");
-      resolved.apiKey = apiKey;
-      loadNativeCatalog(picked.id);
-      console.log(
-        `  ✔ chave guardada para ${picked.id} — ${catalog.length} modelos no catálogo oficial`,
-      );
-      await runModelWizard(readline);
-      return;
+      if (action === "gateway") await gatewayMenu(readline, session);
+      else if (action === "text") await textMenu(readline, session);
+      else if (action === "image") await imageMenu(readline, session);
+      else if (action === "audio") await audioMenu(readline, session);
+      else await mcpMenu(readline, session);
     }
-
-    if (picked?.kind === "compat") {
-      let pickedUrl = picked.baseUrl;
-      if (!pickedUrl)
-        pickedUrl = (
-          await readline.question(
-            "URL raiz do provedor (ex. https://meu-provedor/v1): ",
-          )
-        ).trim();
-      if (!pickedUrl) return fail("Provedor inválido: sem URL.");
-      if (pickedUrl !== baseUrl) {
-        baseUrl = pickedUrl;
-        apiKey = undefined;
-      }
-    }
-    if (!baseUrl) return fail("Informe o provedor (número, id ou URL).");
-
-    if (!apiKey) {
-      readline.pause();
-      apiKey = await hidden("Chave de API (não aparece): ");
-      readline.resume();
-    }
-    for (let attempt = 0; ; attempt += 1) {
-      const check = await listModels(baseUrl, apiKey);
-      if (check.ok) {
-        console.log(`  ✔ chave válida — ${check.ids.length} modelos listados`);
-        break;
-      }
-      console.log(`  ! ${baseUrl} recusou a chave (${check.detail})`);
-      if (attempt >= 2 || !process.stdin.isTTY) return fail("Chave inválida.");
-      readline.pause();
-      apiKey = await hidden("Chave de API: ");
-      readline.resume();
-    }
-    resolved.baseUrl = baseUrl;
-    resolved.apiKey = apiKey;
-    resolved.providerId = providerIdFor(baseUrl);
-    await loadCatalog(baseUrl, apiKey);
-    await runModelWizard(readline);
   } catch (error) {
-    if (error instanceof Error && error.name === "AbortError")
-      return fail("Cancelado.", 0);
+    if (error instanceof Error && error.name === "AbortError") {
+      console.log("Cancelled.");
+      return;
+    }
     throw error;
   } finally {
     readline.close();
   }
 }
-
 const functionFlags =
   options.vision !== undefined ||
   options.audio !== undefined ||
@@ -1113,7 +2243,185 @@ const hasFlags =
   options.dryRun ||
   options.model !== undefined ||
   options.effort !== undefined ||
+  options.aggregators !== undefined ||
+  options.telegramTokenStdin ||
+  options.telegramUsers !== undefined ||
   functionFlags;
+
+function aggregatorLabel() {
+  const stored = readStoredAggregators(dir);
+  if (!stored.record) return "MCP platform: not set (environment applies)";
+  const choice = stored.record.choice;
+  const parts = [choice];
+  const executorOn = choice === "executor" || choice === "both";
+  const composioOn = choice === "composio" || choice === "both";
+  if (stored.record.executor)
+    parts.push(
+      `executor ${stored.record.executor.url}${stored.executorToken ? " (token on volume)" : ""}${executorOn ? "" : " (off)"}`,
+    );
+  if (stored.record.composio)
+    parts.push(
+      `composio ${stored.record.composio.url} user ${stored.record.composio.userId}${stored.composioKey ? " (key on volume)" : ""}${composioOn ? "" : " (off)"}`,
+    );
+  return `MCP platform: ${parts.join(" · ")}`;
+}
+
+function telegramLabel() {
+  const stored = readStoredTelegram(dir);
+  const users = stored.users?.length
+    ? stored.users.join(",")
+    : "none on the volume";
+  return `Telegram: ${stored.token ? "token on the volume" : "no token on the volume"}; users ${users}`;
+}
+
+function persistTelegram(users, token) {
+  if (options.dryRun) {
+    console.log(`(dry-run) telegram: ${users.length} user(s).`);
+    return;
+  }
+  writeStoredTelegram(db, users, token, MODE);
+  console.log(
+    token
+      ? "Telegram saved on the volume. The token is in credentials."
+      : "Telegram saved on the volume. The previous token was kept.",
+  );
+}
+
+function persistAggregators(record, keys) {
+  if (options.dryRun) {
+    console.log(`(dry-run) MCP platform: ${record.choice}.`);
+    return;
+  }
+  writeStoredAggregators(db, record, keys, MODE);
+  console.log(
+    `MCP platform saved on the volume (${record.choice}). Keys are in credentials.`,
+  );
+  warnIfNoAggregator();
+}
+
+function warnIfNoAggregator() {
+  const stored = readStoredAggregators(dir);
+  if (mcpServersFromAggregators(process.env, stored).length === 0)
+    console.log(
+      "! Warning: no MCP platform is active with a credential. The bot starts without MCP tools.",
+    );
+}
+
+function aggregatorFields({
+  choice,
+  executorUrl,
+  executorToken,
+  composioUrl,
+  composioUser,
+  composioKey,
+}) {
+  try {
+    const record = { choice };
+    const keys = {};
+    if (choice === "executor" || choice === "both") {
+      if (!executorUrl) return { error: "Executor URL is missing." };
+      record.executor = { url: validatePublicEndpoint(executorUrl) };
+      if (executorToken) keys.executor = executorToken;
+      else if (!operatorSecret(process.env, "EXECUTOR_TOKEN"))
+        return {
+          error:
+            "Executor token is missing. Enter it in the menu, or set EXECUTOR_TOKEN.",
+        };
+    }
+    if (choice === "composio" || choice === "both") {
+      const url = validatePublicEndpoint(composioUrl || COMPOSIO_CONNECT_URL);
+      if (!validAggregatorUserId(composioUser || ""))
+        return { error: "Composio user id is invalid." };
+      record.composio = { url, userId: composioUser };
+      if (composioKey) keys.composio = composioKey;
+      else if (!operatorSecret(process.env, "COMPOSIO_API_KEY"))
+        return {
+          error:
+            "Composio key is missing. Enter it in the menu, or set COMPOSIO_API_KEY.",
+        };
+      const header = composioAuthHeader(url);
+      console.log(
+        composioSendsUserId(url)
+          ? `  Composio: header ${header}; user id is sent as user_id.`
+          : `  Composio: header ${header}. The user id stays on the volume.`,
+      );
+    }
+    return { record, keys };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function telegramFromFlags() {
+  if (!options.telegramTokenStdin && options.telegramUsers === undefined)
+    return;
+  const stored = readStoredTelegram(dir);
+  const typed = options.telegramTokenStdin ? (await readStdin()).trim() : "";
+  if (typed && !validTelegramToken(typed))
+    fail("Invalid Telegram bot token. Use the form 123456:ABC…");
+  const envToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
+  const envTokenUsable =
+    envToken && !/replace_with/i.test(envToken) && validTelegramToken(envToken)
+      ? envToken
+      : undefined;
+  if (!typed && !stored.token && !envTokenUsable)
+    fail(
+      "Telegram bot token is missing. Use --telegram-token-stdin or the menu.",
+      2,
+    );
+  const usersText =
+    options.telegramUsers !== undefined
+      ? options.telegramUsers.trim() ||
+        stored.users?.join(",") ||
+        process.env.TELEGRAM_ALLOWED_USERS?.trim() ||
+        ""
+      : stored.users?.join(",") ||
+        process.env.TELEGRAM_ALLOWED_USERS?.trim() ||
+        "";
+  const users = parseTelegramUserList(usersText);
+  if (!users)
+    fail(
+      "Telegram users are missing or invalid. Use --telegram-users with comma-separated numeric ids.",
+      2,
+    );
+  persistTelegram(users, typed || undefined);
+}
+
+async function aggregatorsFromFlags() {
+  const choice = parseAggregatorChoice(options.aggregators || "");
+  if (!choice)
+    fail(`Invalid MCP platform: ${options.aggregators}\n\n${usage}`, 2);
+  const stored = readStoredAggregators(dir);
+  let executorToken = stored.executorToken;
+  let composioKey = stored.composioKey;
+  if (options.executorTokenStdin) {
+    const typed = (await readStdin()).trim();
+    if (typed) executorToken = typed;
+  } else if (options.composioKeyStdin) {
+    const typed = (await readStdin()).trim();
+    if (typed) composioKey = typed;
+  }
+  const built = aggregatorFields({
+    choice,
+    executorUrl:
+      options.executorUrl ||
+      process.env.EXECUTOR_MCP_URL?.trim() ||
+      stored.record?.executor?.url,
+    executorToken,
+    composioUrl:
+      options.composioUrl ||
+      process.env.COMPOSIO_MCP_URL?.trim() ||
+      stored.record?.composio?.url ||
+      COMPOSIO_CONNECT_URL,
+    composioUser:
+      options.composioUser ||
+      process.env.COMPOSIO_USER_ID?.trim() ||
+      stored.record?.composio?.userId,
+    composioKey,
+  });
+  if (built.error) fail(built.error);
+  persistAggregators(built.record, built.keys);
+}
 const writes =
   options.model !== undefined || options.effort !== undefined || functionFlags;
 /** Selection from flags; `none` clears a function, absent keeps what is stored. */
@@ -1144,15 +2452,26 @@ function selectionFromFlags() {
   return { ...(vision ? { vision } : {}), ...(audio ? { audio } : {}) };
 }
 try {
+  if (
+    [
+      options.keyStdin,
+      options.composioKeyStdin,
+      options.executorTokenStdin,
+      options.telegramTokenStdin,
+    ].filter(Boolean).length > 1
+  )
+    fail("stdin can carry only one secret per run.", 2);
   if (!hasFlags) {
     if (!process.stdin.isTTY)
       fail(
-        `Sem terminal interativo. Use --provider, --key-stdin (ou LLM_API_KEY no caminho compatível) e --model.\n\n${usage}`,
+        `No interactive terminal. Use --provider and --key-stdin (or LLM_API_KEY for the compat path) and --model, or --telegram-token-stdin and --telegram-users.\n\n${usage}`,
         2,
       );
     await interactive();
   } else {
     // Non-interactive path: flags, then the environment, then the stored setup.
+    // Telegram first so a token on stdin is consumed before anything else reads it.
+    await telegramFromFlags();
     const stored = readStoredSetup(dir);
     const subscriptionFlags =
       options.provider && isSubscriptionChoice(options.provider);
@@ -1180,11 +2499,11 @@ try {
         envKey ||
         (picked?.kind === "native" ? undefined : stored.apiKey);
       if (options.provider && !picked)
-        fail(`Provedor inválido: ${options.provider}\n\n${usage}`, 2);
+        fail(`Invalid provider: ${options.provider}\n\n${usage}`, 2);
       else if (picked?.kind === "native") {
         if (!apiKey && writes)
           fail(
-            "Falta a chave: use --key-stdin (ou LLM_API_KEY só nesta execução do setup).",
+            "API key is missing: use --key-stdin (or LLM_API_KEY for this setup run only).",
           );
         if (apiKey) {
           resolved.apiKey = apiKey;
@@ -1204,7 +2523,7 @@ try {
           await loadCatalog(baseUrl, apiKey);
         } else if (writes && !subscriptionFlags && options.provider)
           fail(
-            "Falta provedor ou chave: use --provider e --key-stdin, ou --provider chatgpt|openai-codex após login.",
+            "Provider or key is missing: use --provider and --key-stdin, or --provider chatgpt|openai-codex after login.",
           );
       }
     }
@@ -1230,9 +2549,11 @@ try {
           throw error;
       }
     }
-    if (!writes) printState(baseUrl);
-    else if (!catalog.length && subscriptionFlags)
-      fail("Catálogo vazio: confira o login da assinatura.");
+    if (!writes) {
+      if (options.aggregators !== undefined) await aggregatorsFromFlags();
+      printState(baseUrl);
+    } else if (!catalog.length && subscriptionFlags)
+      fail("Catalog is empty: check the subscription login.");
     else if (writes) {
       const entry = entryFor(
         options.model ?? current()?.modelId ?? catalog[0]?.id,
@@ -1244,7 +2565,7 @@ try {
         if (resolved.mode === "subscription" || resolved.kind === "native") {
           resolved.chatVision = inferChatVision(entry);
           console.log(
-            `Modelo do chat: ${resolved.chatVision ? "lê imagens (catálogo)" : "NÃO lê imagens (catálogo)"}`,
+            `Text model: ${resolved.chatVision ? "accepts images (catalog)" : "does NOT accept images (catalog)"}`,
           );
         } else {
           const probe = await probeImageSupport({
@@ -1254,19 +2575,20 @@ try {
           });
           resolved.chatVision = probe.verdict === "vision";
           console.log(
-            `Modelo do chat: ${probe.verdict === "vision" ? "lê imagens" : probe.verdict === "text" ? "NÃO lê imagens" : "não confirmado"}${probe.detail ? ` (${probe.detail})` : ""}`,
+            `Text model: ${probe.verdict === "vision" ? "accepts images" : probe.verdict === "text" ? "does NOT accept images" : "not confirmed"}${probe.detail ? ` (${probe.detail})` : ""}`,
           );
         }
       }
       commit(entry, effortFor(entry, options.effort), selection);
       if (functionFlags) {
         if (options.dryRun)
-          console.log(`(dry-run) gravaria ${functionLabel(selection)}.`);
-        else console.log(`Funções: ${functionLabel(selection)}`);
+          console.log(`(dry-run) would save ${functionLabel(selection)}.`);
+        else console.log(`Functions: ${functionLabel(selection)}`);
         warnEnvPrecedence(selection);
       }
+      if (options.aggregators !== undefined) await aggregatorsFromFlags();
     }
   }
 } finally {
-  db.close();
+  closeDb();
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * In-container diagnostic (Coolify terminal, docker exec). Never prints secret values.
+ * In-container diagnostic (docker exec). Never prints secret values.
  * Run from /app after build: node scripts/diagnose-tg-runtime.mjs
  */
 import { existsSync, readFileSync } from "node:fs";
@@ -12,10 +12,13 @@ import {
   LLM_PROVIDER_ID,
   operatorSecret,
   readConfig,
-  resolveMcpServersJson,
   startupErrorMessage,
   telegramAllowlistMisconfiguration,
 } from "../dist/src/config.js";
+import {
+  readStoredAggregators,
+  readStoredTelegram,
+} from "../dist/src/setup.js";
 import {
   describeVolumeProvider,
   formatWaiting,
@@ -24,14 +27,31 @@ import {
 import { readAppInfo } from "../dist/src/app-info.js";
 import { spawnSync } from "node:child_process";
 
-const mandatory = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USERS"];
 const optional = [
+  "TELEGRAM_BOT_TOKEN",
+  "TELEGRAM_ALLOWED_USERS",
   "LLM_BASE_URL",
   "LLM_API_KEY",
   "EXECUTOR_MCP_URL",
   "EXECUTOR_TOKEN",
+  "COMPOSIO_MCP_URL",
+  "COMPOSIO_API_KEY",
+  "COMPOSIO_USER_ID",
   "DATA_DIR",
 ];
+
+function volumeDir() {
+  return process.env.DATA_DIR?.trim() || "/app/data";
+}
+
+function loadConfig() {
+  const dir = volumeDir();
+  return readConfig(
+    process.env,
+    readStoredAggregators(dir),
+    readStoredTelegram(dir),
+  );
+}
 
 /** Global default lives in app.sqlite; read-only peek, never a second writer. */
 const globalDefault = () => {
@@ -82,24 +102,25 @@ if (!id.commit && envStatus("SOURCE_COMMIT") === "definido")
   );
 if (!id.commit)
   console.log(
-    "SOURCE_COMMIT ausente: o deploy ainda não injetou o SHA. Fora do Coolify, exporte SOURCE_COMMIT=$(git rev-parse HEAD).",
+    "SOURCE_COMMIT ausente: o deploy ainda não injetou o SHA. Exporte SOURCE_COMMIT=$(git rev-parse HEAD).",
   );
 
 section("Variáveis de ambiente (presença)");
-for (const name of mandatory)
-  console.log(`${name}=${envStatus(name)} (obrigatória)`);
+console.log(
+  "Nenhuma variável é obrigatória. Token e usuários vêm do volume (`npm run setup`); o ambiente só substitui.",
+);
 for (const name of optional)
   console.log(`${name}=${envStatus(name)} (opcional)`);
 console.log(
   `TELEGRAM_ALLOWED_CHATS=${envStatus("TELEGRAM_ALLOWED_CHATS")} (opcional; padrão = ALLOWED_USERS)`,
 );
 console.log(
-  `SOURCE_COMMIT=${envStatus("SOURCE_COMMIT")} (runtime; Coolify preenche no deploy)`,
+  `SOURCE_COMMIT=${envStatus("SOURCE_COMMIT")} (runtime; o painel de deploy pode preencher)`,
 );
 
 section("Configuração Telegram + MCP (validação local)");
 try {
-  const config = readConfig();
+  const config = loadConfig();
   console.log("readConfig: OK");
   console.log(
     `allowlist users=${config.users.length} chats=${config.chats.length}`,
@@ -200,19 +221,6 @@ if (process.argv.includes("--probe")) {
   }
 }
 
-section("MCP JSON resolvido (sem URL)");
-try {
-  const raw = resolveMcpServersJson();
-  const list = JSON.parse(raw);
-  console.log(
-    Array.isArray(list)
-      ? `entrada(s) MCP=${list.length}${list.length ? " (URLs omitidas)" : ""}`
-      : "formato MCP inesperado",
-  );
-} catch (error) {
-  console.log(`resolveMcpServersJson: FALHOU — ${startupErrorMessage(error)}`);
-}
-
 section("Heartbeat / DATA_DIR");
 console.log(`DATA_DIR=${dataDir}`);
 const healthPath = join(dataDir, "health.json");
@@ -236,7 +244,7 @@ if (!existsSync(healthPath)) {
 
 section("Telegram API (token ok, sem segredos)");
 try {
-  const { token } = readConfig();
+  const { token } = loadConfig();
   const call = async (method, body = {}) => {
     const response = await fetch(
       `https://api.telegram.org/bot${token}/${method}`,
@@ -252,7 +260,7 @@ try {
       throw new Error(`${method}: ${data.description ?? response.status}`);
     return data.result;
   };
-  const config = readConfig();
+  const config = loadConfig();
   const me = await call("getMe");
   console.log(
     `getMe: @${me.username ?? "?"} id=${me.id} (use /status@${me.username ?? "Bot"} em grupos)`,
@@ -385,5 +393,5 @@ console.log(`\
 - Grupos comuns (type group) são aceitos; canais não. Em grupos, use /status@SeuBot ou desative privacy mode.
 - EXECUTOR_MCP_URL e EXECUTOR_TOKEN vêm só do ambiente do deploy (nunca do git).
 - EXECUTOR_TOKEN é chave crua, sem prefixo Bearer.
-- Coolify: defina variáveis na UI; não commite .env.
+- Defina variáveis no .env ou na UI do deploy; não commite .env.
 - Banco: ${join(dataDir, "app.sqlite")} (não store.db). A imagem não inclui o binário sqlite3; use npm run diagnose.`);

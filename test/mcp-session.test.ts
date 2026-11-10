@@ -296,8 +296,6 @@ function gateway(url: string) {
       name: "mock",
       url,
       mode: "direct",
-      readTools: ["lookup"],
-      actionTools: ["execute"],
     },
   ]);
 }
@@ -372,10 +370,7 @@ test("cached catalog metadata still validates output without another list", asyn
     ).length;
     // The SDK only keeps the last page. lookup is the earlier page, so this
     // rejection is our preserved output schema, not a fresh catalog fetch.
-    await assert.rejects(
-      mcp.callDirect("mock", "lookup", {}),
-      /schema de saída/,
-    );
+    await assert.rejects(mcp.callDirect("mock", "lookup", {}), /output schema/);
     await assert.rejects(mcp.callDirect("mock", "execute", {}), (error) => {
       assert.ok(!(error instanceof McpNotSentError));
       return true;
@@ -500,7 +495,7 @@ test("session loss after dispatch on a trusted session is not replayed", async (
     mock.loseWrite();
     await assert.rejects(
       mcp.callDirect("mock", "execute", {}),
-      /não foi reenviada/,
+      /was not resent/,
     );
     assert.equal(
       rpcMethods(mock).filter((method) => method === "tools/list").length,
@@ -671,7 +666,7 @@ test("repeated session expiry during the probe is bounded and definitely unsent"
     agePastProbeWindow(t);
     await assert.rejects(mcp.callDirect("mock", "execute", {}), (error) => {
       assert.ok(error instanceof McpNotSentError);
-      assert.match(error.message, /expirou novamente antes do envio/);
+      assert.match(error.message, /expired again before the send/);
       return true;
     });
     assert.equal(mock.initializes, 2);
@@ -692,7 +687,7 @@ test("a removed endpoint after session admission fails before any tool is sent",
     agePastProbeWindow(t);
     await assert.rejects(mcp.callDirect("mock", "execute", {}), (error) => {
       assert.ok(error instanceof McpNotSentError);
-      assert.match(error.message, /Endpoint MCP.*404.*Nenhuma chamada/);
+      assert.match(error.message, /MCP endpoint.*404.*No tool call/);
       return true;
     });
     assert.equal(mock.writes, 0);
@@ -768,7 +763,7 @@ test("a dispatched SSE tool returning 404 is not replayed and the next operation
     mock.loseWrite();
     await assert.rejects(
       mcp.callDirect("mock", "execute", {}),
-      /não foi reenviada/,
+      /was not resent/,
     );
     assert.equal(mock.writes, 1);
     await mcp.discover("mock");
@@ -917,7 +912,7 @@ test("initial endpoint 404 is distinct from session expiry and does not loop ini
   mock.failEndpoint();
   const mcp = gateway(mock.url);
   try {
-    await assert.rejects(mcp.discover("mock"), /Endpoint MCP.*404/);
+    await assert.rejects(mcp.discover("mock"), /MCP endpoint.*404/);
     assert.equal(
       mock.requests.filter((r) => r.method === "initialize").length,
       1,
@@ -940,7 +935,7 @@ test("direct tools are not resent after 404 and the durable call remains uncerta
     mock.loseWrite();
     await assert.rejects(
       calls.execute("conversation", 1, "mock", "execute", {}),
-      /sessão MCP.*não.*reenviada/i,
+      /MCP session.*was not resent/i,
     );
     assert.equal(mock.writes, 1);
     assert.equal(calls.list("conversation")[0].state, "uncertain");
@@ -969,7 +964,7 @@ test("session recovery is bounded when the server expires every catalog request"
   const mcp = gateway(mock.url);
   try {
     mock.rejectLists();
-    await assert.rejects(mcp.discover("mock"), /sessão MCP expirou novamente/);
+    await assert.rejects(mcp.discover("mock"), /MCP session expired again/);
     assert.equal(mock.initializes, 2);
     assert.equal(
       mock.requests.filter((r) => r.method === "tools/list").length,
@@ -1012,7 +1007,7 @@ test("a direct call rejected with a session 404 is not automatically replayed", 
     mock.loseWrite();
     await assert.rejects(
       mcp.callDirect("mock", "execute", {}),
-      /sessão MCP.*não foi reenviada/,
+      /MCP session.*was not resent/,
     );
     assert.equal(mock.writes, 1);
     await mcp.discover("mock");
@@ -1031,7 +1026,7 @@ test("404 after initialize is a lost session, not a reason to fall back to legac
     mock.loseInitialization();
     await assert.rejects(
       mcp.discover("mock"),
-      /sessão MCP expirou durante a inicialização/,
+      /MCP session expired during startup/,
     );
     assert.equal(mock.initializes, 1);
     assert.equal(mock.gets, 0);
@@ -1090,7 +1085,7 @@ test("a reconnect failure before tools/call is failed, not uncertain, and an exp
     assert.equal(calls.list("conversation")[0].state, "failed");
     assert.match(
       calls.list("conversation")[0].result!,
-      /Nenhuma chamada de ferramenta foi enviada/,
+      /No tool call was sent/,
     );
     // Distinct task identity is an explicit retry, never an automatic replay.
     mock.restoreEndpoint();
@@ -1123,7 +1118,7 @@ test("an initial initialize 404 creates no uncertain call or reconciliation requ
     mock.failEndpoint();
     await assert.rejects(
       calls.execute("conversation", 1, "mock", "execute", {}),
-      /Endpoint MCP/,
+      /MCP endpoint/,
     );
     assert.equal(mock.writes, 0);
     assert.equal(calls.list("conversation").length, 0);
@@ -1240,7 +1235,7 @@ test("a cancelled queued call settles promptly without interrupting the active M
     assert.equal(mock.initializes, 1);
     // A following catalog is still queued behind the live operation.
     const catalog = mcp.discover("mock");
-    assert.throws(() => mcp.checkReplacement([...mcp.config]), /Aguarde/);
+    assert.throws(() => mcp.checkReplacement([...mcp.config]), /Wait for MCP/);
     mock.releaseWrite();
     assert.match(JSON.stringify(await running), /done/);
     await catalog;
@@ -1277,7 +1272,7 @@ test("output validators are compiled once per schema and still enforced on later
     for (let attempt = 0; attempt < 2; attempt++)
       await assert.rejects(
         mcp.callDirect("mock", "lookup", {}),
-        /schema de saída/,
+        /output schema/,
       );
     assert.equal(compiled, 1);
   } finally {
@@ -1287,7 +1282,7 @@ test("output validators are compiled once per schema and still enforced on later
   }
 });
 
-test("mcpCallIsReadOnly treats Executor call and execute sandbox reads as read-only", () => {
+test("mcpCallIsReadOnly accepts exact read contracts and literal call templates", () => {
   assert.equal(mcpCallIsReadOnly("search"), true);
   assert.equal(
     mcpCallIsReadOnly("call", {
@@ -1348,7 +1343,7 @@ test("an uncertain result blocks actions but never reads", async () => {
       calls.execute("conversation", 2, "mock", "execute", {}),
       /resultado MCP incerto/i,
     );
-    // Executor verification often uses execute + sandbox pick(); that stays a read.
+    // A name-based read stays open. It does not clear the uncertain write.
     const sandboxRead = await calls
       .execute("conversation", 31, "mock", "execute", {
         code: [
@@ -1361,12 +1356,12 @@ test("an uncertain result blocks actions but never reads", async () => {
         (error: Error) => error.message,
       );
     assert.doesNotMatch(text(sandboxRead), /resultado MCP incerto/i);
-    assert.equal(calls.clearUncertain("conversation"), 0);
+    assert.equal(calls.list("conversation")[0].state, "uncertain");
     store.run(
       `INSERT INTO mcp_calls(id,conversationId,server,tool,args,state,result,binding,updatedAt)
        VALUES ('lost3','conversation','mock','execute','{}','uncertain','{"isError":true}','mock',0)`,
     );
-    // A read never waits behind it: the message asks the agent to look.
+    // listRuns is a read. A successful read does not dismiss the uncertain write.
     const read = await calls
       .execute("conversation", 3, "mock", "listRuns", {})
       .then(
@@ -1374,14 +1369,18 @@ test("an uncertain result blocks actions but never reads", async () => {
         (error: Error) => error.message,
       );
     assert.doesNotMatch(text(read), /resultado MCP incerto/i);
-    // That read was the verification: the flag is already gone.
-    assert.equal(calls.clearUncertain("conversation"), 0);
-    // A second lost return is cleared by the operator, who keeps the history.
+    await calls.execute("conversation", 32, "mock", "search", {});
+    assert.equal(
+      calls.list("conversation").filter((call) => call.state === "uncertain")
+        .length,
+      2,
+    );
+    // Only an explicit operator dismissal clears these independent lost returns.
     store.run(
       `INSERT INTO mcp_calls(id,conversationId,server,tool,args,state,result,binding,updatedAt)
        VALUES ('lost2','conversation','mock','execute','{}','uncertain','{"isError":true}','mock',0)`,
     );
-    assert.equal(calls.clearUncertain("conversation"), 1);
+    assert.equal(calls.clearUncertain("conversation"), 3);
     assert.equal(
       store.get("SELECT 1 FROM mcp_calls WHERE state='uncertain'"),
       undefined,

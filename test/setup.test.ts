@@ -8,15 +8,44 @@ import {
   bootstrapModels,
   environmentModels,
   LLM_PROVIDER_ID,
+  readConfig,
   SetupRequiredError,
 } from "../src/config.js";
 import {
+  formatSetupMenu,
+  imageModelBelongsToProvider,
+  imageSectionPlan,
   migrateLegacyOfficialSetup,
+  modelAcceptsImages,
+  modelIdsFromListBody,
+  modelsForSection,
+  providerModels,
   readStoredSetup,
+  readStoredTelegram,
+  requestGatewayRestart,
+  routeAudioMenu,
+  routeGatewayMenu,
+  routeImageMenu,
+  routeMcpMenu,
+  routeSetupMenu,
+  routeTelegramMenu,
+  routeTextMenu,
+  secretPrompt,
+  sectionSummary,
+  selectGatewayProcess,
+  setupMenuStatus,
+  UNAVAILABLE_MODEL,
+  telegramUsersKey,
+  TELEGRAM_VOLUME_CREDENTIAL,
   writeStoredSetup,
+  writeStoredTelegram,
 } from "../src/setup.js";
 import { Store, SqlCredentials } from "../src/store.js";
-import { resolveSetupChoice, setupChoices } from "../src/native-providers.js";
+import {
+  officialProvider,
+  resolveSetupChoice,
+  setupChoices,
+} from "../src/native-providers.js";
 
 const catalog = "fake-1|131072|8192|low+high";
 
@@ -533,4 +562,295 @@ test("the backend keys are stored next to the chat key", async () => {
   } finally {
     db2.close();
   }
+});
+
+test("telegram token from the volume is used when the env is missing", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-setup-tg-"));
+  const db = new DatabaseSync(join(dir, "app.sqlite"));
+  try {
+    writeStoredTelegram(db, ["42", "42", "7"], "123:from-store");
+  } finally {
+    db.close();
+  }
+  const stored = readStoredTelegram(dir);
+  assert.equal(stored.token, "123:from-store");
+  assert.deepEqual(stored.users, ["42", "7"]);
+  const config = readConfig({}, undefined, stored);
+  assert.equal(config.token, "123:from-store");
+  assert.deepEqual(config.users, ["42", "7"]);
+  assert.deepEqual(config.chats, ["42", "7"]);
+  const peek = new DatabaseSync(join(dir, "app.sqlite"), { readOnly: true });
+  try {
+    const meta = peek
+      .prepare("SELECT value FROM meta WHERE key=?")
+      .get(telegramUsersKey()) as { value: string };
+    assert.equal(meta.value.includes("123:from-store"), false);
+    const secret = peek
+      .prepare("SELECT value FROM credentials WHERE provider=?")
+      .get(TELEGRAM_VOLUME_CREDENTIAL) as { value: string };
+    assert.equal(secret.value.includes("123:from-store"), true);
+    assert.equal(secret.value.includes("telegram:bot"), false);
+  } finally {
+    peek.close();
+  }
+  assert.throws(
+    () => readConfig({}),
+    (error: unknown) =>
+      error instanceof SetupRequiredError &&
+      /token do Telegram/.test(error.message),
+  );
+  assert.equal(
+    readConfig(
+      { TELEGRAM_BOT_TOKEN: "123456:replace_with_bot_token" },
+      undefined,
+      stored,
+    ).token,
+    "123:from-store",
+  );
+});
+
+test("env telegram token and users override the volume", async () => {
+  const stored = { token: "123:from-store", users: ["42"] };
+  const config = readConfig(
+    { TELEGRAM_BOT_TOKEN: "999:from-env", TELEGRAM_ALLOWED_USERS: "7, 8" },
+    undefined,
+    stored,
+  );
+  assert.equal(config.token, "999:from-env");
+  assert.deepEqual(config.users, ["7", "8"]);
+  assert.equal(
+    readConfig({ TELEGRAM_ALLOWED_USERS: "9" }, undefined, stored).token,
+    "123:from-store",
+  );
+  assert.deepEqual(
+    readConfig({ TELEGRAM_BOT_TOKEN: "999:from-env" }, undefined, stored).users,
+    ["42"],
+  );
+});
+
+test("empty telegram input keeps the saved token", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-setup-tg-keep-"));
+  const db = new DatabaseSync(join(dir, "app.sqlite"));
+  try {
+    writeStoredTelegram(db, ["42"], "123:saved-token");
+    // Enter in the wizard passes no token and the current user list.
+    const typed = "";
+    writeStoredTelegram(db, ["42"], typed || undefined);
+  } finally {
+    db.close();
+  }
+  assert.equal(readStoredTelegram(dir).token, "123:saved-token");
+  assert.deepEqual(readStoredTelegram(dir).users, ["42"]);
+  const db2 = new DatabaseSync(join(dir, "app.sqlite"));
+  try {
+    writeStoredTelegram(db2, undefined, "456:replaced");
+  } finally {
+    db2.close();
+  }
+  assert.equal(readStoredTelegram(dir).token, "456:replaced");
+  assert.deepEqual(readStoredTelegram(dir).users, ["42"]);
+});
+
+test("secret prompts do not reveal any part of a saved secret", () => {
+  const secret = "sk-live-secret-DVMT";
+  const prompt = secretPrompt("Executor token", true);
+  assert.equal(
+    prompt,
+    "Executor token [saved] (hidden, Enter keeps current): ",
+  );
+  assert.equal(prompt.includes(secret), false);
+  assert.equal(prompt.includes("DVMT"), false);
+  assert.equal(prompt.includes("ends"), false);
+  assert.equal(secretPrompt("API key", false), "API key (hidden): ");
+});
+
+test("the setup menu routes sections, save and back, and gateway restart", () => {
+  assert.equal(routeSetupMenu("s"), "restart");
+  assert.equal(routeSetupMenu("1"), "gateway");
+  assert.equal(routeGatewayMenu("1"), "telegram");
+  assert.equal(routeGatewayMenu("save and back"), "save");
+  assert.equal(routeSetupMenu("q"), "exit");
+  for (const route of [routeTelegramMenu, routeTextMenu, routeAudioMenu])
+    assert.equal(route("save and back"), "save");
+  assert.equal(routeMcpMenu("s"), "save");
+  assert.equal(routeImageMenu("s", true), "save");
+  assert.equal(routeImageMenu("1", true), "use-text");
+  assert.equal(routeImageMenu("1", false), "provider");
+  const menu = formatSetupMenu(
+    setupMenuStatus({
+      gateway: false,
+      text: true,
+      image: true,
+      audio: false,
+      mcp: false,
+    }),
+    { image: "gemini/gemini-3.5-flash-lite" },
+  );
+  assert.match(menu, /1 - Setup gateway\s+not set/);
+  assert.match(menu, /Save and restart gateway/);
+  assert.match(menu, /configured \(gemini\/gemini-3\.5-flash-lite\)/);
+  assert.doesNotMatch(menu, /ends \.\.\./);
+});
+
+test("the image summary shows the resolved vision model", () => {
+  const deepseek = officialProvider("deepseek");
+  assert.ok(deepseek);
+  const flash = deepseek
+    .getModels()
+    .find((model) => model.id === "deepseek-flash");
+  const pro = deepseek
+    .getModels()
+    .find((model) => model.id === "deepseek-v4-pro");
+  assert.equal(modelAcceptsImages(flash?.input), true);
+  assert.equal(modelAcceptsImages(pro?.input), false);
+  const separate = sectionSummary({
+    env: {},
+    setup: {
+      providerId: "deepseek",
+      baseUrl: "https://api.deepseek.com",
+      modelId: "deepseek-flash",
+      chatVision: true,
+      vision: {
+        modelId: "gemini-3.5-flash-lite",
+        baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+      },
+    },
+    keys: { vision: "g-key" },
+  });
+  assert.equal(separate.image, "gemini/gemini-3.5-flash-lite");
+  assert.equal(
+    sectionSummary({
+      env: {},
+      setup: {
+        providerId: "deepseek",
+        baseUrl: "https://api.deepseek.com",
+        modelId: "deepseek-flash",
+      },
+    }).image,
+    "text model",
+  );
+  assert.equal(
+    sectionSummary({
+      env: {},
+      setup: {
+        providerId: "deepseek",
+        baseUrl: "https://api.deepseek.com",
+        modelId: "deepseek-v4-pro",
+        chatVision: false,
+      },
+    }).imageOn,
+    false,
+  );
+  const imageModels = modelsForSection(
+    providerModels("deepseek") ?? [],
+    "image",
+  );
+  assert.equal(
+    imageModels.some((model) => model.id === "deepseek-v4-pro"),
+    false,
+  );
+  assert.equal(
+    imageSectionPlan({
+      chatSeesImages: false,
+      textModelId: "deepseek-v4-pro",
+      providerModels: imageModels.map((model) => ({
+        id: model.id,
+        acceptsImages: modelAcceptsImages(model.input),
+      })),
+      storedModelId: "gemini-3.5-flash-lite",
+    }).modelId,
+    "deepseek-flash",
+  );
+  assert.equal(
+    imageModelBelongsToProvider("deepseek", "gemini-3.5-flash-lite", {
+      textBaseUrl: "https://api.deepseek.com",
+    }),
+    false,
+  );
+});
+
+test("a stored model the provider no longer lists is flagged", () => {
+  const summary = sectionSummary({
+    env: {},
+    setup: {
+      providerId: "deepseek",
+      baseUrl: "https://api.deepseek.com",
+      modelId: "deepseek-flash",
+      audio: {
+        modelId: "gemini-1.5-flash",
+        api: "gemini",
+        baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+      },
+    },
+    keys: { audio: "g-key" },
+  });
+  assert.equal(summary.audio, UNAVAILABLE_MODEL);
+  assert.equal(
+    sectionSummary({
+      env: {},
+      setup: {
+        providerId: "deepseek",
+        baseUrl: "https://api.deepseek.com",
+        modelId: "deepseek-flash",
+        audio: {
+          modelId: "gemini-3.5-flash",
+          api: "gemini",
+          baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+          language: "pt",
+        },
+      },
+      keys: { audio: "g-key" },
+    }).audio,
+    "gemini/gemini-3.5-flash",
+  );
+  const google = providerModels("google") ?? [];
+  assert.ok(
+    modelsForSection(google, "audio").some(
+      (model) => model.id === "gemini-3.5-flash",
+    ),
+  );
+  assert.equal(
+    modelsForSection(google, "audio").some((model) =>
+      model.id.startsWith("gemma-"),
+    ),
+    false,
+  );
+  assert.deepEqual(
+    modelIdsFromListBody({ models: [{ name: "models/gemini-3.5-flash" }] }),
+    ["gemini-3.5-flash"],
+  );
+  assert.deepEqual(modelIdsFromListBody({ data: [{ id: "whisper-1" }] }), [
+    "whisper-1",
+  ]);
+  assert.equal(
+    modelsForSection([{ id: "whisper-large-v3-turbo" }], "audio").length,
+    1,
+  );
+});
+
+test("gateway restart signals the bot process and not setup", () => {
+  const rows = [
+    { pid: 1, command: "node scripts/setup-model.mjs" },
+    { pid: 4, command: "node dist/src/main.js" },
+    { pid: 9, command: "node --import tsx src/main.ts" },
+  ];
+  const calls: Array<[number, string]> = [];
+  assert.deepEqual(
+    requestGatewayRestart(rows, 9, (pid, signal) => {
+      calls.push([pid, signal]);
+    }),
+    { restarted: true, pid: 4 },
+  );
+  assert.deepEqual(calls, [[4, "SIGTERM"]]);
+  assert.equal(selectGatewayProcess(rows, 4)?.pid, 9);
+  assert.deepEqual(
+    requestGatewayRestart(
+      [{ pid: 2, command: "node scripts/setup-model.mjs" }],
+      3,
+      () => {
+        throw new Error("should not signal");
+      },
+    ),
+    { restarted: false },
+  );
 });

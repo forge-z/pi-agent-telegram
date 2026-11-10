@@ -10,26 +10,7 @@ import {
 } from "@earendil-works/pi-ai/providers/faux";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { Runtime } from "../src/runtime.js";
-
-function linkChat(
-  app: Runtime,
-  chat: string,
-  user: string,
-  conversationId: string,
-) {
-  app.store.run(
-    "INSERT INTO telegram VALUES (?,?,?) ON CONFLICT(chat) DO UPDATE SET conversationId=excluded.conversationId,user=excluded.user",
-    chat,
-    conversationId,
-    user,
-  );
-  app.store.run(
-    "INSERT OR IGNORE INTO telegram_grants VALUES (?,?,?)",
-    chat,
-    user,
-    conversationId,
-  );
-}
+import { linkChat } from "./link-chat.js";
 
 import { Telegram, type TelegramUpdate } from "../src/telegram.js";
 import type { TelegramReplyMarkup } from "../src/telegram-controls.js";
@@ -207,11 +188,11 @@ test("/model opens configured providers with counts, current marker and cancel, 
     const before = f.app.settings.defaults();
     const result = (await f.send("/model")) as { conversationId: string };
     assert.notEqual(result.conversationId, f.anchor);
-    assert.match(f.views.at(-1)!.text, /Configuração de modelo/);
+    assert.match(f.views.at(-1)!.text, /Model settings/);
     assert.match(f.views.at(-1)!.text, /faux-1/);
     f.token(/✓.*Primeiro.*\(1\)/);
     f.token(/Segundo.*\(19\)/);
-    f.token(/Cancelar/);
+    f.token(/Cancel/);
     assert.doesNotMatch(
       JSON.stringify(f.views),
       /Desconectado|synthetic-private-token/,
@@ -232,13 +213,13 @@ test("provider and model pages edit the original menu, support back and invalida
     await f.click(provider);
     assert.match(f.views.at(-1)!.text, /Segundo/);
     const stale = f.token(/Modelo 0 · model-0$/);
-    await f.click(f.token(/Próxima/));
+    await f.click(f.token(/Next/));
     assert.doesNotMatch(JSON.stringify(f.views.at(-1)), /Modelo 0"/);
     const before = f.views.length;
     await f.click(stale);
     assert.equal(f.views.length, before);
-    assert.match(f.answers.at(-1)!, /expir|mudou|desatualizado/i);
-    await f.click(f.token(/Voltar aos provedores/));
+    assert.match(f.answers.at(-1)!, /expir|changed|out of date/i);
+    await f.click(f.token(/Back to providers/));
     f.token(/✓.*Primeiro/);
     assert.ok(f.edits.length >= 3);
     assert.ok(f.edits.every((e) => e.chat === "100" && e.messageId === 500));
@@ -292,8 +273,8 @@ test("cross-provider choice clamps thinking, keeps topic, history, other convers
     await f.click(choice);
     const selected = { provider: "second", modelId: "model-0", effort: "off" };
     assert.deepEqual(await f.app.settings.conversation(id), selected);
-    assert.match(f.views.at(-1)!.text, /apenas esta conversa/i);
-    assert.match(f.views.at(-1)!.text, /persiste após reinício/);
+    assert.match(f.views.at(-1)!.text, /only this conversation/i);
+    assert.match(f.views.at(-1)!.text, /persists after a restart/);
     assert.deepEqual(
       f.app.store.all("SELECT * FROM telegram_topic_selection"),
       bindings,
@@ -330,7 +311,7 @@ test("cancel and changed conversation model make old controls inert", async () =
     const result = (await f.send("/model")) as { conversationId: string };
     const original = await f.app.settings.conversation(result.conversationId);
     const provider = f.token(/Segundo/);
-    await f.click(f.token(/Cancelar/));
+    await f.click(f.token(/Cancel/));
     assert.equal(f.views.at(-1)!.markup.inline_keyboard.length, 0);
     await f.click(provider);
     assert.deepEqual(
@@ -348,7 +329,7 @@ test("cancel and changed conversation model make old controls inert", async () =
       effort: "low",
     });
     await f.click(old);
-    assert.match(f.answers.at(-1)!, /mudou|desatualizado/i);
+    assert.match(f.answers.at(-1)!, /changed|out of date/i);
     assert.equal(
       (await f.app.settings.conversation(result.conversationId)).effort,
       "low",
@@ -417,11 +398,11 @@ test("catalog removal or disconnected provider never applies a stale model choic
       (await f.app.settings.conversation(result.conversationId)).provider,
       "faux",
     );
-    assert.match(f.answers.at(-1)!, /catálogo|disponível/i);
+    assert.match(f.answers.at(-1)!, /catalog|available/i);
     await f.send("/model");
     await f.click(f.token(/Segundo.*\(0\)/));
-    assert.match(f.views.at(-1)!.text, /Nenhum modelo disponível/);
-    f.token(/Voltar/);
+    assert.match(f.views.at(-1)!.text, /No model available/);
+    f.token(/Back/);
     f.models.setProvider(f.second.provider);
     await f.send("/model");
     await f.click(f.token(/Segundo/));
@@ -432,7 +413,7 @@ test("catalog removal or disconnected provider never applies a stale model choic
       (await f.app.settings.conversation(result.conversationId)).provider,
       "faux",
     );
-    assert.match(f.answers.at(-1)!, /configurado|disponível/i);
+    assert.match(f.answers.at(-1)!, /configured|available/i);
   } finally {
     await f.close();
   }
@@ -444,7 +425,7 @@ test("no configured providers offers only cancellation and a failed edit falls b
     f.models.setProvider({ ...f.first.provider, auth: {} });
     f.models.setProvider({ ...f.second.provider, auth: {} });
     await f.send("/model");
-    assert.match(f.views.at(-1)!.text, /Nenhum provedor configurado/);
+    assert.match(f.views.at(-1)!.text, /No configured provider/);
     assert.equal(f.views.at(-1)!.markup.inline_keyboard.flat().length, 1);
     f.models.setProvider(f.first.provider);
     f.models.setProvider(f.second.provider);
@@ -466,9 +447,9 @@ test("provider pages are bounded and duplicate model callbacks configure only on
       f.models.setProvider({ ...extra.provider, name: `Extra ${i}` });
     }
     await f.send("/model");
-    await f.click(f.token(/Próxima/));
+    await f.click(f.token(/Next/));
     f.token(/Extra 9/);
-    await f.click(f.token(/Anterior/));
+    await f.click(f.token(/Previous/));
     await f.click(f.token(/Segundo/));
     const choice = f.token(/Modelo 0 · model-0$/);
     const save = f.app.settings.saveConversation.bind(f.app.settings);
@@ -536,7 +517,7 @@ test("revocation and regrant while configure inspects the conversation invalidat
       (await f.app.settings.conversation(original.conversationId)).provider,
       "faux",
     );
-    assert.match(f.answers.at(-1)!, /autoriza|desatualizado/);
+    assert.match(f.answers.at(-1)!, /authoriz|out of date/);
   } finally {
     release();
     await f.close();

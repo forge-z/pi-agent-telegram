@@ -53,7 +53,7 @@ async function fixture() {
     },
     conversation: async (id: string) => {
       if (!store.get("SELECT id FROM conversations WHERE id=?", id))
-        throw new Error("Conversa não encontrada");
+        throw new Error("Conversa not found");
       return {};
     },
     submit: async (
@@ -129,13 +129,10 @@ test("creation receipts deduplicate concurrent calls and survive restart even af
     assert.equal((await reopened.create(input, "chat:create:1")).id, a.id);
     await assert.rejects(
       reopened.create({ ...input, prompt: "Different" }, "chat:create:1"),
-      /conteúdo diferente/,
+      /different content/,
     );
     reopened.remove(a.id);
-    await assert.rejects(
-      reopened.create(input, "chat:create:1"),
-      /não encontrada/,
-    );
+    await assert.rejects(reopened.create(input, "chat:create:1"), /not found/);
     assert.equal(
       reopened.list().length,
       0,
@@ -183,7 +180,7 @@ test("old task rows migrate to legacy delivery and new tasks default to web", as
     assert.equal(created.delivery, "web");
     assert.throws(
       () => migrated!.update(created.id, { delivery: "legacy" }),
-      /Destino/,
+      /destination/i,
     );
     assert.equal(
       migrated.update("legacy-task", { delivery: "legacy" }).delivery,
@@ -204,11 +201,11 @@ test("Telegram delivery creation and updates require the current authorized bind
     assert.equal(f.tasks.telegramAvailability(conversationId), false);
     await assert.rejects(
       f.tasks.create({ ...cron, conversationId, delivery: "web_telegram" }),
-      /conectado e autorizado/,
+      /connected and authorized/,
     );
     assert.throws(
       () => f.tasks.update(task.id, { delivery: "web_telegram" }),
-      /conectado e autorizado/,
+      /connected and authorized/,
     );
     const binding = {
       enabled: true,
@@ -248,7 +245,7 @@ test("Telegram delivery creation and updates require the current authorized bind
     assert.equal(f.tasks.telegramAvailability(conversationId), false);
     assert.throws(
       () => f.tasks.update(task.id, { delivery: "web_telegram" }),
-      /conectado e autorizado/,
+      /connected and authorized/,
     );
   } finally {
     await f.close();
@@ -318,7 +315,7 @@ test("cron skips downtime backlog and overlapping pending occurrences", async ()
     // second one: the manual trigger is refused instead of joining it.
     f.time = epoch + 12 * 60000;
     await f.tasks.tick();
-    await assert.rejects(f.tasks.runNow(task.id), /execução em andamento/);
+    await assert.rejects(f.tasks.runNow(task.id), /already in progress/);
     await f.tasks.tick();
     assert.equal(f.tasks.runs(task.id).length, 1);
     assert.equal(f.submits, 1);
@@ -351,7 +348,7 @@ test("pause/resume recomputes cron; manual execution of a paused task preserves 
     assert.equal(f.submits, 1);
     assert.throws(
       () => f.tasks.setEnabled(task.id, "yes" as unknown as boolean),
-      /booleano/,
+      /boolean/,
     );
   } finally {
     await f.close();
@@ -421,7 +418,7 @@ test("unknown inputs, schedule syntax, zones, limits and missing conversations a
     assert.equal(offset.nextRun, epoch + 1000);
     for (let i = 1; i < 100; i++)
       await f.tasks.create({ ...cron, enabled: false });
-    await assert.rejects(f.tasks.create(cron), /100 tarefas/);
+    await assert.rejects(f.tasks.create(cron), /100 tasks/);
     assert.equal(f.creates, 100);
     f.tasks.remove(offset.id);
     await f.tasks.create(cron);
@@ -456,7 +453,7 @@ test("admission failures and terminal input errors stay visible, pending work su
     await f.tasks.tick();
     assert.equal(f.tasks.runs(task.id)[0].state, "done");
     assert.equal(f.tasks.runs(task.id).length, 3);
-    await assert.rejects(f.tasks.runNow(task.id), /não encontrada/);
+    await assert.rejects(f.tasks.runNow(task.id), /not found/);
   } finally {
     await f.close();
   }
@@ -531,7 +528,7 @@ test("delivery none stops posting and the execution log stays queryable", async 
     assert.equal(updated.destinationChat, null);
     assert.throws(
       () => tasks.update(task.id, { delivery: "email" }),
-      /Destino/,
+      /destination/i,
     );
 
     await tasks.runNow(task.id);
@@ -564,7 +561,7 @@ test("delivery none stops posting and the execution log stays queryable", async 
     assert.equal(run.delivery, "none");
     assert.match(run.summary!, /Relat[óo]rio enviado/);
     assert.match(run.external!, /executor\/send_email/);
-    assert.match(run.external!, /executor\/gmail_send \(aprovação pulada\)/);
+    assert.match(run.external!, /executor\/gmail_send \(approval skipped\)/);
 
     assert.equal(tasks.runs(task.id, { since: epoch + 1 }).length, 0);
     assert.equal(tasks.runs(task.id, { until: epoch - 1 }).length, 0);
@@ -727,8 +724,7 @@ test("a turn that ends without an answer tells the chat why instead of staying s
     assert.ok(
       texts.some(
         (text) =>
-          text.includes("Não foi possível responder") &&
-          text.includes("model_error"),
+          text.includes("Could not reply") && text.includes("model_error"),
       ),
       JSON.stringify(texts),
     );
@@ -778,9 +774,9 @@ test("close drains admitted submissions and rejects new work", async () => {
     assert.equal((await run).state, "pending");
     await close;
     assert.equal(f.submits, 1);
-    await assert.rejects(f.tasks.tick(), /encerrando/);
-    await assert.rejects(f.tasks.create(cron), /encerrando/);
-    assert.throws(() => f.tasks.start(), /encerrando/);
+    await assert.rejects(f.tasks.tick(), /shutting down/);
+    await assert.rejects(f.tasks.create(cron), /shutting down/);
+    assert.throws(() => f.tasks.start(), /shutting down/);
   } finally {
     await f.close();
   }
@@ -801,7 +797,7 @@ test("TaskError identifies safe module errors without reclassifying external fai
       (error: unknown) =>
         error instanceof Error &&
         !(error instanceof TaskError) &&
-        error.message === "Conversa não encontrada",
+        error.message === "Conversa not found",
     );
   } finally {
     await f.close();
@@ -818,7 +814,7 @@ test("a manual client key deduplicates its own occurrence and refuses a second t
     // A different key while the schedule runs is a second trigger: refused, never joined.
     await assert.rejects(
       f.tasks.runNow(task.id, "other-key"),
-      /execução em andamento/,
+      /already in progress/,
     );
     f.finish();
     await f.tasks.tick();
@@ -1160,7 +1156,7 @@ test("trusted Telegram origin defaults to a frozen mirror route and rejects a di
         undefined,
         origin,
       ),
-      /destino é fixo/i,
+      /destination is fixed/i,
     );
     assert.equal(f.tasks.get(task.id)?.delivery, "web_telegram");
     await assert.rejects(
@@ -1169,7 +1165,7 @@ test("trusted Telegram origin defaults to a frozen mirror route and rejects a di
         undefined,
         origin,
       ),
-      /origem|Origem/,
+      /origin/i,
     );
   } finally {
     await f.close();
@@ -1221,7 +1217,7 @@ test("unproven old occurrences stay blocked after a link and explicit future des
     reopened.update(task.id, { delivery: "web_telegram" });
     const old = reopened.runs(task.id)[0];
     assert.equal(old.destinationChat, null);
-    assert.match(old.destinationReason ?? "", /legado|origem|destino/i);
+    assert.match(old.destinationReason ?? "", /legacy|origin|destination/i);
   } finally {
     await reopened?.close();
     await f.close();
@@ -1249,17 +1245,17 @@ test("revoked frozen task destinations cannot revive after grant restoration", a
       "42",
       conversationId,
     );
-    assert.match(f.tasks.get(task.id)?.destinationReason ?? "", /revogad/i);
+    assert.match(f.tasks.get(task.id)?.destinationReason ?? "", /revoked/i);
     assert.match(
       f.tasks.runs(task.id).find((r) => r.id === run.id)?.destinationReason ??
         "",
-      /revogad/i,
+      /revoked/i,
     );
     assert.equal(
       f.tasks.update(task.id, { delivery: "web_telegram" }).destinationReason,
       null,
     );
-    assert.match(f.tasks.runs(task.id)[0].destinationReason ?? "", /revogad/i);
+    assert.match(f.tasks.runs(task.id)[0].destinationReason ?? "", /revoked/i);
   } finally {
     await f.close();
   }
@@ -1335,7 +1331,7 @@ test("an old admitted run never gets a Telegram copy from a newly selected futur
     assert.match(
       f.store.get<{ reason: string }>("SELECT reason FROM task_notifications")
         ?.reason ?? "",
-      /destino|legado/i,
+      /destination|legacy/i,
     );
   } finally {
     await f.close();
@@ -1358,10 +1354,10 @@ test("blocked Telegram reasons remain visible after calendar admission and compl
     );
     f.time = epoch + 60000;
     await f.tasks.tick();
-    assert.match(f.tasks.get(task.id)?.lastError ?? "", /revogad/i);
+    assert.match(f.tasks.get(task.id)?.lastError ?? "", /revoked/i);
     f.finish();
     await f.tasks.tick();
-    assert.match(f.tasks.get(task.id)?.lastError ?? "", /revogad/i);
+    assert.match(f.tasks.get(task.id)?.lastError ?? "", /revoked/i);
   } finally {
     await f.close();
   }
@@ -1404,7 +1400,7 @@ test("topic closure and dedicated route replacement permanently block a saved de
       }
       assert.match(
         f.tasks.get(task.id)?.destinationReason ?? "",
-        /revogad/i,
+        /revoked/i,
         mutation,
       );
     } finally {
@@ -1438,7 +1434,7 @@ test("trusted Telegram task creation rejects a missing or revoked captured origi
         );
       await assert.rejects(
         f.tasks.create({ ...cron, conversationId }, "captured-create", origin),
-        /origem|Origem|revogad|capturad/i,
+        /origin|revoked|captured/i,
         mutation,
       );
       assert.equal(f.tasks.list().length, 0);
@@ -1449,7 +1445,7 @@ test("trusted Telegram task creation rejects a missing or revoked captured origi
           undefined,
           origin,
         ),
-        /destino é fixo/i,
+        /destination is fixed/i,
       );
       assert.equal(f.tasks.list().length, 0);
     } finally {
@@ -1577,7 +1573,7 @@ test("one-time destination migration flags old implicit web intent and preserves
     reopened = new Tasks(f.runtime as unknown as Runtime, () => epoch);
     assert.match(
       reopened.get(implicit.id)?.destinationReason ?? "",
-      /destino|origem|legado/i,
+      /destination|origin|legacy/i,
     );
     assert.equal(reopened.get(implicit.id)?.enabled, false);
     assert.equal(reopened.get(implicit.id)?.nextRun, null);
@@ -1674,14 +1670,14 @@ test("a trusted Telegram origin freezes the captured topic and a model web deliv
         undefined,
         origin,
       ),
-      /destino é fixo/i,
+      /destination is fixed/i,
     );
     await assert.rejects(
       f.tasks.create({ ...cron, conversationId }, undefined, {
         ...origin,
         source: "web",
       }),
-      /destino é fixo/i,
+      /destination is fixed/i,
     );
     assert.equal(f.tasks.list().length, 1);
   } finally {
@@ -1755,7 +1751,7 @@ test("prompt edits cannot rewrite an occurrence that is already pending", async 
     );
     assert.throws(
       () => f.tasks.edit(task.id, { prompt: "Changed after claim" }),
-      /ocorrência pendente/,
+      /occurrence is pending/,
     );
     assert.equal(f.tasks.get(task.id)!.prompt, task.prompt);
     assert.equal(
@@ -1801,7 +1797,7 @@ test("a manual run of a running schedule is refused", async () => {
   try {
     const task = await f.tasks.create(cron);
     await f.tasks.runNow(task.id);
-    await assert.rejects(f.tasks.runNow(task.id), /execução em andamento/);
+    await assert.rejects(f.tasks.runNow(task.id), /already in progress/);
     // The refusal leaves exactly one occurrence and one submitted turn.
     assert.equal(f.tasks.runs(task.id).length, 1);
     assert.equal(f.submits, 1);
@@ -1837,7 +1833,7 @@ test("a stale in-flight run times out once and alerts the destination", async ()
     const run = f.tasks.runs(task.id)[0];
     assert.equal(run.state, "failed");
     assert.equal(run.status, "erro");
-    assert.match(run.summary!, /expirou/i);
+    assert.match(run.summary!, /expired/i);
     assert.equal(
       f.store.all("SELECT * FROM task_notifications").length,
       1,

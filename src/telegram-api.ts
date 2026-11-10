@@ -10,6 +10,7 @@ type Method =
   | "setMyCommands"
   | "answerCallbackQuery"
   | "editMessageText"
+  | "deleteMessage"
   | "getFile";
 interface TelegramFile {
   data: Uint8Array;

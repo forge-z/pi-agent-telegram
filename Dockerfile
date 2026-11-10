@@ -19,6 +19,7 @@ RUN --mount=type=secret,id=npm_ca \
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --chown=node:node scripts/diagnose-tg-runtime.mjs scripts/diagnose-tg-deploy.sh scripts/setup-model.mjs scripts/login.mjs ./scripts/
 COPY --chown=node:node LICENSE THIRD_PARTY_NOTICES.md ./
+COPY --chown=node:node config.default.yaml ./config.default.yaml
 COPY --chown=node:node vendor ./vendor
 RUN mkdir -p /app/data && chown node:node /app/data && chmod 700 /app/data
 USER node

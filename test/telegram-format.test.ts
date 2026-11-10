@@ -176,21 +176,3 @@ function hasUnpairedSurrogate(value: string) {
   }
   return false;
 }
-
-test("web mirror labels fit every HTML chunk and preserve all body characters and formatting", () => {
-  const source = "**Bold** & <literal> 😀 ".repeat(500);
-  const plain = assertValidChunks(formatTelegramMessage(source)).visible;
-  for (const role of ["web_user", "web_assistant"] as const) {
-    const chunks = formatTelegramMessage(source, role);
-    assert.ok(chunks.length > 1);
-    const withoutLabels = chunks.map((chunk) => {
-      assert.match(
-        chunk,
-        /^<b>(?:👤 Você · via web|🤖 Agente · resposta à web) · \d+\/\d+<\/b>\n\n/,
-      );
-      return chunk.replace(/^<b>[^<]+<\/b>\n\n/, "");
-    });
-    assertValidChunks(chunks, 4096);
-    assert.equal(assertValidChunks(withoutLabels).visible, plain);
-  }
-});

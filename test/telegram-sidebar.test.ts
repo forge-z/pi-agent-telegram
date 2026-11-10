@@ -4,26 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { Runtime } from "../src/runtime.js";
-
-function linkChat(
-  app: Runtime,
-  chat: string,
-  user: string,
-  conversationId: string,
-) {
-  app.store.run(
-    "INSERT INTO telegram VALUES (?,?,?) ON CONFLICT(chat) DO UPDATE SET conversationId=excluded.conversationId,user=excluded.user",
-    chat,
-    conversationId,
-    user,
-  );
-  app.store.run(
-    "INSERT OR IGNORE INTO telegram_grants VALUES (?,?,?)",
-    chat,
-    user,
-    conversationId,
-  );
-}
+import { linkChat } from "./link-chat.js";
 
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-sidebar-"));

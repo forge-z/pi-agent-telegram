@@ -107,8 +107,6 @@ function gateway(url: string) {
       name: "mock",
       url,
       mode: "direct",
-      readTools: [],
-      actionTools: ["execute", "fast"],
     },
   ]);
 }
@@ -202,7 +200,7 @@ test("timeout de chamada de 60 s respeitado (via MCP_CALL_TIMEOUT_MS pequeno)", 
     mock.holdWrite();
     await assert.rejects(
       mcp.callDirect("mock", "execute", {}),
-      /Tempo de resposta MCP excedido|timeout|abort/i,
+      /MCP response timed out|timeout|abort/i,
     );
   } finally {
     mock.releaseWrite();

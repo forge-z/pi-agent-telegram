@@ -2,7 +2,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { resolveFunctions } from "../src/functions.js";
 import { transcribeAudio } from "../src/transcribe.js";
-import { describeImage, probeImageSupport } from "../src/vision.js";
+import {
+  describeImage,
+  probeImageSupport,
+  providerErrorHint,
+} from "../src/vision.js";
 
 const chat = {
   LLM_BASE_URL: "https://api.chat.com/v1",
@@ -256,7 +260,7 @@ test("probeImageSupport separates a missing modality from an outage", async () =
   const no = stub([200, 500, 500]);
   assert.deepEqual(await probeImageSupport(config, { fetch: no.doFetch }), {
     verdict: "text",
-    detail: "resposta 500",
+    detail: "response 500",
   });
   assert.equal(no.calls.filter((call) => call.withImage).length, 2);
 
@@ -279,6 +283,36 @@ test("probeImageSupport separates a missing modality from an outage", async () =
     JSON.stringify(yes.calls[0].body),
     /max_tokens|max_completion/,
   );
+});
+
+test("a provider error is shown on a word boundary", async () => {
+  const message =
+    "The supported API model names are deepseek-chat and deepseek-reasoner";
+  const padded = `${message} ${"deepseek-reasoner ".repeat(20)}`;
+  assert.ok(padded.length > 180);
+  const hint = providerErrorHint(
+    JSON.stringify({ error: { message: padded } }),
+  );
+  assert.match(hint, /deepseek-chat/);
+  assert.doesNotMatch(hint, /deeps(?!eek)/);
+  assert.equal(hint.endsWith("…"), true);
+  const short = JSON.stringify({
+    error: { message },
+  });
+  const shown = await probeImageSupport(
+    {
+      modelId: "gemini-3.5-flash-lite",
+      baseUrl: "https://api.deepseek.com",
+      apiKey: "k",
+    },
+    {
+      fetch: (async () =>
+        new Response(short, { status: 400 })) as unknown as typeof fetch,
+    },
+  );
+  assert.equal(shown.verdict, "unknown");
+  assert.match(shown.detail ?? "", /deepseek-chat/);
+  assert.doesNotMatch(shown.detail ?? "", /deeps(?!eek)/);
 });
 
 test("the setup record carries the backend endpoints, not only the models", () => {

@@ -1,0 +1,1 @@
+../../../skills/search/SKILL.md

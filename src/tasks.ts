@@ -93,12 +93,12 @@ type TaskRuntime = Pick<
 
 function text(value: unknown, field: string, limit: number) {
   if (typeof value !== "string" || !value.trim() || value.length > limit)
-    throw new TaskError(`${field} inválido (máximo ${limit} caracteres)`);
+    throw new TaskError(`${field} is invalid (maximum ${limit} characters)`);
   return value;
 }
 function nextCron(schedule: string, timezone: string, now: number) {
   if (schedule.split(/\s+/).length !== 5 || /\bH\b/i.test(schedule))
-    throw new TaskError("Cron deve ter exatamente 5 campos, sem H/hash");
+    throw new TaskError("Cron must have exactly 5 fields, with no H/hash");
   try {
     return CronExpressionParser.parse(schedule, {
       tz: timezone,
@@ -107,7 +107,7 @@ function nextCron(schedule: string, timezone: string, now: number) {
       .next()
       .getTime();
   } catch {
-    throw new TaskError("Expressão cron inválida");
+    throw new TaskError("Invalid cron expression");
   }
 }
 function onceDate(schedule: string, now: number) {
@@ -118,7 +118,7 @@ function onceDate(schedule: string, now: number) {
   const timestamp = Date.parse(schedule);
   if (!match || !Number.isFinite(timestamp) || timestamp <= now)
     throw new TaskError(
-      "Data única deve ser ISO com Z/offset e estar no futuro",
+      "A one-time date must be ISO with Z/offset and in the future",
     );
   const [, year, month, day, hour, minute, second, offset] = match;
   const days = new Date(Date.UTC(Number(year), Number(month), 0)).getUTCDate();
@@ -133,7 +133,7 @@ function onceDate(schedule: string, now: number) {
     (offset !== "Z" &&
       (Number(offset.slice(1, 3)) > 23 || Number(offset.slice(4)) > 59))
   )
-    throw new TaskError("Data única inválida");
+    throw new TaskError("Invalid one-time date");
   return timestamp;
 }
 function publicTask(row: TaskRow): Task {
@@ -176,10 +176,10 @@ export class Tasks {
       CREATE TABLE IF NOT EXISTS task_delivery_changes(changeKey TEXT PRIMARY KEY,taskId TEXT NOT NULL,delivery TEXT NOT NULL,result TEXT NOT NULL);
       CREATE TRIGGER IF NOT EXISTS archived_task_insert BEFORE INSERT ON tasks
       WHEN EXISTS (SELECT 1 FROM conversation_lifecycle WHERE conversationId=NEW.conversationId AND deletedAt IS NOT NULL)
-      BEGIN SELECT RAISE(ABORT,'Conversa excluída'); END;
+      BEGIN SELECT RAISE(ABORT,'Conversation deleted'); END;
       CREATE TRIGGER IF NOT EXISTS archived_task_enable BEFORE UPDATE OF enabled ON tasks
       WHEN NEW.enabled=1 AND EXISTS (SELECT 1 FROM conversation_lifecycle WHERE conversationId=NEW.conversationId AND deletedAt IS NOT NULL)
-      BEGIN SELECT RAISE(ABORT,'Conversa excluída'); END;
+      BEGIN SELECT RAISE(ABORT,'Conversation deleted'); END;
     `);
     if (
       !runtime.store
@@ -240,15 +240,15 @@ export class Tasks {
     runtime.store.db.exec(`
       UPDATE task_runs SET conversationId=(SELECT conversationId FROM tasks WHERE id=task_runs.taskId)
         WHERE conversationId IS NULL;
-      UPDATE task_runs SET delivery='legacy',destinationReason='Destino legado não comprovado. Selecione o destino para execuções futuras.'
+      UPDATE task_runs SET delivery='legacy',destinationReason='Legacy destination was not proven. Select the destination for future runs.'
         WHERE delivery IS NULL;
-      UPDATE tasks SET destinationReason='Destino legado não comprovado. Selecione o destino para execuções futuras.'
+      UPDATE tasks SET destinationReason='Legacy destination was not proven. Select the destination for future runs.'
         WHERE delivery IN ('legacy','web_telegram') AND destinationChat IS NULL AND destinationReason IS NULL;
     `);
     if (!hadOrigins)
       runtime.store.db.exec(`
-      UPDATE tasks SET enabled=0,nextRun=NULL,destinationReason='Destino legado não comprovado. Selecione explicitamente o destino para execuções futuras.',
-        lastError='Destino legado não comprovado. Selecione explicitamente o destino para execuções futuras.'
+      UPDATE tasks SET enabled=0,nextRun=NULL,destinationReason='Legacy destination was not proven. Explicitly select the destination for future runs.',
+        lastError='Legacy destination was not proven. Explicitly select the destination for future runs.'
       WHERE delivery='web' AND originSource IS NULL AND destinationReason IS NULL AND NOT EXISTS (
         SELECT 1 FROM task_creations c WHERE c.taskId=tasks.id
         AND CASE WHEN json_valid(c.input) THEN json_extract(c.input,'$.delivery')='web' ELSE 0 END
@@ -261,8 +261,8 @@ export class Tasks {
       ["tasks", "task_runs"]
         .map(
           (table) => `
-      UPDATE ${table} SET destinationReason='Vínculo Telegram revogado. Selecione o destino para execuções futuras.'
-      ${table === "tasks" ? ",lastError='Vínculo Telegram revogado. Selecione o destino para execuções futuras.'" : ""}
+      UPDATE ${table} SET destinationReason='Telegram link revoked. Select the destination for future runs.'
+      ${table === "tasks" ? ",lastError='Telegram link revoked. Select the destination for future runs.'" : ""}
       WHERE destinationChat IS NOT NULL AND destinationReason IS NULL AND (${condition});`,
         )
         .join("\n");
@@ -318,12 +318,12 @@ export class Tasks {
   }
   private require(id: string) {
     const task = this.get(id);
-    if (!task) throw new TaskError("Tarefa não encontrada");
+    if (!task) throw new TaskError("Task not found");
     return task;
   }
   private serialize<T>(operation: () => Promise<T>): Promise<T> {
     if (this.closing)
-      return Promise.reject(new TaskError("Agendador encerrando"));
+      return Promise.reject(new TaskError("Scheduler is shutting down"));
     const result = this.tail.then(operation);
     this.tail = result.catch(() => {});
     return result;
@@ -335,11 +335,11 @@ export class Tasks {
   ): Promise<Task> {
     return this.serialize(async () => {
       if (!input || typeof input !== "object" || Array.isArray(input))
-        throw new TaskError("Tarefa inválida");
+        throw new TaskError("Invalid task");
       const data = input as Record<string, unknown>;
-      const title = text(data.title, "Título", 120).trim();
+      const title = text(data.title, "Title", 120).trim();
       const prompt = text(data.prompt, "Prompt", MAX_TEXT);
-      const schedule = text(data.schedule, "Agenda", 200).trim();
+      const schedule = text(data.schedule, "Schedule", 200).trim();
       if (
         origin &&
         ((origin.source !== "web" && origin.source !== "telegram") ||
@@ -347,7 +347,7 @@ export class Tasks {
           !origin.conversationId ||
           data.conversationId !== origin.conversationId)
       )
-        throw new TaskError("Origem da tarefa não corresponde à conversa");
+        throw new TaskError("The task origin does not match the conversation");
       const requestedDelivery =
         data.delivery === undefined
           ? undefined
@@ -360,15 +360,16 @@ export class Tasks {
       );
       try {
         // Intl also accepts fixed offsets; require an IANA name (UTC is valid).
-        if (/^[+-]/.test(timezone)) throw new TaskError("Fuso IANA inválido");
+        if (/^[+-]/.test(timezone))
+          throw new TaskError("Invalid IANA timezone");
         new Intl.DateTimeFormat("en", { timeZone: timezone }).format(0);
       } catch {
-        throw new TaskError("Fuso IANA inválido");
+        throw new TaskError("Invalid IANA timezone");
       }
       if (data.kind !== "once" && data.kind !== "cron")
-        throw new TaskError("Tipo de tarefa inválido");
+        throw new TaskError("Invalid task type");
       if (data.enabled !== undefined && typeof data.enabled !== "boolean")
-        throw new TaskError("enabled deve ser booleano");
+        throw new TaskError("enabled must be a boolean");
       // The receipt and schedule commit together, before a replay-safe tool returns.
       // Resolve a receipt before checking the current time or quota: a once schedule
       // may already be in the past when its interrupted tool is resumed.
@@ -389,7 +390,7 @@ export class Tasks {
       const signature = JSON.stringify(signatureInput);
       if (creationKey !== undefined) {
         if (!REQUEST_ID.test(creationKey))
-          throw new TaskError("Chave de criação inválida");
+          throw new TaskError("Invalid creation key");
         const receipt = this.runtime.store.get<{
           taskId: string;
           input: string;
@@ -407,7 +408,7 @@ export class Tasks {
           // destination. It never repairs provenance or reroutes old work.
           if (receipt.input !== signature && receipt.input !== priorSignature)
             throw new TaskError(
-              "Chave de criação já utilizada com conteúdo diferente",
+              "Creation key already used with different content",
             );
           return this.require(receipt.taskId);
         }
@@ -417,15 +418,15 @@ export class Tasks {
           ? onceDate(schedule, this.clock())
           : nextCron(schedule, timezone, this.clock());
       if (this.list().length >= 100)
-        throw new TaskError("Limite de 100 tarefas atingido");
+        throw new TaskError("Limit of 100 tasks reached");
       let conversationId: string;
       if (data.conversationId !== undefined) {
-        conversationId = text(data.conversationId, "Conversa", 100);
+        conversationId = text(data.conversationId, "Conversation", 100);
         await this.runtime.conversation(conversationId);
       } else {
         if (delivery === "web_telegram")
           throw new TaskError(
-            "Telegram não está conectado e autorizado para esta conversa. Escolha uma conversa vinculada ao bot.",
+            "Telegram is not connected and authorized for this conversation. Choose a conversation linked to the bot.",
           );
         conversationId = await this.runtime.create(title);
       }
@@ -433,7 +434,7 @@ export class Tasks {
       const id = randomUUID();
       if (this.runtime.store.conversationDeleted(conversationId))
         throw new TaskError(
-          "Conversa excluída. Recupere-a antes de criar uma tarefa.",
+          "Conversation deleted. Restore it before creating a task.",
         );
       this.runtime.store.db.exec("BEGIN IMMEDIATE");
       try {
@@ -481,9 +482,9 @@ export class Tasks {
   }
   /** Edit schedule content only; channel, origin and captured destination are immutable here. */
   edit(id: string, input: unknown): Task {
-    if (this.closing) throw new TaskError("Agendador encerrando");
+    if (this.closing) throw new TaskError("Scheduler is shutting down");
     if (!input || typeof input !== "object" || Array.isArray(input))
-      throw new TaskError("Atualização de tarefa inválida");
+      throw new TaskError("Invalid task update");
     const data = input as Record<string, unknown>;
     if (
       !Object.keys(data).length ||
@@ -491,13 +492,13 @@ export class Tasks {
         (key) => !["title", "prompt", "schedule", "timezone"].includes(key),
       )
     )
-      throw new TaskError("Campo de atualização inválido");
+      throw new TaskError("Invalid update field");
     const task = this.require(id);
     if (this.runtime.store.conversationDeleted(task.conversationId))
       throw new TaskError(
-        "Conversa excluída. Recupere-a antes de alterar a tarefa.",
+        "Conversation deleted. Restore it before changing the task.",
       );
-    const title = text(data.title ?? task.title, "Título", 120).trim();
+    const title = text(data.title ?? task.title, "Title", 120).trim();
     const prompt = text(data.prompt ?? task.prompt, "Prompt", MAX_TEXT);
     if (
       prompt !== task.prompt &&
@@ -507,15 +508,23 @@ export class Tasks {
       )
     )
       throw new TaskError(
-        "Há uma ocorrência pendente. Aguarde sua conclusão antes de editar a instrução.",
+        "An occurrence is pending. Wait for it to finish before editing the instruction.",
       );
-    const schedule = text(data.schedule ?? task.schedule, "Agenda", 200).trim();
-    const timezone = text(data.timezone ?? task.timezone, "Fuso", 100).trim();
+    const schedule = text(
+      data.schedule ?? task.schedule,
+      "Schedule",
+      200,
+    ).trim();
+    const timezone = text(
+      data.timezone ?? task.timezone,
+      "Timezone",
+      100,
+    ).trim();
     try {
       if (/^[+-]/.test(timezone)) throw new Error();
       new Intl.DateTimeFormat("en", { timeZone: timezone }).format(0);
     } catch {
-      throw new TaskError("Fuso IANA inválido");
+      throw new TaskError("Invalid IANA timezone");
     }
     const reschedule = schedule !== task.schedule || timezone !== task.timezone;
     let nextRun = task.nextRun;
@@ -527,7 +536,7 @@ export class Tasks {
           id,
         )
       )
-        throw new TaskError("Tarefa única já executada");
+        throw new TaskError("One-time task already ran");
       const next =
         task.kind === "once"
           ? onceDate(schedule, this.clock())
@@ -546,22 +555,22 @@ export class Tasks {
     return this.require(id);
   }
   update(id: string, input: unknown): Task {
-    if (this.closing) throw new TaskError("Agendador encerrando");
+    if (this.closing) throw new TaskError("Scheduler is shutting down");
     if (!input || typeof input !== "object" || Array.isArray(input))
-      throw new TaskError("Atualização de tarefa inválida");
+      throw new TaskError("Invalid task update");
     const data = input as Record<string, unknown>;
     if (data.enabled === undefined && data.delivery === undefined)
-      throw new TaskError("Informe uma alteração da tarefa");
+      throw new TaskError("Provide a change to the task");
     if (Object.keys(data).some((key) => !["enabled", "delivery"].includes(key)))
-      throw new TaskError("Campo de atualização inválido");
+      throw new TaskError("Invalid update field");
     const task = this.require(id);
     if (this.runtime.store.conversationDeleted(task.conversationId))
       throw new TaskError(
-        "Conversa excluída. Recupere-a antes de alterar a tarefa.",
+        "Conversation deleted. Restore it before changing the task.",
       );
     const enabled = data.enabled ?? task.enabled;
     if (typeof enabled !== "boolean")
-      throw new TaskError("enabled deve ser booleano");
+      throw new TaskError("enabled must be a boolean");
     const delivery =
       data.delivery === undefined
         ? task.delivery
@@ -572,7 +581,7 @@ export class Tasks {
       !taskTelegramAvailable(this.runtime.store, task.conversationId)
     )
       throw new TaskError(
-        "Telegram não está conectado e autorizado para esta conversa. Conecte o bot e vincule a conversa escolhida.",
+        "Telegram is not connected and authorized for this conversation. Connect the bot and link the chosen conversation.",
       );
     const destination =
       data.delivery === undefined
@@ -588,7 +597,7 @@ export class Tasks {
             "SELECT id FROM task_runs WHERE taskId=? AND scheduled=1",
             id,
           );
-          if (consumed) throw new TaskError("Tarefa única já executada");
+          if (consumed) throw new TaskError("One-time task already ran");
           nextRun = Date.parse(task.schedule);
         } else nextRun = nextCron(task.schedule, task.timezone, this.clock());
       }
@@ -616,21 +625,25 @@ export class Tasks {
     // A captured human request always freezes the originating Telegram topic.
     // Delivery "web" is only a stored value for rows that already exist.
     if (requested === "web" || origin?.source === "web")
-      throw new TaskError("O destino é fixo no chat/tópico de origem.");
+      throw new TaskError(
+        "The destination is fixed to the original chat/topic.",
+      );
     if (origin) {
       if (origin.source !== "telegram")
-        throw new TaskError(
-          "Agendamentos exigem uma solicitação humana neste tópico.",
-        );
+        throw new TaskError("Schedules require a human request in this topic.");
       if (requested && requested !== "web_telegram")
-        throw new TaskError("O destino é fixo no chat/tópico de origem.");
+        throw new TaskError(
+          "The destination is fixed to the original chat/topic.",
+        );
       return "web_telegram";
     }
     // Scheduler calls with no human request keep a local row. They do not
     // invent a Telegram destination. Production tools always pass an origin.
     if (requested === "web_telegram" || requested === "none") return requested;
     if (requested)
-      throw new TaskError("O destino é fixo no chat/tópico de origem.");
+      throw new TaskError(
+        "The destination is fixed to the original chat/topic.",
+      );
     return "web";
   }
   private destination(
@@ -662,7 +675,7 @@ export class Tasks {
           !telegramRouteAuthorized(this.runtime.store, captured)
         )
           throw new TaskError(
-            "Rota Telegram da origem ausente ou revogada. A tarefa não foi criada; selecione explicitamente um destino para uma nova solicitação.",
+            "The origin Telegram route is missing or revoked. The task was not created; explicitly select a destination for a new request.",
           );
         route = captured;
       } else
@@ -670,7 +683,7 @@ export class Tasks {
     }
     if (delivery === "web_telegram" && !route)
       throw new TaskError(
-        "Telegram não está conectado e autorizado para esta conversa. Selecione um destino autorizado.",
+        "Telegram is not connected and authorized for this conversation. Select an authorized destination.",
       );
     return {
       destinationChat: route?.chat ?? null,
@@ -679,7 +692,7 @@ export class Tasks {
       destinationMessageThreadId: route?.messageThreadId ?? null,
       destinationReason:
         delivery === "legacy"
-          ? "Destino legado não comprovado. Selecione o destino para execuções futuras."
+          ? "Legacy destination was not proven. Select the destination for future runs."
           : null,
     };
   }
@@ -692,11 +705,11 @@ export class Tasks {
     )
       return value;
     throw new TaskError(
-      "Destino inválido: use origin (tópico de origem) ou none (sem entrega)",
+      "Invalid destination: use origin (original topic) or none (no delivery)",
     );
   }
   remove(id: string) {
-    if (this.closing) throw new TaskError("Agendador encerrando");
+    if (this.closing) throw new TaskError("Scheduler is shutting down");
     this.require(id);
     // Preserve admitted occurrences and their conversations, even across a restart.
     this.runtime.store.run(
@@ -792,7 +805,7 @@ export class Tasks {
          AND r.startedAt<?`,
       now - timeout,
     )) {
-      const summary = `Execução expirou após ${Math.round(timeout / 60_000)} minutos sem conclusão.`;
+      const summary = `Run expired after ${Math.round(timeout / 60_000)} minutes without finishing.`;
       store.run(
         "UPDATE task_runs SET state='failed',finishedAt=?,status='erro',summary=?,error=COALESCE(error,?) WHERE id=?",
         now,
@@ -813,7 +826,7 @@ export class Tasks {
           store,
           run.conversationId,
           run.requestId,
-          `A tarefa agendada não terminou a tempo (${summary}). Consulte /crons ou o painel web.`,
+          `The scheduled task did not finish in time (${summary}). See /crons or the web panel.`,
         );
       }
     }
@@ -833,7 +846,7 @@ export class Tasks {
         requestId !== undefined &&
         (typeof requestId !== "string" || !REQUEST_ID.test(requestId))
       )
-        throw new TaskError("requestId de execução inválido");
+        throw new TaskError("Invalid run requestId");
       // Bound the final Pi input key to 160 characters even for long client keys.
       const manualRequestId =
         requestId === undefined
@@ -883,7 +896,7 @@ export class Tasks {
         id,
       );
       if (task && store.conversationDeleted(task.conversationId))
-        throw new TaskError("Conversa excluída");
+        throw new TaskError("Conversation deleted");
       const pending = store.get<TaskRun>(
         "SELECT * FROM task_runs WHERE taskId=? AND state='pending'",
         id,
@@ -910,9 +923,7 @@ export class Tasks {
         // A manual trigger never joins someone else's execution: if this schedule is
         // already running, refuse. The catch below rolls back, so no ROLLBACK here.
         if (!scheduled)
-          throw new TaskError(
-            "Já existe uma execução em andamento deste agendamento.",
-          );
+          throw new TaskError("A run of this schedule is already in progress.");
         store.db.exec("COMMIT");
         return pending;
       }
@@ -1009,12 +1020,12 @@ export class Tasks {
         this.admitted.delete(run.id);
         continue;
       }
-      const error = `Solicitação terminou com status: ${request.status}`;
+      const error = `Request ended with status: ${request.status}`;
       store.run(
         "UPDATE task_runs SET state='failed',error=COALESCE(error,?),finishedAt=?,status=COALESCE(status,'erro'),summary=COALESCE(summary,?) WHERE id=?",
         error,
         Date.now(),
-        `A tarefa não foi concluída: ${error}`,
+        `The task did not finish: ${error}`,
         run.id,
       );
       store.run(
@@ -1079,7 +1090,7 @@ export class Tasks {
               store,
               run.conversationId,
               run.requestId,
-              "A tarefa não pôde iniciar. Confira sua conexão e o estado da tarefa em /crons no Telegram ou no painel web do canal de origem.",
+              "The task could not start. Check your connection and the task state in /crons on Telegram or the origin channel's web panel.",
             );
             store.run(
               "UPDATE task_runs SET state='failed',error=? WHERE id=?",
@@ -1092,7 +1103,7 @@ export class Tasks {
     }
   }
   start() {
-    if (this.closing) throw new TaskError("Agendador encerrando");
+    if (this.closing) throw new TaskError("Scheduler is shutting down");
     if (this.timer) return;
     const tick = () => {
       void this.tick().catch((error: unknown) => {

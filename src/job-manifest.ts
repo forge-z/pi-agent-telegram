@@ -1,4 +1,6 @@
 import { asRecord } from "./executor-result.js";
+import { envWithDiscovery } from "./discover.js";
+import { loadHarnessConfig } from "./harness-config.js";
 
 /**
  * Declarative job manifests: everything provider-specific about an async job, in config.
@@ -17,6 +19,11 @@ type ObserveMode = "poll" | "webhook" | "reconcile";
 export interface JobManifest {
   /** Tool path that starts the job, e.g. `tools.tinyfish.agent.automation.runAsync`. */
   tool: string;
+  /**
+   * MCP server for status reads. `executor` or omitted runs the observe tool
+   * inside Executor `execute`. Any other name is called directly.
+   */
+  server?: string;
   dispatch: { mode: DispatchMode; idPath?: string };
   observe: {
     mode: ObserveMode;
@@ -142,34 +149,32 @@ export function jobState(manifest: JobManifest, value: unknown): JobState {
 }
 
 /** Substitutes `${id}`, `${goal}` and `${row}` in a template value. */
-function applyTemplate(
+export function renderTemplate(
   value: unknown,
   vars: Record<string, string | number | undefined>,
 ): unknown {
-  if (typeof value === "string")
-    return value.replace(/\$\{(\w+)\}/g, (whole, name: string) =>
-      vars[name] === undefined || vars[name] === ""
-        ? whole
-        : String(vars[name]),
+  if (typeof value === "string") {
+    const whole = /^\$\{(\w+)\}$/.exec(value);
+    if (whole && (vars[whole[1]] === undefined || vars[whole[1]] === ""))
+      return undefined;
+    return value.replace(/\$\{(\w+)\}/g, (part, name: string) =>
+      vars[name] === undefined || vars[name] === "" ? part : String(vars[name]),
     );
+  }
   if (Array.isArray(value))
-    return value.map((item) => applyTemplate(item, vars));
+    return value.map((item) => renderTemplate(item, vars));
   if (value && typeof value === "object")
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>).map(([key, item]) => [
         key,
-        applyTemplate(item, vars),
+        renderTemplate(item, vars),
       ]),
     );
   return value;
 }
 
 export type ReadInput =
-  | {
-      ok: true;
-      input: { accountId: string; input: Record<string, unknown> };
-    }
-  | { ok: false; error: string };
+  { ok: true; input: Record<string, unknown> } | { ok: false; error: string };
 
 /**
  * Every v2 tool takes `{ accountId, input }`. Manifests may already say that,
@@ -180,7 +185,7 @@ export function buildReadInput(
   args: unknown,
   vars: Record<string, string | number | undefined>,
 ): ReadInput {
-  const rendered = applyTemplate(args ?? {}, vars);
+  const rendered = renderTemplate(args ?? {}, vars);
   const body = asRecord(rendered);
   if (!body)
     return {
@@ -214,109 +219,97 @@ export function buildReadInput(
   return { ok: true, input: { accountId, input } };
 }
 
-export const INSTABOX_CODE_TASK_TOOL = "internal.instabox.codeTask";
-
-export const BUILTIN: JobManifest[] = [
-  {
-    tool: "tools.tinyfish.agent.automation.runAsync",
-    dispatch: { mode: "immediate", idPath: "run_id" },
-    observe: {
-      mode: "poll",
-      tool: "tools.tinyfish.agent.runs.getRunById",
-      args: {
-        accountId: "${accountId}",
-        input: { path: { id: "${job_id}" } },
-      },
-      statePath: "status",
-      resultPath: "result",
-      errorPath: "error",
-    },
-    reconcile: {
-      tool: "tools.tinyfish.agent.runs.listRuns",
-      args: {
-        accountId: "${accountId}",
-        input: {
-          query: {
-            goal: "${goal}",
-            limit: 20,
-            sort_direction: "desc",
-          },
-        },
-      },
-      match: "goalSuffix",
-      windowMinutes: 15,
-    },
-    poll: { intervalSeconds: 25, backoff: [25, 60, 150], maxAttempts: 3 },
-    graceMinutes: 5,
-  },
-];
-
 function object(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-/** Parses `ASYNC_JOB_MANIFESTS` (a JSON array) and adds the in-code app manifests. */
+function normalizeManifest(entry: Record<string, unknown>): JobManifest {
+  const manifest = entry as unknown as JobManifest;
+  const server =
+    typeof manifest.server === "string" ? manifest.server.trim() : "";
+  const rest = { ...manifest };
+  delete rest.server;
+  return {
+    ...rest,
+    ...(server ? { server } : {}),
+    dispatch: {
+      mode: MODES.includes(manifest.dispatch?.mode as DispatchMode)
+        ? (manifest.dispatch.mode as DispatchMode)
+        : "immediate",
+      ...(manifest.dispatch?.idPath
+        ? { idPath: manifest.dispatch.idPath }
+        : {}),
+    },
+    observe: {
+      ...manifest.observe,
+      mode: manifest.observe?.mode ?? "poll",
+    },
+  };
+}
+
+const ENV_VAR = /\$\{([A-Z][A-Z0-9_]*)\}/g;
+const ENV_LEFT = /\$\{[A-Z][A-Z0-9_]*\}/;
+
+function fillEnv(
+  value: unknown,
+  env: Record<string, string | undefined>,
+): unknown {
+  if (typeof value === "string")
+    return value.replace(ENV_VAR, (whole, name: string) => {
+      const filled = env[name]?.trim();
+      if (filled) return filled;
+      // An unset account env falls back to the dispatch's account, as before.
+      return name.endsWith("_ACCOUNT_ID") ? "${accountId}" : whole;
+    });
+  if (Array.isArray(value)) return value.map((item) => fillEnv(item, env));
+  if (value && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+        key,
+        fillEnv(item, env),
+      ]),
+    );
+  return value;
+}
+
+/** Fills `${ENV_VAR}` from the environment; a backend missing one stays disabled. */
+function withEnv(
+  manifests: JobManifest[],
+  env: Record<string, string | undefined>,
+): JobManifest[] {
+  const merged = envWithDiscovery(env);
+  return manifests.flatMap((manifest) => {
+    const filled = fillEnv(manifest, merged) as JobManifest;
+    return ENV_LEFT.test(JSON.stringify(filled)) ? [] : [filled];
+  });
+}
+
+/**
+ * Jobs from config.yaml, then `ASYNC_JOB_MANIFESTS` on top. The same `tool`
+ * in the env replaces the yaml entry. Invalid JSON still throws, and the
+ * poller turns that into "manifesto inválido; desligado".
+ */
 export function loadManifests(
   env: Record<string, string | undefined> = process.env,
 ): JobManifest[] {
-  const manifests: JobManifest[] = [];
+  const manifests = loadHarnessConfig(env)
+    .asyncJobs.filter(
+      (entry): entry is Record<string, unknown> =>
+        object(entry) && typeof entry.tool === "string",
+    )
+    .map((entry) => normalizeManifest(entry));
   const raw = (env.ASYNC_JOB_MANIFESTS ?? "").trim();
   if (raw) {
     const parsed = JSON.parse(raw) as unknown;
-    for (const entry of Array.isArray(parsed) ? parsed : [parsed])
-      if (object(entry) && typeof entry.tool === "string") {
-        const manifest = entry as unknown as JobManifest;
-        manifests.push({
-          ...manifest,
-          dispatch: {
-            mode: MODES.includes(manifest.dispatch?.mode as DispatchMode)
-              ? (manifest.dispatch.mode as DispatchMode)
-              : "immediate",
-            ...(manifest.dispatch?.idPath
-              ? { idPath: manifest.dispatch.idPath }
-              : {}),
-          },
-          observe: {
-            ...manifest.observe,
-            mode: manifest.observe?.mode ?? "poll",
-          },
-        });
-      }
+    for (const entry of Array.isArray(parsed) ? parsed : [parsed]) {
+      if (!object(entry) || typeof entry.tool !== "string") continue;
+      const manifest = normalizeManifest(entry);
+      const index = manifests.findIndex((item) => item.tool === manifest.tool);
+      if (index >= 0) manifests[index] = manifest;
+      else manifests.push(manifest);
+    }
   }
-  for (const manifest of BUILTIN) {
-    if (manifests.some((entry) => entry.tool === manifest.tool)) continue;
-    manifests.push(manifest);
-  }
-
-  const instaboxMachineId = (env.INSTABOX_MACHINE_ID ?? "").trim();
-  if (
-    instaboxMachineId &&
-    !manifests.some((entry) => entry.tool === INSTABOX_CODE_TASK_TOOL)
-  ) {
-    const instaboxAccountId = (env.INSTABOX_ACCOUNT_ID ?? "").trim();
-    manifests.push({
-      tool: INSTABOX_CODE_TASK_TOOL,
-      dispatch: { mode: "immediate" },
-      observe: {
-        mode: "poll",
-        tool: "tools.instabox.machines.readFiles",
-        args: {
-          accountId: instaboxAccountId || "${accountId}",
-          input: {
-            id: instaboxMachineId,
-            path: "/data/home/jobs/${id}/status.json",
-          },
-        },
-        statePath: "state",
-        resultPath: "result",
-        errorPath: "error",
-      },
-      poll: { intervalSeconds: 20, backoff: [20, 30, 60], maxAttempts: 3 },
-      graceMinutes: 3,
-    });
-  }
-
-  return manifests;
+  return withEnv(manifests, env);
 }
 
 /** Whether a state means the watch can stop. */

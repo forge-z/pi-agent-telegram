@@ -108,8 +108,6 @@ async function fixture(instructions?: string) {
     name: "mock",
     url: `http://127.0.0.1:${address.port}/mcp`,
     mode: "direct",
-    readTools: [],
-    actionTools: [],
   };
   return {
     counts,
@@ -548,7 +546,8 @@ test("closing settles a claimed resume queued behind active work as failed witho
     const id = await app.create();
     const first = app.mcpCalls.execute(id, 800, "mock", "write", {});
     await until(() => f.counts.writes === 1);
-    // Reproduce a recovered paused claim arriving while the conversation lease is held.
+    // A recovered pause can follow earlier effects; only its resume is still unsent.
+    // Reproduce its claim arriving while the conversation lease is held.
     const active = app.mcpCalls.list(id)[0];
     const pausedId = "9".repeat(24);
     const interactionId = randomUUID();

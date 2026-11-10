@@ -71,15 +71,15 @@ interface Menu {
   };
 }
 const fields: Record<Field, string> = {
-  title: "Título",
-  prompt: "Instrução",
-  schedule: "Agenda",
-  timezone: "Fuso",
+  title: "Title",
+  prompt: "Instruction",
+  schedule: "Schedule",
+  timezone: "Timezone",
 };
 const key = (id: string) => `telegram:cron-menu:${id}`;
 const invalid = () =>
   new TaskError(
-    "Menu expirado, desatualizado ou autorização mudou. Use /crons novamente.",
+    "Menu expired, out of date, or authorization changed. Use /crons again.",
   );
 function save(app: Runtime, id: string, menu: Menu) {
   app.store.run(
@@ -251,7 +251,7 @@ function render(
     });
   let text: string;
   if (action.action === "close")
-    return { text: "Menu encerrado. Use /crons para abrir novamente.", markup };
+    return { text: "Menu closed. Use /crons to open it again.", markup };
   if (!task) {
     const tasks = app.tasks.list().filter((row) => {
       try {
@@ -263,8 +263,8 @@ function render(
     });
     const pages = Math.max(1, Math.ceil(tasks.length / 8));
     const page = Math.min(Math.max(0, action.page ?? 0), pages - 1);
-    text = `Agendamentos Telegram · ${page + 1}/${pages}\nOs destinos permanecem nos tópicos de origem. Nenhuma execução é iniciada pelo menu.`;
-    if (!tasks.length) text += "\nNenhum agendamento Telegram autorizado.";
+    text = `Telegram schedules · ${page + 1}/${pages}\nDestinations stay in their original topics. The menu does not start a run.`;
+    if (!tasks.length) text += "\nNo authorized Telegram schedule.";
     for (const row of tasks.slice(page * 8, (page + 1) * 8)) {
       capture(row);
       markup.inline_keyboard.push([
@@ -276,45 +276,45 @@ function render(
       ]);
     }
     const nav = [];
-    if (page) nav.push(add("← Anterior", { action: "list", page: page - 1 }));
+    if (page) nav.push(add("← Previous", { action: "list", page: page - 1 }));
     if (page + 1 < pages)
-      nav.push(add("Próxima →", { action: "list", page: page + 1 }));
+      nav.push(add("Next →", { action: "list", page: page + 1 }));
     if (nav.length) markup.inline_keyboard.push(nav);
-    markup.inline_keyboard.push([add("Criar agendamento", { action: "new" })]);
-    markup.inline_keyboard.push([add("Fechar", { action: "close" })]);
+    markup.inline_keyboard.push([add("Create schedule", { action: "new" })]);
+    markup.inline_keyboard.push([add("Close", { action: "close" })]);
   } else {
     capture(task);
-    text = `${task.title}\n${task.enabled ? "Ativo" : "Pausado"} · ${task.kind}\nAgenda: ${task.schedule}\nFuso: ${task.timezone}\nPróxima: ${task.nextRun === null ? "—" : new Date(task.nextRun).toISOString()}\nEntrega salva: ${task.delivery}${task.destinationReason ? ` · bloqueada: ${task.destinationReason}` : ""}${task.lastError ? `\nÚltimo erro: ${task.lastError.slice(0, 300)}` : ""}\nDestino fixo: ${task.destinationMessageThreadId == null ? "sem tópico" : `tópico ${task.destinationMessageThreadId}`} · conversa ${task.conversationId}\n\n${task.prompt.slice(0, 1800)}${task.prompt.length > 1800 ? "… (instrução abreviada)" : ""}`;
+    text = `${task.title}\n${task.enabled ? "Active" : "Paused"} · ${task.kind}\nSchedule: ${task.schedule}\nTimezone: ${task.timezone}\nNext: ${task.nextRun === null ? "—" : new Date(task.nextRun).toISOString()}\nSaved delivery: ${task.delivery}${task.destinationReason ? ` · blocked: ${task.destinationReason}` : ""}${task.lastError ? `\nLast error: ${task.lastError.slice(0, 300)}` : ""}\nFixed destination: ${task.destinationMessageThreadId == null ? "no topic" : `topic ${task.destinationMessageThreadId}`} · conversation ${task.conversationId}\n\n${task.prompt.slice(0, 1800)}${task.prompt.length > 1800 ? "… (instruction shortened)" : ""}`;
     if (action.action === "delete") {
       text +=
-        "\n\nConfirmar exclusão deste agendamento? O histórico e ocorrências já admitidas serão preservados.";
+        "\n\nDelete this schedule? History and occurrences already admitted will be kept.";
       markup.inline_keyboard.push([
-        add("Confirmar exclusão", { action: "remove" }),
-        add("Cancelar", { action: "detail" }),
+        add("Confirm delete", { action: "remove" }),
+        add("Cancel", { action: "detail" }),
       ]);
     } else if (action.action === "edit") {
       for (const field of Object.keys(fields) as Field[])
         markup.inline_keyboard.push([
           add(fields[field], { action: "field", field }),
         ]);
-      markup.inline_keyboard.push([add("Cancelar", { action: "detail" })]);
+      markup.inline_keyboard.push([add("Cancel", { action: "detail" })]);
     } else if (action.action === "save" && menu.edit) {
-      text = `Confirmar alteração de ${fields[menu.edit.action.field!]}?\n\n${menu.edit.value!}\n\nO destino deste agendamento será preservado.`;
+      text = `Confirm change to ${fields[menu.edit.action.field!]}?\n\n${menu.edit.value!}\n\nThis schedule's destination will be kept.`;
       markup.inline_keyboard.push([
-        add("Confirmar alteração", { action: "save" }),
-        add("Cancelar", { action: "detail" }),
+        add("Confirm change", { action: "save" }),
+        add("Cancel", { action: "detail" }),
       ]);
     } else {
       markup.inline_keyboard.push([
-        add(task.enabled ? "Pausar" : "Retomar", { action: "toggle" }),
+        add(task.enabled ? "Pause" : "Resume", { action: "toggle" }),
       ]);
-      markup.inline_keyboard.push([add("Rodar agora", { action: "run" })]);
+      markup.inline_keyboard.push([add("Run now", { action: "run" })]);
       markup.inline_keyboard.push([
-        add("Editar…", { action: "edit" }),
-        add("Excluir…", { action: "delete" }),
+        add("Edit…", { action: "edit" }),
+        add("Delete…", { action: "delete" }),
       ]);
       markup.inline_keyboard.push([
-        add("← Agendamentos", {
+        add("← Schedules", {
           action: "list",
           taskId: undefined,
           taskHash: undefined,
@@ -380,7 +380,7 @@ export async function handleCronMenu(
         app,
         `telegram:cron-new:${action.id}:${menu.version}`,
         menu,
-        "Criar agendamento neste tópico. Responda diretamente a esta mensagem com 4 linhas:\nTítulo\nAgenda (cron de 5 campos OU data ISO com offset)\nFuso IANA (ex.: America/Sao_Paulo)\nInstrução completa (pode continuar em mais linhas)\n\nVocê revisará e confirmará antes de salvar. Use /crons para cancelar.",
+        "Create a schedule in this topic. Reply directly to this message with 4 lines:\nTitle\nSchedule (5-field cron OR an ISO date with offset)\nIANA timezone (e.g. America/Sao_Paulo)\nFull instruction (may continue on more lines)\n\nYou will review and confirm before it is saved. Use /crons to cancel.",
         undefined,
         true,
       );
@@ -415,7 +415,7 @@ export async function handleCronMenu(
           "INSERT OR IGNORE INTO requests(conversationId,requestId,text,source,chat,status) VALUES (?,?,?,'telegram',?,'done')",
           menu.conversationId,
           requestId,
-          "Criar agendamento confirmado neste tópico.",
+          "Confirmed schedule creation in this topic.",
           menu.owner.chat,
         );
         app.store.run(
@@ -441,7 +441,7 @@ export async function handleCronMenu(
         app,
         `telegram:cron-created:${action.id}`,
         menu,
-        `Agendamento salvo: ${task.title}. Destino fixo: este chat/tópico. Use /crons para gerenciar.`,
+        `Schedule saved: ${task.title}. Fixed destination: this chat/topic. Use /crons to manage it.`,
       );
     }
     return;
@@ -468,12 +468,10 @@ export async function handleCronMenu(
       throw invalid();
     try {
       await app.tasks.runNow(task.id);
-      notice = `Execução manual de ${task.title} iniciada. O resultado segue a entrega configurada e o próximo horário não muda.`;
+      notice = `Manual run of ${task.title} started. The result follows the saved delivery and the next time does not change.`;
     } catch (error) {
       notice =
-        error instanceof Error
-          ? error.message
-          : "Não foi possível iniciar a execução.";
+        error instanceof Error ? error.message : "Could not start the run.";
     }
     menu.version++;
     save(app, action.id, menu);
@@ -499,10 +497,10 @@ export async function handleCronMenu(
         const guidance =
           action.field === "schedule"
             ? task.kind === "cron"
-              ? "Use cron de 5 campos, por exemplo: 0 9 * * *."
-              : "Use data ISO futura com Z/offset."
+              ? "Use a 5-field cron, for example: 0 9 * * *."
+              : "Use a future ISO date with Z/offset."
             : action.field === "timezone"
-              ? "Use um fuso IANA, por exemplo: America/Sao_Paulo ou UTC."
+              ? "Use an IANA timezone, for example: America/Sao_Paulo or UTC."
               : "";
         menu.targets = [
           {
@@ -518,7 +516,7 @@ export async function handleCronMenu(
           app,
           `telegram:cron-edit:${action.id}:${menu.version}`,
           menu,
-          `Editar ${fields[action.field]} de ${task.title}.\nResponda diretamente a esta mensagem com o novo valor. ${guidance}\nA alteração ainda exigirá confirmação. Use /crons para sair.`,
+          `Edit ${fields[action.field]} of ${task.title}.\nReply directly to this message with the new value. ${guidance}\nThe change still needs confirmation. Use /crons to leave.`,
           undefined,
           true,
         );
@@ -631,7 +629,7 @@ export function acceptCronReply(
         message.text.length > 12000
       )
         throw new TaskError(
-          "Informe título, agenda, fuso e instrução (até 12000 caracteres). Use /crons para recomeçar.",
+          "Provide a title, schedule, timezone, and instruction (up to 12000 characters). Use /crons to start over.",
         );
       menu.draft.value = {
         title: title.trim(),
@@ -647,12 +645,12 @@ export function acceptCronReply(
         app,
         menu.draft.previewPrefix,
         menu,
-        `Confirmar agendamento neste tópico?\nTítulo: ${title}\nAgenda: ${schedule}\nFuso: ${timezone}\n\n${prompt}\n\nO destino de origem será preservado.`,
+        `Confirm this schedule in this topic?\nTitle: ${title}\nSchedule: ${schedule}\nTimezone: ${timezone}\n\n${prompt}\n\nThe original destination will be kept.`,
         {
           inline_keyboard: [
             [
               {
-                text: "Confirmar criação",
+                text: "Confirm create",
                 callback_data: button(app, {
                   kind: "cron",
                   owner,
@@ -664,7 +662,7 @@ export function acceptCronReply(
             ],
             [
               {
-                text: "Cancelar",
+                text: "Cancel",
                 callback_data: button(app, {
                   kind: "cron",
                   owner,
@@ -710,7 +708,7 @@ export function acceptCronReply(
       { conversationId: receipt.conversationId, owner },
       error instanceof TaskError
         ? error.message
-        : "Edição não autorizada. Use /crons novamente.",
+        : "Edit not authorized. Use /crons again.",
     );
   }
   return true;

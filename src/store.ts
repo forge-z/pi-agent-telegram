@@ -2,10 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
 import type { OutboundMedia } from "./outbound.js";
 import { mkdirSync } from "node:fs";
-import {
-  formatTelegramMessage,
-  type TelegramMessageRole,
-} from "./telegram-format.js";
+import { formatTelegramMessage } from "./telegram-format.js";
 import type {
   Credential,
   CredentialStore,
@@ -350,7 +347,6 @@ export class Store {
     legacyLimit = 3500,
     conversationId?: string,
     messageThreadId?: number | null,
-    role?: TelegramMessageRole,
     media?: OutboundMedia[],
     replyTo?: number | null,
   ) {
@@ -376,12 +372,7 @@ export class Store {
         chunks.push(text.slice(offset, end));
         offset = end;
       }
-    } else
-      chunks.push(
-        ...(onlyMedia
-          ? [""]
-          : formatTelegramMessage(text, prior.length ? undefined : role)),
-      );
+    } else chunks.push(...(onlyMedia ? [""] : formatTelegramMessage(text)));
     // Commands already commit their receipt and acknowledgement together.
     // A savepoint keeps this batch atomic both inside and outside that transaction.
     this.db.exec("SAVEPOINT telegram_delivery_batch");

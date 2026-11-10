@@ -90,16 +90,14 @@ test("responde aviso de pedido em andamento quando turno está ocupado (sem spam
     assert.ok(
       deliveries.some((d) =>
         d.text.includes(
-          "Recebi, vou considerar no que estou fazendo. /stop cancela.",
+          "Got it. I will take that into account. /stop cancels.",
         ),
       ),
       "aviso enviado ao usuário",
     );
 
     const countBefore = deliveries.filter((d) =>
-      d.text.includes(
-        "Recebi, vou considerar no que estou fazendo. /stop cancela.",
-      ),
+      d.text.includes("Got it. I will take that into account. /stop cancels."),
     ).length;
     assert.equal(countBefore, 1);
 
@@ -120,9 +118,7 @@ test("responde aviso de pedido em andamento quando turno está ocupado (sem spam
       "-100123",
     );
     const countAfter = deliveriesAfter.filter((d) =>
-      d.text.includes(
-        "Recebi, vou considerar no que estou fazendo. /stop cancela.",
-      ),
+      d.text.includes("Got it. I will take that into account. /stop cancels."),
     ).length;
     assert.equal(countAfter, 1, "não repete aviso para a mesma ferramenta");
 
@@ -143,9 +139,7 @@ test("responde aviso de pedido em andamento quando turno está ocupado (sem spam
       "-100123",
     );
     const countCmd = deliveriesCmd.filter((d) =>
-      d.text.includes(
-        "Recebi, vou considerar no que estou fazendo. /stop cancela.",
-      ),
+      d.text.includes("Got it. I will take that into account. /stop cancels."),
     ).length;
     assert.equal(countCmd, 1, "comandos não disparam aviso de ocupado");
 
@@ -198,6 +192,11 @@ test("updates de chats diferentes rodam em paralelo e offset avança apenas de f
                   id: "cb_3",
                   from: { id: 43, is_bot: false },
                   data: JSON.stringify({ kind: "model", menu: "noop" }),
+                  message: {
+                    message_id: 90,
+                    from: { id: 123 },
+                    chat: { id: -100456, type: "supergroup" },
+                  },
                 },
               },
             ];

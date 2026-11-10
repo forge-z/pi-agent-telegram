@@ -10,7 +10,7 @@ import {
   fauxAssistantMessage,
 } from "@earendil-works/pi-ai/providers/faux";
 import type { FauxResponseStep } from "@earendil-works/pi-ai";
-import { Runtime } from "../src/runtime.js";
+import { Runtime, assistantClock } from "../src/runtime.js";
 import { Store, type Delivery } from "../src/store.js";
 const gateway = { catalog: async () => [] };
 async function temp() {
@@ -27,6 +27,58 @@ async function wait(app: Runtime, id: string) {
   await (await app.conversation(id)).waitForIdle(context);
   await new Promise((resolve) => setTimeout(resolve, 20));
 }
+
+test("the clock defaults to America/Sao_Paulo and follows TZ", () => {
+  const now = new Date("2026-11-09T18:00:00Z");
+  const fallback = assistantClock({}, now);
+  assert.match(fallback, /America\/Sao_Paulo/);
+  assert.match(fallback, /November 9, 2026/);
+  assert.match(fallback, /15:00/);
+  assert.match(fallback, /tomorrow/);
+  const utc = assistantClock({ TZ: "UTC" }, now);
+  assert.match(utc, /\(UTC\)/);
+  assert.match(utc, /18:00/);
+  assert.match(assistantClock({ TZ: "Not/AZone" }, now), /America\/Sao_Paulo/);
+});
+
+test("each turn's system prompt includes that turn's clock", async () => {
+  const dir = await temp();
+  const { models } = model([fauxAssistantMessage("ok")]);
+  const app = await Runtime.open({
+    dir,
+    gateway,
+    models,
+    env: { TZ: "UTC" },
+    now: () => Date.parse("2026-11-09T18:04:00Z"),
+  });
+  try {
+    const found = (
+      app as unknown as {
+        registry: {
+          snapshot: () => {
+            extension: (name: string) => {
+              sections?: {
+                key: string;
+                render: (...args: unknown[]) => Promise<string> | string;
+              }[];
+            };
+          };
+        };
+      }
+    ).registry
+      .snapshot()
+      .extension("personal-assistant")
+      ?.sections?.find((item) => item.key === "now");
+    const text = await found?.render(undefined, undefined);
+    assert.match(text ?? "", /Current date and time/);
+    assert.match(text ?? "", /November 9, 2026/);
+    assert.match(text ?? "", /18:04/);
+    assert.match(text ?? "", /\(UTC\)/);
+  } finally {
+    await app.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("Durable assistant answers persist formatted Telegram chunks before delivery and deduplicate after restart", async () => {
   const dir = await temp();

@@ -113,9 +113,9 @@ export interface SetupChoice {
 
 const COMPAT_CHOICE: SetupChoice = {
   id: "custom",
-  name: "Outro (OpenAI-compatible)",
+  name: "Other (OpenAI-compatible)",
   kind: "compat",
-  hint: "reserva opcional: proxy ou host sem provedor nativo",
+  hint: "optional reserve: a proxy or a host with no native provider",
 };
 
 let choices: SetupChoice[] | undefined;
@@ -128,7 +128,7 @@ export function setupChoices(): SetupChoice[] {
       id: provider.id,
       name: provider.name,
       kind: "native",
-      hint: "catálogo oficial",
+      hint: "official catalog",
       ...(provider.baseUrl ? { baseUrl: provider.baseUrl } : {}),
     }))
     .sort((a, b) => a.name.localeCompare(b.name, "pt"));

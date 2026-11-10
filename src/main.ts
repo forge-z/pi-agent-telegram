@@ -1,8 +1,10 @@
 import { join, resolve } from "node:path";
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { Runtime } from "./runtime.js";
 import { McpGateway } from "./mcp.js";
+import { LongCallHeartbeat } from "./heartbeat.js";
+import { loadHarnessConfig } from "./harness-config.js";
 import {
   readConfig,
   bootstrapModels,
@@ -15,7 +17,9 @@ import {
 } from "./config.js";
 import {
   migrateLegacyOfficialSetup,
+  readStoredAggregators,
   readStoredSetup,
+  readStoredTelegram,
   type StoredSetup,
 } from "./setup.js";
 import { Store, SqlCredentials } from "./store.js";
@@ -42,29 +46,55 @@ function migrateVolume(dir: string) {
   }
 }
 
+function waitMessage(error: SetupRequiredError) {
+  if (setupNeedsLogin(error))
+    return (
+      "Assinatura ChatGPT ainda não autenticada. Rode `npm run login` no terminal do container; " +
+      "o bot começa a responder sozinho quando o login terminar."
+    );
+  if (/token do Telegram/i.test(error.message))
+    return (
+      "Sem token do Telegram no ambiente nem no volume. Rode `npm run setup` no terminal do container; " +
+      "o bot fica no ar e começa a responder sozinho quando o assistente terminar."
+    );
+  if (/usuários permitidos do Telegram/i.test(error.message))
+    return (
+      "Sem usuários permitidos do Telegram no ambiente nem no volume. Rode `npm run setup` no terminal do container; " +
+      "o bot fica no ar e começa a responder sozinho quando o assistente terminar."
+    );
+  return (
+    "Sem provedor configurado. Rode `npm run setup` no terminal do container; " +
+    "o bot começa a responder sozinho quando o assistente terminar."
+  );
+}
+
 async function modelsOrWait(dir: string) {
-  for (let attempt = 0; ; attempt += 1) {
+  let announced = "";
+  for (;;) {
     migrateVolume(dir);
     const stored = readStoredSetup(dir);
-    const store = new Store(dir);
+    let store: Store | undefined;
     try {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const config = readConfig(
+        process.env,
+        readStoredAggregators(dir),
+        readStoredTelegram(dir),
+      );
+      store = new Store(dir);
       const credentials = new SqlCredentials(store);
       const models = await bootstrapModels(credentials, process.env, {
         stored,
       });
-      return { models, stored, store };
+      return { models, stored, store, config };
     } catch (error) {
-      store.close();
+      store?.close();
       if (!(error instanceof SetupRequiredError)) throw error;
-      if (attempt === 0) {
-        const needsLogin = setupNeedsLogin(error);
-        console.error(
-          needsLogin
-            ? "Assinatura ChatGPT ainda não autenticada. Rode `npm run login` no terminal do container; " +
-                "o bot começa a responder sozinho quando o login terminar."
-            : "Sem provedor configurado. Rode `npm run setup` no terminal do container; " +
-                "o bot começa a responder sozinho quando o assistente terminar.",
-        );
+      const line = waitMessage(error);
+      // One line per distinct gap. Repeating it every poll looks like a crash loop.
+      if (line !== announced) {
+        console.error(line);
+        announced = line;
       }
       // Waiting is the expected state, not a fault: keep the healthcheck green so the
       // platform does not restart the container that holds the terminal you need.
@@ -88,16 +118,18 @@ import { configureTelegram, TelegramPolling } from "./telegram-polling.js";
 
 process.umask(0o077);
 try {
-  const config = readConfig();
-  const dir = resolve(config.dir);
+  loadHarnessConfig();
+  const dir = resolve((process.env.DATA_DIR ?? "data").trim() || "data");
   const {
     models,
     stored,
     store: bootstrapStore,
+    config,
   }: {
     models: Awaited<ReturnType<typeof bootstrapModels>>;
     stored: StoredSetup;
     store: Store;
+    config: ReturnType<typeof readConfig>;
   } = await modelsOrWait(dir);
   // Safe deploy hint: endpoint and catalog only, never credentials.
   const selection = await preferredVolumeSelection(
@@ -132,10 +164,32 @@ try {
   if (allowlistMisconfig) throw new Error(allowlistMisconfig);
   rmSync(`${dir}/health.json`, { force: true });
   const gateway = new McpGateway(config.mcp);
+  // Status for a tool call that outlives a minute; best effort, never durable.
+  const heartbeat = new LongCallHeartbeat({
+    send: async (chat, text, options) =>
+      (await api.call("sendMessage", {
+        chat_id: chat,
+        text,
+        ...(options.messageThreadId === undefined
+          ? {}
+          : { message_thread_id: options.messageThreadId }),
+      })) as { message_id?: number },
+    edit: async (chat, messageId, text) => {
+      await api.call("editMessageText", {
+        chat_id: chat,
+        message_id: messageId,
+        text,
+      });
+    },
+    delete: async (chat, messageId) => {
+      await api.call("deleteMessage", { chat_id: chat, message_id: messageId });
+    },
+  });
   const app = await Runtime.open({
     dir,
     store: bootstrapStore,
     gateway,
+    heartbeat,
     models,
     mode: "live",
     // Bootstrap only: the choice from `npm run setup` seeds the default once;
@@ -147,7 +201,16 @@ try {
           effort: selection.effort,
         }
       : {}),
-    redact: secretRedactor(process.env, config.mcp),
+    redact: secretRedactor(
+      {
+        ...process.env,
+        // The token may come from the volume. Clear _FILE so a placeholder file
+        // does not hide that value from the redactor.
+        TELEGRAM_BOT_TOKEN: config.token,
+        TELEGRAM_BOT_TOKEN_FILE: "",
+      },
+      config.mcp,
+    ),
     initialize: (store) => configureTelegram(store, config, bot),
   });
   const polling = new TelegramPolling(app, api, config, bot);
@@ -169,11 +232,16 @@ try {
       await app.close();
       await gateway.close();
     })());
+  // Exit after the drain. `npm run setup` signals this process; the container
+  // restart policy (unless-stopped) starts it again so it re-reads the volume.
+  // A handler that only closes leaves the event loop up, and the old token,
+  // allowlist, and MCP gateway stay in memory.
   for (const event of ["SIGTERM", "SIGINT"] as const)
     process.once(event, () => {
-      void close().catch(() => {
-        process.exitCode = 1;
-      });
+      void close().then(
+        () => process.exit(0),
+        () => process.exit(1),
+      );
     });
   polling.start(() => {
     void close().finally(() => {

@@ -12,14 +12,14 @@ export function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value as Record<string, unknown>;
 }
 
-function statusWord(value: unknown) {
+export function statusWord(value: unknown) {
   return String(value ?? "")
     .trim()
     .toLowerCase()
     .replace(/[\s-]+/g, "_");
 }
 
-function approvalId(body: Record<string, unknown>) {
+export function approvalId(body: Record<string, unknown>) {
   for (const key of ["requestId", "executionId"]) {
     const value = body[key];
     if (typeof value === "string" && value.trim()) return value.trim();
@@ -89,6 +89,98 @@ export function executorPauseKind(
   )
     return "approval-required";
   return undefined;
+}
+
+const AUTH_STATUSES = new Set([
+  "needs_auth",
+  "auth_required",
+  "authentication_required",
+]);
+
+function redirectUrl(body: Record<string, unknown>) {
+  for (const key of [
+    "redirect_url",
+    "redirectUrl",
+    "auth_url",
+    "authorization_url",
+  ]) {
+    const value = body[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+export interface AuthRedirect {
+  url: string;
+  message: string;
+  elicitationId: string;
+}
+
+function collectRecords(
+  value: unknown,
+  depth: number,
+  into: Record<string, unknown>[],
+  seen: Set<object>,
+) {
+  if (depth > 5 || into.length >= 64 || seen.has(value as object)) return;
+  if (Array.isArray(value)) {
+    seen.add(value);
+    for (const item of value) collectRecords(item, depth + 1, into, seen);
+    return;
+  }
+  const body = asRecord(value);
+  if (!body) return;
+  seen.add(body);
+  into.push(body);
+  for (const child of Object.values(body))
+    collectRecords(child, depth + 1, into, seen);
+}
+
+/**
+ * Tool payloads that need an account link (`needs_auth` / `auth_required`
+ * plus an https redirect). Mapped onto the URL card, not treated as a pause.
+ * Composio nests that object under `data.results.<toolkit>`, which the shared
+ * body walker does not descend into.
+ */
+export function authRedirects(value: unknown): AuthRedirect[] {
+  const found: AuthRedirect[] = [];
+  const seenUrl = new Set<string>();
+  const candidates: Record<string, unknown>[] = [];
+  const seen = new Set<object>();
+  for (const body of executorBodies(value))
+    collectRecords(body, 0, candidates, seen);
+  for (const body of candidates) {
+    if (!AUTH_STATUSES.has(statusWord(body.status))) continue;
+    const raw = redirectUrl(body);
+    if (!raw || seenUrl.has(raw)) continue;
+    let address: URL;
+    try {
+      address = new URL(raw);
+    } catch {
+      continue;
+    }
+    if (
+      address.protocol !== "https:" ||
+      address.username ||
+      address.password ||
+      address.href.length > 4096
+    )
+      continue;
+    seenUrl.add(raw);
+    const text =
+      typeof body.message === "string" && body.message.trim()
+        ? body.message.trim()
+        : "Conecte a conta para continuar.";
+    found.push({
+      url: address.href,
+      message: text
+        .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
+        .slice(0, 500),
+      elicitationId: `auth-${found.length + 1}`,
+    });
+    if (found.length >= 8) break;
+  }
+  return found;
 }
 
 /** Approval / paused Executor result (`apr_…`), not a finished job. */

@@ -6,7 +6,7 @@ const REPLY_LIMIT = 500;
 const LIST_LIMIT = 180;
 const RECENT_LIMIT = 20;
 
-type TelegramAuthor = "bot" | "usuário" | "aviso";
+export type TelegramAuthor = "bot" | "usuário" | "aviso";
 
 export function telegramAuthor(
   from: { id?: number; is_bot?: boolean } | undefined,

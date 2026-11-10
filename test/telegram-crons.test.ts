@@ -6,26 +6,7 @@ import { join } from "node:path";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import { Runtime } from "../src/runtime.js";
-
-function linkChat(
-  app: Runtime,
-  chat: string,
-  user: string,
-  conversationId: string,
-) {
-  app.store.run(
-    "INSERT INTO telegram VALUES (?,?,?) ON CONFLICT(chat) DO UPDATE SET conversationId=excluded.conversationId,user=excluded.user",
-    chat,
-    conversationId,
-    user,
-  );
-  app.store.run(
-    "INSERT OR IGNORE INTO telegram_grants VALUES (?,?,?)",
-    chat,
-    user,
-    conversationId,
-  );
-}
+import { linkChat } from "./link-chat.js";
 
 import {
   Telegram,
@@ -226,9 +207,9 @@ test("/crons lists only authorized Telegram schedules across topics and controls
     await f.click(f.token(/Relatório/));
     assert.match(f.views.at(-1)!.text, /Instrução original/);
     assert.match(f.views.at(-1)!.text, /22/);
-    await f.click(f.token(/Retomar/));
+    await f.click(f.token(/Resume/));
     assert.equal(f.app.tasks.get(f.task.id)!.enabled, true);
-    const stale = f.token(/Pausar/);
+    const stale = f.token(/Pause/);
     await f.click(stale);
     assert.equal(f.app.tasks.get(f.task.id)!.enabled, false);
     await f.click(stale);
@@ -257,14 +238,14 @@ test("cron deletion requires confirmation, supports cancel, and preserves conver
   try {
     await f.send("/crons");
     await f.click(f.token(/Relatório/));
-    await f.click(f.token(/Excluir/));
+    await f.click(f.token(/Delete/));
     assert.ok(f.app.tasks.get(f.task.id));
-    const stale = f.token(/Confirmar exclusão/);
-    await f.click(f.token(/Cancelar/));
+    const stale = f.token(/Confirm delete/);
+    await f.click(f.token(/Cancel/));
     await f.click(stale);
     assert.ok(f.app.tasks.get(f.task.id));
-    await f.click(f.token(/Excluir/));
-    await f.click(f.token(/Confirmar exclusão/));
+    await f.click(f.token(/Delete/));
+    await f.click(f.token(/Confirm delete/));
     assert.equal(f.app.tasks.get(f.task.id), undefined);
     assert.ok(
       f.app.store.get("SELECT 1 FROM conversations WHERE id=?", f.second),
@@ -285,14 +266,14 @@ test("cron field editing accepts only an exact prompt reply and confirms before 
   try {
     await f.send("/crons");
     await f.click(f.token(/Relatório/));
-    await f.click(f.token(/Editar/));
-    await f.click(f.token(/Título/));
+    await f.click(f.token(/Edit/));
+    await f.click(f.token(/Title/));
     const prompt = f.views.at(-1)!;
     assert.equal(prompt.forceReply, true);
     await f.restart();
     await f.send("Título novo", prompt.messageId);
     assert.equal(f.app.tasks.get(f.task.id)!.title, f.task.title);
-    await f.click(f.token(/Confirmar alteração/));
+    await f.click(f.token(/Confirm change/));
     assert.equal(f.app.tasks.get(f.task.id)!.title, "Título novo");
     assert.equal(f.app.tasks.get(f.task.id)!.destinationMessageThreadId, 22);
     await f.send("Não repetir", prompt.messageId);
@@ -324,7 +305,7 @@ test("cron callbacks reject foreign user/chat/topic/bot, stale task and revoked/
     ])
       await f.click(detail, alter);
     await f.click(detail);
-    const resume = f.token(/Retomar/);
+    const resume = f.token(/Resume/);
     f.app.store.run(
       "DELETE FROM telegram_grants WHERE conversationId=?",
       f.second,
@@ -335,10 +316,10 @@ test("cron callbacks reject foreign user/chat/topic/bot, stale task and revoked/
     );
     await f.click(resume);
     assert.equal(f.app.tasks.get(f.task.id)!.enabled, false);
-    assert.match(f.answers.at(-1)!, /autoriza|desatualizado|mudou/i);
+    assert.match(f.answers.at(-1)!, /authoriz|out of date|changed/i);
     await f.send("/crons");
     await f.click(f.token(/Relatório/));
-    const stale = f.token(/Retomar/);
+    const stale = f.token(/Resume/);
     f.app.tasks.edit(f.task.id, { title: "Alterado fora do menu" });
     await f.click(stale);
     assert.equal(f.app.tasks.get(f.task.id)!.enabled, false);
@@ -353,21 +334,21 @@ test("reopening /crons cancels an old edit prompt; slash text edits remain data 
   try {
     await f.send("/crons");
     await f.click(f.token(/Relatório/));
-    await f.click(f.token(/Editar/));
-    await f.click(f.token(/Instrução/));
+    await f.click(f.token(/Edit/));
+    await f.click(f.token(/Instruction/));
     const promptId = f.views.at(-1)!.messageId;
     await f.send("/link abcdef", promptId);
-    await f.click(f.token(/Confirmar alteração/));
+    await f.click(f.token(/Confirm change/));
     assert.equal(f.app.tasks.get(f.task.id)!.prompt, "/link abcdef");
-    await f.click(f.token(/Editar/));
-    await f.click(f.token(/Título/));
+    await f.click(f.token(/Edit/));
+    await f.click(f.token(/Title/));
     const old = f.views.at(-1)!.messageId;
     await f.send("/crons", old);
     f.token(/Relatório/);
     await f.send("Não alterar", old);
     assert.equal(f.app.tasks.get(f.task.id)!.title, f.task.title);
     assert.equal(f.app.store.all("SELECT * FROM requests").length, 0);
-    assert.match(f.views.at(-1)!.text, /expirado|desatualizado/);
+    assert.match(f.views.at(-1)!.text, /expired|out of date/);
   } finally {
     await f.close();
   }
@@ -380,9 +361,9 @@ test("menu pagination, edit failures and legacy Telegram schedule management nev
     f.app.store.run("UPDATE tasks SET originSource=NULL WHERE id=?", f.task.id);
     await f.send("/crons");
     f.failEdits();
-    await f.click(f.token(/Próxima/));
-    assert.ok(f.token(/Anterior/));
-    await f.click(f.token(/Anterior/));
+    await f.click(f.token(/Next/));
+    assert.ok(f.token(/Previous/));
+    await f.click(f.token(/Previous/));
     // Existing legacy origins remain editable through their preserved Telegram conversation.
     await f.send("/crons");
     const allTokens = f.views.at(-1)!.markup!.inline_keyboard.flat();
@@ -423,19 +404,19 @@ test("a reply to an older field prompt cannot populate a later field in the same
   try {
     await f.send("/crons");
     await f.click(f.token(/Relatório/));
-    await f.click(f.token(/Editar/));
-    await f.click(f.token(/Título/));
+    await f.click(f.token(/Edit/));
+    await f.click(f.token(/Title/));
     const old = f.views.at(-1)!.messageId;
     await f.send("Título salvo", old);
-    await f.click(f.token(/Confirmar alteração/));
-    await f.click(f.token(/Editar/));
-    await f.click(f.token(/Instrução/));
+    await f.click(f.token(/Confirm change/));
+    await f.click(f.token(/Edit/));
+    await f.click(f.token(/Instruction/));
     const current = f.views.at(-1)!.messageId;
     await f.send("Valor de resposta antiga", old);
-    assert.match(f.views.at(-1)!.text, /expirado|desatualizado/);
+    assert.match(f.views.at(-1)!.text, /expired|out of date/);
     assert.equal(f.app.tasks.get(f.task.id)!.prompt, "Instrução original");
     await f.send("Nova instrução correta", current);
-    await f.click(f.token(/Confirmar alteração/));
+    await f.click(f.token(/Confirm change/));
     assert.equal(f.app.tasks.get(f.task.id)!.prompt, "Nova instrução correta");
     assert.equal(f.app.store.all("SELECT * FROM requests").length, 0);
   } finally {
@@ -448,10 +429,10 @@ test("native edit replies recognize the legacy TelegramHttp Bot API envelope", a
   try {
     await f.send("/crons");
     await f.click(f.token(/Relatório/));
-    await f.click(f.token(/Editar/));
-    await f.click(f.token(/Título/));
+    await f.click(f.token(/Edit/));
+    await f.click(f.token(/Title/));
     await f.send("Título pelo HTTP", f.views.at(-1)!.messageId);
-    await f.click(f.token(/Confirmar alteração/));
+    await f.click(f.token(/Confirm change/));
     assert.equal(f.app.tasks.get(f.task.id)!.title, "Título pelo HTTP");
     assert.equal(f.app.store.all("SELECT * FROM requests").length, 0);
   } finally {
@@ -464,8 +445,8 @@ test("existing permanent cleanup removes staged cross-topic cron values and deli
   try {
     await f.send("/crons");
     await f.click(f.token(/Relatório/));
-    await f.click(f.token(/Editar/));
-    await f.click(f.token(/Instrução/));
+    await f.click(f.token(/Edit/));
+    await f.click(f.token(/Instruction/));
     await f.send(
       "sensitive staged cron instruction",
       f.views.at(-1)!.messageId,
@@ -526,22 +507,22 @@ test("Telegram edits validate schedule and timezone, allow instruction changes, 
   try {
     await f.send("/crons");
     await f.click(f.token(/Relatório/));
-    assert.match(f.views.at(-1)!.text, /Entrega salva: web/);
+    assert.match(f.views.at(-1)!.text, /Saved delivery: web/);
     for (const [label, value, field] of [
-      [/Agenda/, "30 10 * * *", "schedule"],
-      [/Fuso/, "America/Sao_Paulo", "timezone"],
-      [/Instrução/, "Nova instrução cron", "prompt"],
+      [/Schedule/, "30 10 * * *", "schedule"],
+      [/Timezone/, "America/Sao_Paulo", "timezone"],
+      [/Instruction/, "Nova instrução cron", "prompt"],
     ] as const) {
-      await f.click(f.token(/Editar/));
+      await f.click(f.token(/Edit/));
       await f.click(f.token(label));
       await f.send(value, f.views.at(-1)!.messageId);
-      await f.click(f.token(/Confirmar alteração/));
+      await f.click(f.token(/Confirm change/));
       assert.equal(f.app.tasks.get(f.task.id)![field], value);
     }
-    await f.click(f.token(/Editar/));
-    await f.click(f.token(/Agenda/));
+    await f.click(f.token(/Edit/));
+    await f.click(f.token(/Schedule/));
     await f.send("invalid cron", f.views.at(-1)!.messageId);
-    await f.click(f.token(/Confirmar alteração/));
+    await f.click(f.token(/Confirm change/));
     assert.equal(f.app.tasks.get(f.task.id)!.schedule, "30 10 * * *");
     assert.match(f.answers.at(-1)!, /Cron|cron/);
     assert.equal(f.app.tasks.get(f.task.id)!.destinationMessageThreadId, 22);
@@ -556,7 +537,7 @@ test("expired menus and changed source selections refuse cron mutations", async 
   try {
     await f.send("/crons");
     await f.click(f.token(/Relatório/));
-    const expired = f.token(/Retomar/);
+    const expired = f.token(/Resume/);
     f.app.store.run(
       "UPDATE meta SET value=json_set(value,'$.expiresAt',0) WHERE key GLOB 'telegram:cron-menu:*'",
     );
@@ -564,7 +545,7 @@ test("expired menus and changed source selections refuse cron mutations", async 
     assert.equal(f.app.tasks.get(f.task.id)!.enabled, false);
     await f.send("/crons");
     await f.click(f.token(/Relatório/));
-    const changed = f.token(/Retomar/);
+    const changed = f.token(/Resume/);
     const replacement = await f.app.create("Outra seleção", f.owner);
     f.app.telegramChats.select(replacement, f.owner);
     assert.notEqual(replacement, f.first);
@@ -582,8 +563,8 @@ test("/crons runs a schedule now, marks it manual and does not reschedule", asyn
     const before = f.app.tasks.get(f.task.id)!;
     await f.send("/crons");
     await f.click(f.token(/Relatório/));
-    await f.click(f.token(/Rodar agora/));
-    assert.match(f.views.at(-1)!.text, /Execução manual de .+ iniciada/);
+    await f.click(f.token(/Run now/));
+    assert.match(f.views.at(-1)!.text, /Manual run of .+ started/);
     const runs = f.app.tasks.runs(f.task.id);
     assert.equal(runs.length, 1);
     assert.equal(runs[0].trigger, "manual");
@@ -591,8 +572,8 @@ test("/crons runs a schedule now, marks it manual and does not reschedule", asyn
     assert.equal(f.app.tasks.get(f.task.id)!.nextRun, before.nextRun);
     assert.equal(f.app.tasks.get(f.task.id)!.enabled, before.enabled);
     // A second press while it is running is refused, with a readable reason.
-    await f.click(f.token(/Rodar agora/));
-    assert.match(f.views.at(-1)!.text, /execução em andamento/);
+    await f.click(f.token(/Run now/));
+    assert.match(f.views.at(-1)!.text, /already in progress/);
     assert.equal(f.app.tasks.runs(f.task.id).length, 1);
   } finally {
     await f.close();

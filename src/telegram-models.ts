@@ -15,7 +15,7 @@ import { LLM_PROVIDER_ID } from "./config.js";
 
 const PAGE_SIZE = 8;
 const guidance =
-  "A escolha altera apenas esta conversa e persiste após reinício.";
+  "The choice changes only this conversation and persists after a restart.";
 interface Menu {
   conversationId: string;
   authorizationVersion: string;
@@ -81,11 +81,11 @@ function assertCurrent(
   if (locked) {
     app.telegramChats.connection(owner);
     if (!app.telegramChats.owns(id, owner) || app.store.conversationDeleted(id))
-      throw new SettingsError("Conversa não autorizada. Use /model novamente.");
+      throw new SettingsError("Conversation not authorized. Use /model again.");
   } else app.commands.authorize(id, { source: "telegram", ...owner });
   if (app.telegramChats.selection(owner) !== id)
     throw new SettingsError(
-      "A conversa selecionada mudou. Use /model novamente.",
+      "The selected conversation changed. Use /model again.",
     );
   if (
     app.store.get(
@@ -96,7 +96,7 @@ function assertCurrent(
     )
   )
     throw new SettingsError(
-      "Tópico fechado no estado observado. Use /model após reabri-lo.",
+      "Topic is closed in the observed state. Use /model after reopening it.",
     );
 }
 function render(
@@ -134,17 +134,17 @@ function render(
           effort,
         }),
       ]);
-    markup.inline_keyboard.push([add("Cancelar", { action: "cancel" })]);
+    markup.inline_keyboard.push([add("Cancel", { action: "cancel" })]);
     // A single `off` is not a bug: the catalog declares no reasoning for this model.
     const noReasoning =
       !current ||
       current.efforts.filter((effort) => effort !== "off").length === 0;
     return {
-      text: `Esforço ativo: ${menu.current.effort}\nModelo: ${menu.current.provider}/${menu.current.modelId}\n${
+      text: `Active effort: ${menu.current.effort}\nModel: ${menu.current.provider}/${menu.current.modelId}\n${
         noReasoning
           ? menu.current.provider === LLM_PROVIDER_ID
-            ? "Este modelo não declara níveis de raciocínio, então só existe `off`. Para habilitar low/medium/high, declare o catálogo em LLM_MODELS com `reasoning=true` ou a lista de níveis (ex.: deepseek-flash|1000000|384000|off+low+high+max).\n"
-            : "Este modelo não declara níveis de raciocínio no catálogo oficial, então só existe `off`.\n"
+            ? "This model declares no reasoning levels, so only `off` exists. To enable low/medium/high, declare the catalog in LLM_MODELS with `reasoning=true` or the level list (e.g. deepseek-flash|1000000|384000|off+low+high+max).\n"
+            : "This model declares no reasoning levels in the official catalog, so only `off` exists.\n"
           : ""
       }${guidance}`,
       markup,
@@ -153,22 +153,22 @@ function render(
   const currentProvider =
     app.models.getProvider(menu.current.provider)?.name ??
     menu.current.provider;
-  let text = `Configuração de modelo\nAtual: ${menu.current.provider}/${menu.current.modelId}\nProvedor: ${currentProvider}\n\n`;
+  let text = `Model settings\nCurrent: ${menu.current.provider}/${menu.current.modelId}\nProvider: ${currentProvider}\n\n`;
   const provider =
     action.action === "models"
       ? available.find((p) => p.id === action.provider)
       : undefined;
   if (action.action === "models" && !provider)
     throw new SettingsError(
-      "Provedor não configurado ou indisponível. Use /model novamente.",
+      "Provider not configured or unavailable. Use /model again.",
     );
   const rows = provider?.models ?? available;
   const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
   const page = Math.min(Math.max(0, action.page ?? 0), pages - 1);
   if (provider) {
-    text += `Selecione um modelo de ${provider.name} · ${page + 1}/${pages}`;
+    text += `Select a model from ${provider.name} · ${page + 1}/${pages}`;
     if (!rows.length)
-      text += "\nNenhum modelo disponível no catálogo deste provedor.";
+      text += "\nNo model available in this provider's catalog.";
     for (const model of provider.models.slice(
       page * PAGE_SIZE,
       (page + 1) * PAGE_SIZE,
@@ -180,8 +180,8 @@ function render(
         ),
       ]);
   } else {
-    text += "Selecione um provedor";
-    if (!rows.length) text += "\nNenhum provedor configurado disponível.";
+    text += "Select a provider";
+    if (!rows.length) text += "\nNo configured provider available.";
     for (const row of available.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE))
       markup.inline_keyboard.push([
         add(
@@ -196,15 +196,15 @@ function render(
     provider: provider?.id,
   };
   if (page > 0)
-    navigation.push(add("← Anterior", { ...pageAction, page: page - 1 }));
+    navigation.push(add("← Previous", { ...pageAction, page: page - 1 }));
   if (page + 1 < pages)
-    navigation.push(add("Próxima →", { ...pageAction, page: page + 1 }));
+    navigation.push(add("Next →", { ...pageAction, page: page + 1 }));
   if (navigation.length) markup.inline_keyboard.push(navigation);
   if (provider)
     markup.inline_keyboard.push([
-      add("← Voltar aos provedores", { action: "providers" }),
+      add("← Back to providers", { action: "providers" }),
     ]);
-  markup.inline_keyboard.push([add("Cancelar", { action: "cancel" })]);
+  markup.inline_keyboard.push([add("Cancel", { action: "cancel" })]);
   return { text: `${text}\n\n${guidance}`, markup };
 }
 export async function openModelMenu(
@@ -219,7 +219,7 @@ export async function openModelMenu(
   const available = await providers(app);
   assertCurrent(app, owner, id);
   if (authorizationVersion !== app.store.authorizationVersion(owner, id))
-    throw new SettingsError("A autorização mudou. Use /model novamente.");
+    throw new SettingsError("Authorization changed. Use /model again.");
   const prefix = `telegram:model:${updateId}`;
   // Recovery of an update with an already queued menu must not create new tokens.
   if (app.store.get("SELECT 1 FROM deliveries WHERE id=?", `${prefix}:0`))
@@ -258,8 +258,7 @@ export async function handleModelMenu(
   validateConnection: () => void,
 ) {
   const action = data.modelMenu;
-  if (!action)
-    throw new SettingsError("Controle inválido. Use /model novamente.");
+  if (!action) throw new SettingsError("Invalid control. Use /model again.");
   const key = `telegram:model-menu:${action.id}`;
   const read = () => {
     const saved = app.store.get<{ value: string }>(
@@ -276,9 +275,7 @@ export async function handleModelMenu(
       menu.authorizationVersion !==
         app.store.authorizationVersion(data.owner, data.conversationId)
     )
-      throw new SettingsError(
-        "Menu expirado ou desatualizado. Use /model novamente.",
-      );
+      throw new SettingsError("Menu expired or out of date. Use /model again.");
     return menu;
   };
   const validate = () => {
@@ -296,7 +293,7 @@ export async function handleModelMenu(
     !same(menu.current, await app.settings.conversation(data.conversationId))
   )
     throw new SettingsError(
-      "O modelo desta conversa mudou. Use /model novamente.",
+      "This conversation's model changed. Use /model again.",
     );
   validate();
   read();
@@ -305,7 +302,7 @@ export async function handleModelMenu(
     const model = provider?.models.find((m) => m.id === action.modelId);
     if (!provider || !model)
       throw new SettingsError(
-        "Modelo não disponível no catálogo configurado. Use /model novamente.",
+        "Model not available in the configured catalog. Use /model again.",
       );
     const native = app.models.getModel(provider.id, model.id)!;
     // Close before awaiting configure: siblings and duplicate updates never
@@ -336,18 +333,18 @@ export async function handleModelMenu(
           menu.expiresAt <= Date.now()
         )
           throw new SettingsError(
-            "A autorização do menu mudou ou expirou. Use /model novamente.",
+            "The menu authorization changed or expired. Use /model again.",
           );
         if (!same(menu.current, current))
           throw new SettingsError(
-            "A conversa ou o modelo mudou. Use /model novamente.",
+            "The conversation or the model changed. Use /model again.",
           );
         if (
           app.models.getProvider(provider.id) !== provider.registered ||
           authBinding(app, provider.id) !== provider.authBinding
         )
           throw new SettingsError(
-            "O provedor configurado mudou. Use /model novamente.",
+            "The configured provider changed. Use /model again.",
           );
         app.settings.validate({
           provider: provider.id,
@@ -359,12 +356,12 @@ export async function handleModelMenu(
         });
       },
     );
-    text = `Modelo: ${saved.modelId}. Provedor: ${provider.name}. Esforço: ${saved.effort}.\n\n${guidance}`;
+    text = `Model: ${saved.modelId}. Provider: ${provider.name}. Effort: ${saved.effort}.\n\n${guidance}`;
     // The user picked a model here on purpose: stop warning about an implicit default.
     app.settings.markModelNoticeShown(data.conversationId);
   } else if (action.action === "cancel") {
     menu.closed = true;
-    text = `Seleção cancelada. O modelo não foi alterado por este menu.\n\n${guidance}`;
+    text = `Selection cancelled. This menu did not change the model.\n\n${guidance}`;
   } else {
     menu.version++;
     const view = render(

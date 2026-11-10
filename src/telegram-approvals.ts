@@ -12,19 +12,22 @@ import {
   button,
   queueControl,
   type TelegramButton,
+  type TelegramReplyMarkup,
 } from "./telegram-controls.js";
+import { APPROVAL_EXPIRE_MS, approvalAction } from "./guards.js";
+import { logFailure } from "./log.js";
 
 const object = (v: unknown): v is Record<string, unknown> =>
   !!v && typeof v === "object" && !Array.isArray(v);
 const reviewVersion = 3;
 const acceptGuidance =
-  "Revise a ação, o destino e o conteúdo acima. A decisão retoma somente esta pendência.";
+  "Review the action, destination, and content above. The decision resumes only this pending item.";
 const executorAcceptGuidance =
-  "Toque em **Aprovar esta chamada** para continuar no Executor, ou **Negar** para cancelar.";
+  "Tap **Approve this call** to continue in Executor, or **Decline** to cancel.";
 const opaqueGuidance =
-  "Aprovação indisponível: este envio não traz destinatários e conteúdo revisáveis no Telegram (apenas draftId ou outro identificador, formato opaco ou campos fora do contrato). Revise no serviço externo. O bot não busca o rascunho, não lê e-mail e não decodifica conteúdo. Use o fluxo seguro do serviço; não envie credenciais aqui. Você pode negar esta pendência.";
+  "Approval unavailable: this send has no recipients or content that can be reviewed in Telegram (only a draftId or another identifier, an opaque format, or fields outside the contract). Review it in the external service. The bot does not fetch the draft, read mail, or decode content. Use the service's secure flow; do not send credentials here. You can decline this pending item.";
 const closedGuidance =
-  "Aprovação indisponível: a ação, o destino ou o conteúdo não atendem ao contrato de revisão, ou exigem entrada adicional. Identificadores, rascunhos, wrappers e formatos desconhecidos precisam de revisão fora do Telegram. Use o fluxo seguro do serviço; não envie credenciais aqui. Você pode negar esta pendência.";
+  "Approval unavailable: the action, destination, or content does not meet the review contract, or it needs extra input. Identifiers, drafts, wrappers, and unknown formats need review outside Telegram. Use the service's secure flow; do not send credentials here. You can decline this pending item.";
 const reviewPrefix = (id: string) => `telegram:mcp:${id}-v${reviewVersion}`;
 const invisible =
   /[\p{Cf}\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029\uD800-\uDFFF]/u;
@@ -232,6 +235,163 @@ function formatExpiresAt(ms: number) {
     timeStyle: "short",
   });
 }
+const approvalAtKey = (id: string) => `telegram:approval-at:${id}`;
+const approvalRemindedKey = (id: string) => `telegram:approval-reminded:${id}`;
+function approvalMeta(app: Runtime, key: string) {
+  const row = app.store.get<{ value: string }>(
+    "SELECT value FROM meta WHERE key=?",
+    key,
+  );
+  const value = Number(row?.value);
+  return Number.isFinite(value) ? value : undefined;
+}
+function rememberApproval(app: Runtime, key: string, at = Date.now()) {
+  app.store.run("INSERT OR REPLACE INTO meta VALUES (?,?)", key, String(at));
+}
+function clearApprovalMeta(app: Runtime, id: string) {
+  app.store.run(
+    "DELETE FROM meta WHERE key IN (?,?)",
+    approvalAtKey(id),
+    approvalRemindedKey(id),
+  );
+}
+/** The sent card's chat and message_id, or undefined until every part is out. */
+function sentApprovalCard(app: Runtime, item: McpInteraction) {
+  const prefix = reviewPrefix(item.id);
+  const parts = app.store.all<{
+    state: string;
+    result: string | null;
+    chat: string;
+  }>(
+    "SELECT state,result,chat FROM deliveries WHERE id>=? AND id<? ORDER BY rowid",
+    `${prefix}:`,
+    `${prefix};`,
+  );
+  if (!parts.length || parts.some((part) => part.state !== "sent"))
+    return undefined;
+  const last = parts.at(-1)!;
+  let receipt: Record<string, unknown> | undefined;
+  try {
+    receipt = last.result
+      ? (JSON.parse(last.result) as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+  const nested =
+    receipt && object(receipt.result)
+      ? (receipt.result as Record<string, unknown>)
+      : undefined;
+  const messageId = receipt?.message_id ?? nested?.message_id;
+  return typeof messageId === "number" && messageId > 0
+    ? { chat: last.chat, messageId }
+    : undefined;
+}
+function remindApproval(
+  app: Runtime,
+  item: McpInteraction,
+  card: { chat: string; messageId: number },
+) {
+  const route = telegramOwnerForConversation(app, item.conversationId);
+  if (!route) return false;
+  let tool = "";
+  try {
+    const invocation = (
+      JSON.parse(item.payload) as { invocation?: { tool?: unknown } }
+    ).invocation;
+    if (typeof invocation?.tool === "string") tool = ` (${invocation.tool})`;
+  } catch {
+    /* malformed payload still gets the reminder */
+  }
+  queueControl(
+    app,
+    `telegram:mcp-reminder:${item.id}`,
+    route.owner,
+    item.conversationId,
+    `**MCP approval still pending${tool}**\n\nThe original card is still waiting for your decision. Use its buttons to approve or decline; with no answer, the pending item expires in 24 hours.`,
+    undefined,
+    card.messageId,
+  );
+  return true;
+}
+async function expireApproval(
+  app: Runtime,
+  item: McpInteraction,
+  card: { chat: string; messageId: number } | undefined,
+  edit?: (
+    chat: string,
+    messageId: number,
+    text: string,
+    markup: TelegramReplyMarkup,
+  ) => Promise<unknown>,
+) {
+  app.store.savepoint("mcp_expire_unanswered", () => {
+    app.store.run(
+      "UPDATE mcp_interactions SET state='expired' WHERE id=? AND state='pending'",
+      item.id,
+    );
+    app.store.run(
+      "UPDATE mcp_calls SET state='abandoned',updatedAt=? WHERE id=? AND state='paused'",
+      Date.now(),
+      item.callId,
+    );
+  });
+  clearApprovalMeta(app, item.id);
+  const text =
+    "MCP approval expired — nobody answered within 24 hours. The pending item was declined and no resume was sent.";
+  if (card && edit) {
+    try {
+      await edit(card.chat, card.messageId, text, { inline_keyboard: [] });
+      return;
+    } catch (error) {
+      logFailure("Failed to edit expired MCP card", error);
+    }
+  }
+  if (!card) return;
+  const route = telegramOwnerForConversation(app, item.conversationId);
+  if (route)
+    queueControl(
+      app,
+      `telegram:mcp-expired:${item.id}`,
+      route.owner,
+      item.conversationId,
+      `**${text}**`,
+    );
+}
+/** One poller tick: remind once after 4h, then expire and deny after 24h. */
+export async function sweepMcpApprovals(
+  app: Runtime,
+  edit?: (
+    chat: string,
+    messageId: number,
+    text: string,
+    markup: TelegramReplyMarkup,
+  ) => Promise<unknown>,
+) {
+  if (!app.mcpCalls) return;
+  const now = Date.now();
+  for (const item of app.store.all<McpInteraction>(
+    "SELECT * FROM mcp_interactions WHERE state='pending'",
+  )) {
+    const at = approvalMeta(app, approvalAtKey(item.id));
+    if (at === undefined) {
+      rememberApproval(app, approvalAtKey(item.id), now);
+      continue;
+    }
+    const action = approvalAction(
+      now - at,
+      approvalMeta(app, approvalRemindedKey(item.id)) !== undefined,
+    );
+    if (!action) continue;
+    const card = sentApprovalCard(app, item);
+    if (action === "expire") {
+      await expireApproval(app, item, card, edit);
+      continue;
+    }
+    if (card && remindApproval(app, item, card))
+      rememberApproval(app, approvalRemindedKey(item.id), now);
+  }
+}
 function isSyntheticExecutorExecutionInvocation(
   invocation: Record<string, unknown> | undefined,
 ) {
@@ -250,14 +410,14 @@ function formatExecutorRefreshInvocation(invocation: Record<string, unknown>) {
       : typeof input.connection === "string"
         ? input.connection
         : undefined;
-  const lines = ["**Atualizar catálogo de ferramentas (Executor)**", ""];
-  lines.push(`Ferramenta: \`${String(invocation.tool)}\``);
-  if (address) lines.push(`Conexão: \`${address}\``);
+  const lines = ["**Refresh tool catalog (Executor)**", ""];
+  lines.push(`Tool: \`${String(invocation.tool)}\``);
+  if (address) lines.push(`Connection: \`${address}\``);
   return lines.join("\n");
 }
 function formatMailInvocationHuman(invocation: Record<string, unknown>) {
   const input = object(invocation.input) ? invocation.input : {};
-  const lines = ["**Envio de e-mail**", ""];
+  const lines = ["**Send email**", ""];
   const pick = (...keys: string[]) => {
     for (const key of keys) {
       const value = input[key];
@@ -266,10 +426,10 @@ function formatMailInvocationHuman(invocation: Record<string, unknown>) {
     return undefined;
   };
   const to = pick("to", "recipients", "to_addresses", "toAddresses");
-  if (to) lines.push(`Para: ${Array.isArray(to) ? to.join(", ") : to}`);
+  if (to) lines.push(`To: ${Array.isArray(to) ? to.join(", ") : to}`);
   for (const [label, ...keys] of [
     ["Cc", "cc", "cc_addresses", "ccAddresses"],
-    ["Cco", "bcc", "bcc_addresses", "bccAddresses"],
+    ["Bcc", "bcc", "bcc_addresses", "bccAddresses"],
   ] as const) {
     const value = pick(...keys);
     if (value)
@@ -278,11 +438,11 @@ function formatMailInvocationHuman(invocation: Record<string, unknown>) {
       );
   }
   const subject = pick("subject");
-  if (typeof subject === "string") lines.push(`Assunto: ${subject}`);
+  if (typeof subject === "string") lines.push(`Subject: ${subject}`);
   const body = pick("body", "text", "body_text", "bodyText");
   if (typeof body === "string") {
     lines.push("");
-    lines.push("Mensagem:");
+    lines.push("Message:");
     lines.push(literalReview(body));
   }
   return lines.join("\n");
@@ -312,7 +472,7 @@ export function formatMcpApprovalDisplay(
     review.executorExecutionPause ||
     isSyntheticExecutorExecutionInvocation(invocation)
   )
-    return request || "Confirme esta ação no Executor.";
+    return request || "Confirm this action in Executor.";
   if (invocation && reviewableExecutorInvocation(invocation))
     return formatExecutorRefreshInvocation(invocation);
   if (
@@ -333,9 +493,9 @@ export function formatMcpApprovalDisplay(
     });
   if (review.opaque) {
     const hint = opaqueReferenceHint(item, call, invocation);
-    if (request && hint) return `${request}\n\nReferência: \`${hint}\``;
+    if (request && hint) return `${request}\n\nReference: \`${hint}\``;
     if (request) return request;
-    if (hint) return `Referência: \`${hint}\``;
+    if (hint) return `Reference: \`${hint}\``;
   }
   // A v2 pause asks one question and then dumps the whole argument object; the
   // question is what a person needs to decide, so the dump never reaches the card.
@@ -351,7 +511,7 @@ export function formatMcpApprovalDisplay(
     const question = request.split(/\n\s*\n/)[0].trim();
     return question && question.length <= 200
       ? question
-      : `Aprovar \`${invocation.tool}\`?`;
+      : `Approve \`${invocation.tool}\`?`;
   }
 
   return literalReview(review.view.text);
@@ -407,11 +567,11 @@ export function formatMcpOutcomeMessage(call: McpCall) {
       : undefined;
     if (structured?.status === "completed") {
       const inner = object(structured.result) ? structured.result : undefined;
-      if (inner?.ok === true) return "Executor concluiu com sucesso.";
+      if (inner?.ok === true) return "Executor finished successfully.";
       if (inner?.ok === false)
-        return "Executor reportou falha na execução. Verifique no painel do Executor.";
+        return "Executor reported an execution failure. Check the Executor panel.";
     }
-    return "Chamada MCP concluída.";
+    return "MCP call finished.";
   }
   if (result.isError) {
     const text = (Array.isArray(result.content) ? result.content : []).find(
@@ -428,74 +588,219 @@ export function formatMcpOutcomeMessage(call: McpCall) {
       if (line && line.length <= 280) return line;
       if (line) return `${line.slice(0, 277)}…`;
     }
-    return "A retomada falhou. Verifique no Executor ou nos logs.";
+    return "Resume failed. Check Executor or the logs.";
   }
   return "";
 }
 const sensitive =
   /^(?:.*(?:token|secret|password|credential|authorization|cookie)|api[_-]?key)$/i;
-/** Never approve a review whose content had to be hidden or abbreviated. */
+const tooLarge = "[Content too large to review in Telegram.]";
+const escapeInvisible = (text: string) =>
+  text.replace(
+    new RegExp(invisible.source, "gu"),
+    (character) =>
+      `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+/** One hiding rule for every review rendering: display may not drift from it. */
+function reviewScrubber() {
+  const state = {
+    hidden: false,
+    text(value: string) {
+      let result = value;
+      if (invisible.test(result)) {
+        state.hidden = true;
+        result = escapeInvisible(result);
+      }
+      return result
+        .replace(/https?:\/\/[^\s"<>]+/g, (raw) => {
+          try {
+            const url = new URL(raw);
+            if (url.username || url.password || url.search || url.hash) {
+              state.hidden = true;
+              return `${url.origin}${url.pathname}[private URL omitted]`;
+            }
+          } catch {
+            state.hidden = true;
+            return "[URL omitted]";
+          }
+          return raw;
+        })
+        .replace(
+          /(?:sk-[\w-]{12,}|\d{6,}:[A-Za-z0-9_-]{20,}|Bearer\s+\S+)/g,
+          () => {
+            state.hidden = true;
+            return "[REDACTED]";
+          },
+        );
+    },
+  };
+  return state;
+}
+/** Never approve a review whose content had to be hidden or abbreviated.
+ * Approval cards keep the literal JSON: `reviewHash` signs those exact bytes. */
 export function reviewText(value: unknown, redact?: (text: string) => string) {
-  let hidden = false;
+  const scrub = reviewScrubber();
   let serialized =
     JSON.stringify(
       value,
       (key, item: unknown) => {
         if (sensitive.test(key)) {
-          hidden = true;
+          scrub.hidden = true;
           return "[REDACTED]";
         }
-        if (typeof item === "string") {
-          if (invisible.test(item)) {
-            hidden = true;
-            item = item.replace(
-              new RegExp(invisible.source, "gu"),
-              (character) =>
-                `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
-            );
-          }
-          return (item as string)
-            .replace(/https?:\/\/[^\s"<>]+/g, (raw) => {
-              try {
-                const url = new URL(raw);
-                if (url.username || url.password || url.search || url.hash) {
-                  hidden = true;
-                  return `${url.origin}${url.pathname}[private URL omitted]`;
-                }
-              } catch {
-                hidden = true;
-                return "[URL omitted]";
-              }
-              return raw;
-            })
-            .replace(
-              /(?:sk-[\w-]{12,}|\d{6,}:[A-Za-z0-9_-]{20,}|Bearer\s+\S+)/g,
-              () => {
-                hidden = true;
-                return "[REDACTED]";
-              },
-            );
-        }
-        return item;
+        return typeof item === "string" ? scrub.text(item) : item;
       },
       2,
     ) ?? "";
   // Property names are also untrusted; JSON.stringify does not escape bidi controls in keys.
   if (invisible.test(serialized)) {
-    hidden = true;
-    serialized = serialized.replace(
-      new RegExp(invisible.source, "gu"),
-      (character) =>
-        `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
-    );
+    scrub.hidden = true;
+    serialized = escapeInvisible(serialized);
   }
   const safe = redact?.(serialized) ?? serialized;
   return {
-    text:
-      safe.length <= 24000
-        ? safe
-        : "[Conteúdo grande demais para revisão no Telegram.]",
-    complete: !hidden && safe === serialized && safe.length <= 24000,
+    text: safe.length <= 24000 ? safe : tooLarge,
+    complete: !scrub.hidden && safe === serialized && safe.length <= 24000,
+  };
+}
+type ReviewScrubber = ReturnType<typeof reviewScrubber>;
+const isStructure = (value: unknown) => Array.isArray(value) || object(value);
+/** Whitespace would break the layout; quoting keeps the value on its own line. */
+const oneLine = (text: string) =>
+  /\s/.test(text) ? JSON.stringify(text) : text;
+const reviewLeaf = (value: unknown, scrub: ReviewScrubber) =>
+  typeof value === "string"
+    ? JSON.stringify(scrub.text(value))
+    : (JSON.stringify(value) ?? String(value));
+/** Fields render as `chave: valor`; arrays as numbered items; nothing is abbreviated. */
+function reviewLines(
+  value: unknown,
+  indent: number,
+  scrub: ReviewScrubber,
+): string[] {
+  const pad = " ".repeat(indent);
+  if (Array.isArray(value)) {
+    if (!value.length) return [`${pad}[]`];
+    return value.flatMap((item, index) =>
+      isStructure(item)
+        ? [`${pad}${index + 1}.`, ...reviewLines(item, indent + 2, scrub)]
+        : [`${pad}${index + 1}. ${reviewLeaf(item, scrub)}`],
+    );
+  }
+  if (object(value)) {
+    const entries = Object.entries(value);
+    if (!entries.length) return [`${pad}{}`];
+    return entries.flatMap(([key, item]) =>
+      reviewField(key, item, indent, scrub),
+    );
+  }
+  return [`${pad}${reviewLeaf(value, scrub)}`];
+}
+function reviewField(
+  key: string,
+  value: unknown,
+  indent: number,
+  scrub: ReviewScrubber,
+) {
+  const pad = " ".repeat(indent);
+  const name = scrub.text(key);
+  const label = `${pad}${oneLine(name)}:`;
+  if (sensitive.test(key)) {
+    scrub.hidden = true;
+    return [`${label} [REDACTED]`];
+  }
+  if (!isStructure(value)) return [`${label} ${reviewLeaf(value, scrub)}`];
+  if (Array.isArray(value) && !value.length) return [`${label} []`];
+  if (object(value) && !Object.keys(value).length) return [`${label} {}`];
+  return [label, ...reviewLines(value, indent + 2, scrub)];
+}
+/** Batch shape of a `call` argument: `{calls: {path, input}}`, one or many. */
+function reviewCalls(input: unknown) {
+  if (!object(input) || Object.keys(input).some((key) => key !== "calls"))
+    return undefined;
+  const list = Array.isArray(input.calls) ? input.calls : [input.calls];
+  const calls = list.map((entry) => {
+    if (!object(entry) || typeof entry.path !== "string") return undefined;
+    const params = Object.entries(entry).filter(([key]) => key !== "path");
+    // `{path, input}` is the call contract: the fields under `input` are the parameters.
+    return {
+      path: entry.path,
+      params:
+        object(entry.input) && params.length === 1
+          ? Object.entries(entry.input)
+          : params,
+    };
+  });
+  return calls.every((entry) => entry)
+    ? (calls as { path: string; params: [string, unknown][] }[])
+    : undefined;
+}
+/** Readable body for an uncertain call card. It must show exactly what was
+ * called, so a shape it does not recognize is rendered field by field, never
+ * abbreviated and never as a JSON blob. Hiding keeps the `reviewText` rule. */
+export function formatUncertainCallReview(
+  value: { server: string; tool: string; state: string; input: unknown },
+  redact?: (text: string) => string,
+) {
+  const scrub = reviewScrubber();
+  const lines = [
+    "MCP call with an uncertain result",
+    `Server: ${scrub.text(value.server)}`,
+    `Tool: ${scrub.text(value.tool)}`,
+    `State: ${scrub.text(value.state)}`,
+  ];
+  const calls = reviewCalls(value.input);
+  const input = object(value.input) ? value.input : undefined;
+  const address = [input?.path, input?.address].find(
+    (item): item is string => typeof item === "string",
+  );
+  if (calls) {
+    const paths = calls.map((entry) => oneLine(scrub.text(entry.path)));
+    if (paths.length === 1) lines.push(`Target: ${paths[0]}`);
+    else {
+      lines.push("Target:");
+      for (const [index, path] of paths.entries())
+        lines.push(`  ${index + 1}. ${path}`);
+    }
+    lines.push("Parameters:");
+    if (calls.length === 1) {
+      if (!calls[0].params.length) lines.push("  (none)");
+      else
+        lines.push(
+          ...reviewLines(Object.fromEntries(calls[0].params), 2, scrub),
+        );
+    } else
+      for (const [index, entry] of calls.entries()) {
+        lines.push(`  Call ${index + 1}:`);
+        if (!entry.params.length) lines.push("    (nenhum)");
+        else
+          lines.push(
+            ...reviewLines(Object.fromEntries(entry.params), 4, scrub),
+          );
+      }
+  } else {
+    if (address) lines.push(`Target: ${oneLine(scrub.text(address))}`);
+    lines.push("Parameters:");
+    lines.push(
+      ...(input
+        ? reviewLines(
+            Object.fromEntries(
+              Object.entries(input).filter(
+                ([key]) => !address || (key !== "path" && key !== "address"),
+              ),
+            ),
+            2,
+            scrub,
+          )
+        : reviewLines(value.input, 2, scrub)),
+    );
+  }
+  const readable = lines.join("\n");
+  const safe = redact?.(readable) ?? readable;
+  const oversized = safe.length > 24000 || readable.length > 24000;
+  return {
+    text: oversized ? tooLarge : safe,
+    complete: !scrub.hidden && safe === readable && !oversized,
   };
 }
 function approvalReview(app: Runtime, item: McpInteraction, call: McpCall) {
@@ -612,6 +917,7 @@ function card(app: Runtime, item: McpInteraction) {
         Date.now(),
         item.callId,
       );
+      clearApprovalMeta(app, item.id);
     });
     const invocation = payload.invocation as { tool?: unknown } | undefined;
     const tool =
@@ -621,7 +927,7 @@ function card(app: Runtime, item: McpInteraction) {
       `telegram:mcp-expired:${item.id}`,
       owner,
       item.conversationId,
-      `**Aprovação MCP expirada**${tool}\n\nNenhuma decisão foi tomada. Nada foi executado e a chamada não será repetida.`,
+      `**MCP approval expired**${tool}\n\nNo resume was sent and the call will not be repeated. Earlier steps may have had effects; uncertain results still need verification.`,
     );
     return;
   }
@@ -636,7 +942,7 @@ function card(app: Runtime, item: McpInteraction) {
       ? opaqueGuidance
       : closedGuidance;
   const expiresAt = Math.min(
-    Date.now() + 15 * 60_000,
+    Date.now() + APPROVAL_EXPIRE_MS,
     typeof payload.expiresAt === "number" ? payload.expiresAt : Infinity,
   );
   const prefix = reviewPrefix(item.id);
@@ -673,10 +979,10 @@ function card(app: Runtime, item: McpInteraction) {
       );
       return token;
     };
-    const controls = [{ text: "Recusar", callback_data: make("decline") }];
+    const controls = [{ text: "Decline", callback_data: make("decline") }];
     if (canAccept)
       controls.unshift({
-        text: "Aprovar",
+        text: "Approve",
         callback_data: make("accept"),
       });
     queueControl(
@@ -684,8 +990,13 @@ function card(app: Runtime, item: McpInteraction) {
       prefix,
       owner,
       item.conversationId,
-      `**Aprovação MCP pendente**\n\n${display}\n\n${guidance}\n\nVálido até: ${formatExpiresAt(expiresAt)} UTC`,
+      `**MCP approval pending**\n\n${display}\n\n${guidance}\n\nValid until: ${formatExpiresAt(expiresAt)} UTC`,
       { inline_keyboard: [controls] },
+    );
+    app.store.run(
+      "INSERT OR IGNORE INTO meta VALUES (?,?)",
+      approvalAtKey(item.id),
+      String(Date.now()),
     );
   });
 }
@@ -780,10 +1091,10 @@ export function queueMcpUncertainNotices(app: Runtime) {
       deliveryId,
       owner,
       call.conversationId,
-      `${call.server} / ${call.tool}: resultado MCP incerto. Verifique no serviço externo. Toque em Registrar verificação externa abaixo, ou envie /reload para dispensar sem apagar o histórico (/destravar também).`,
+      `${call.server} / ${call.tool}: uncertain MCP result. Check this occurrence in the external service. Tap Record external verification below.`,
       {
         inline_keyboard: [
-          [{ text: "Registrar verificação externa…", callback_data: token }],
+          [{ text: "Record external verification…", callback_data: token }],
         ],
       },
     );
@@ -807,25 +1118,25 @@ export async function decideMcp(
       app.store.authorizationVersion(data.owner, data.conversationId) ||
     (data.decision !== "accept" && data.decision !== "decline")
   )
-    throw new PolicyError("Pendência encerrada, alterada ou não autorizada.");
+    throw new PolicyError("Pending item closed, changed, or not authorized.");
   const currentCall = app.store.get<McpCall>(
     "SELECT * FROM mcp_calls WHERE id=?",
     item.callId,
   );
-  if (!currentCall) throw new PolicyError("Chamada pendente indisponível.");
+  if (!currentCall) throw new PolicyError("Pending call unavailable.");
   const review = approvalReview(app, item, currentCall);
   if (data.decision === "accept" && !review.canAccept)
     throw new PolicyError(
       review.opaque
-        ? "Destinatários ou conteúdo não revisáveis. Revise no serviço externo; o bot não consulta rascunhos, não lê e-mail e não decodifica conteúdo opaco."
-        : "Ação, destino ou conteúdo não revisáveis. Use o fluxo seguro do serviço externo; você pode negar esta pendência.",
+        ? "Recipients or content cannot be reviewed. Review it in the external service; the bot does not look up drafts, read mail, or decode opaque content."
+        : "Action, destination, or content cannot be reviewed. Use the external service's secure flow; you can decline this pending item.",
     );
   if (
     data.reviewVersion !== reviewVersion ||
     data.reviewHash !== hash(review.view.text)
   )
     throw new PolicyError(
-      "Cartão de revisão antigo ou alterado. Use o novo cartão literal desta pendência.",
+      "Review card is old or changed. Use the new literal card for this pending item.",
     );
   const prefix = reviewPrefix(item.id);
   const parts = app.store.all<{ state: string; result: string | null }>(
@@ -841,7 +1152,7 @@ export async function decideMcp(
     (receipt?.message_id ?? receipt?.result?.message_id) !== messageId
   )
     throw new PolicyError(
-      "Revisão incompleta ou botão fora da mensagem original.",
+      "Review is incomplete or the button is outside the original message.",
     );
   const result = await app.mcpCalls.decide(
     data.conversationId,
@@ -849,6 +1160,7 @@ export async function decideMcp(
     data.decision,
     data.decision === "accept" ? {} : undefined,
   );
+  clearApprovalMeta(app, item.id);
   const call = app.mcpCalls
     .list(data.conversationId)
     .find((row) => row.id === result.callId);
@@ -859,7 +1171,7 @@ export async function decideMcp(
       `telegram:mcp-result:${item.id}`,
       data.owner,
       data.conversationId,
-      `**Decisão registrada:** ${data.decision === "accept" ? "aprovar" : "negar"}\nEstado MCP: ${call.state}${call.state === "paused" ? "\nHá uma nova pendência; revise o próximo cartão." : ""}${(() => {
+      `**Decision recorded:** ${data.decision === "accept" ? "approve" : "decline"}\nMCP state: ${call.state}${call.state === "paused" ? "\nThere is a new pending item; review the next card." : ""}${(() => {
         const detail = formatMcpOutcomeMessage(call);
         return detail ? `\n\n${detail}` : "";
       })()}`,
@@ -897,10 +1209,10 @@ export function queueMcpChecks(
       `telegram:mcp-check-menu:${updateId}:${call.id}`,
       owner,
       id,
-      `${call.server} / ${call.tool}: resultado incerto. Verifique no serviço externo antes de liberar novas chamadas neste servidor.`,
+      `${call.server} / ${call.tool}: uncertain result. Check the external service before allowing new calls on this server.`,
       {
         inline_keyboard: [
-          [{ text: "Registrar verificação externa…", callback_data: token }],
+          [{ text: "Record external verification…", callback_data: token }],
         ],
       },
     );
@@ -922,16 +1234,16 @@ export async function verifyMcp(
       app.store.authorizationVersion(data.owner, data.conversationId)
   )
     throw new PolicyError(
-      "Registro alterado ou não autorizado. Use /status novamente.",
+      "Record changed or not authorized. Use /status again.",
     );
   const prefix = `telegram:mcp-check:${call.id}:${data.callHash}`;
   if (data.verification === "review") {
-    const view = reviewText(
+    const view = formatUncertainCallReview(
       {
         server: call.server,
         tool: call.tool,
-        input: JSON.parse(call.args),
         state: call.state,
+        input: JSON.parse(call.args),
       },
       app.options.redact,
     );
@@ -951,19 +1263,23 @@ export async function verifyMcp(
       prefix,
       data.owner,
       data.conversationId,
-      `${literalReview(view.text)}\n\nConsulte o resultado no serviço externo. Confirme somente o que você verificou. O registro libera chamadas futuras; não executa nem repete esta ação. Se ainda houver dúvida, mantenha bloqueado.`,
+      `${literalReview(view.text)}\n\n${
+        view.complete
+          ? "Check the result in the external service. Confirm only what you verified. The record allows future calls; it does not run or repeat this action. If you are still unsure, keep it blocked."
+          : "Verification options are unavailable because part of the content was hidden or shortened. The block stays until it is dismissed; use /resume to dismiss this conversation's uncertain result without repeating the action."
+      }`,
       {
         inline_keyboard: view.complete
           ? [
               [
                 {
-                  text: "Verifiquei: ação concluída",
+                  text: "I checked: action completed",
                   callback_data: make("done"),
                 },
               ],
               [
                 {
-                  text: "Verifiquei: ação não executada",
+                  text: "I checked: action did not run",
                   callback_data: make("not-executed"),
                 },
               ],
@@ -974,7 +1290,7 @@ export async function verifyMcp(
     return;
   }
   if (!["done", "not-executed"].includes(data.verification ?? ""))
-    throw new PolicyError("Verificação inválida.");
+    throw new PolicyError("Invalid verification.");
   const parts = app.store.all<{ state: string; result: string | null }>(
     "SELECT state,result FROM deliveries WHERE id>=? AND id<? ORDER BY rowid",
     `${prefix}:`,
@@ -988,11 +1304,11 @@ export async function verifyMcp(
     parts.some((p) => p.state !== "sent") ||
     (receipt?.message_id ?? receipt?.result?.message_id) !== messageId
   )
-    throw new PolicyError("Revisão não foi entregue integralmente.");
+    throw new PolicyError("The review was not fully delivered.");
   const result = app.mcpCalls.reconcile(
     call.conversationId,
     call.id,
-    `Usuário autorizado declarou ter verificado no serviço externo: ${data.verification === "done" ? "ação concluída" : "ação não executada"}. Nenhuma repetição foi autorizada.`,
+    `An authorized user said they checked the external service: ${data.verification === "done" ? "action completed" : "action did not run"}. No repeat was authorized.`,
   );
   if (result) await app.recordMcpOutcome(result);
   queueControl(
@@ -1000,6 +1316,6 @@ export async function verifyMcp(
     `telegram:mcp-verified:${call.id}`,
     data.owner,
     data.conversationId,
-    "Verificação declarada registrada. Nenhuma chamada foi reenviada.",
+    "Declared verification recorded. No call was resent.",
   );
 }
