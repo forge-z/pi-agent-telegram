@@ -9,8 +9,8 @@ O repositório e o container mantêm o nome `pi-agent-tg` para os volumes e depl
 ## Instalar
 
 ```sh
-git clone https://github.com/forge-z/pi-agent-telegram.git
-cd pi-agent-telegram
+git clone https://github.com/forge-z/pi-bot.git
+cd pi-bot
 cp .env.example .env
 docker compose up -d --build
 ```

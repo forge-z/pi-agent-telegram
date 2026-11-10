@@ -1,3 +1,11 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/c-wordmark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo/c-wordmark-on-light.svg">
+    <img alt="Pi Bot" src="assets/logo/c-wordmark-on-light.svg" width="360">
+  </picture>
+</p>
+
 # Pi-Agent
 
 A personal AI assistant that lives in Telegram: one container, one volume, no web panel. It runs on the [pi.dev](https://pi.dev) harness. Tools come from [Executor](https://executor.sh) and, optionally, [Composio](https://composio.dev).
@@ -9,8 +17,8 @@ The repository and container keep the `pi-agent-tg` name so existing volumes and
 ## Install
 
 ```sh
-git clone https://github.com/forge-z/pi-agent-telegram.git
-cd pi-agent-telegram
+git clone https://github.com/forge-z/pi-bot.git
+cd pi-bot
 cp .env.example .env
 docker compose up -d --build
 ```
