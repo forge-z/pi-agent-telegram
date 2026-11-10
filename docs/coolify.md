@@ -5,7 +5,7 @@ runtime, nunca argumento de build.
 
 ## Pré-requisitos
 
-- Repositório `https://github.com/forge-z/pi-agent-telegram`, branch `main`.
+- Repositório `https://github.com/forge-z/pi-bot`, branch `main`.
 - Docker Engine + Compose v2.24+ (amd64 ou arm64).
 - Um bot Telegram dedicado, sem webhook ativo e sem segundo consumidor de polling.
 
@@ -46,7 +46,7 @@ Faça isso uma vez, fora do Coolify, para não descobrir erro de configuração 
 
 ## 1. Criar o recurso
 
-- **New Resource → Docker Compose**, apontando para `forge-z/pi-agent-telegram` na branch `main`.
+- **New Resource → Docker Compose**, apontando para `forge-z/pi-bot` na branch `main`.
 - **Docker Compose Location**: `docker-compose.yml` (raiz do repositório).
 - O serviço se chama `pi-agent-tg`.
 - **Não** configure domínio, porta ou proxy reverso. O processo usa long polling e o

@@ -155,7 +155,7 @@ topic that asked is told when the machine is ready:
 
 ### Tarefas de código na sandbox (`sandbox_code_task`)
 
-A ferramenta interna é genérica: `config.default.yaml` traz o Instabox como entrada padrão, e servidor, chamada de exec e manifesto de leitura vêm do bloco `sandbox_code_task`. Trocar de sandbox (freestyle.sh, por exemplo) é configurar outro bloco e outro manifesto em `async_jobs`, sem tocar em código.
+`sandbox_code_task` hoje suporta só o Instabox. O bloco em `config.default.yaml`, as variáveis `INSTABOX_*` e `scripts/instabox/` são desse provedor. Apontar o YAML para outro sandbox (freestyle.sh, por exemplo) não faz o bot usá-lo.
 
 ```yaml
 sandbox_code_task:

@@ -1,16 +1,16 @@
-# Pi-Agent
+# Pi Bot
 
 Um assistente de IA pessoal que vive no Telegram: um container, um volume, nenhum painel web. Roda sobre o harness do [pi.dev](https://pi.dev). As ferramentas vêm do [Executor](https://executor.sh) e, se quiser, do [Composio](https://composio.dev).
 
-O repositório e o container mantêm o nome `pi-agent-tg` para os volumes e deploys que já existem. Renomear o volume é uma mudança futura, separada. O serviço do Compose continua `pi-agent-tg` e o volume continua `pi_agent_tg_data`.
+O Pi Bot mantém o serviço do Compose `pi-agent-tg` e o volume `pi_agent_tg_data` para os deploys que já existem. Renomear o volume é uma mudança futura, separada.
 
 **Alfa.** Este projeto ainda está em alfa: espere mudanças incompatíveis, imperfeições e recursos incompletos. Ainda não é recomendado para uso crítico.
 
 ## Instalar
 
 ```sh
-git clone https://github.com/forge-z/pi-agent-telegram.git
-cd pi-agent-telegram
+git clone https://github.com/forge-z/pi-bot.git
+cd pi-bot
 cp .env.example .env
 docker compose up -d --build
 ```

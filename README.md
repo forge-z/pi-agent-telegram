@@ -1,16 +1,24 @@
-# Pi-Agent
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/c-wordmark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo/c-wordmark-on-light.svg">
+    <img alt="Pi Bot" src="assets/logo/c-wordmark-on-light.svg" width="360">
+  </picture>
+</p>
+
+# Pi Bot
 
 A personal AI assistant that lives in Telegram: one container, one volume, no web panel. It runs on the [pi.dev](https://pi.dev) harness. Tools come from [Executor](https://executor.sh) and, optionally, [Composio](https://composio.dev).
 
-The repository and container keep the `pi-agent-tg` name so existing volumes and deployments keep working. Renaming the volume is a separate future change. The Compose service stays `pi-agent-tg` and the volume stays `pi_agent_tg_data`.
+Pi Bot keeps the Compose service `pi-agent-tg` and the volume `pi_agent_tg_data` so existing deployments keep working. Renaming the volume is a separate future change.
 
 **Alpha.** This project is still in alpha: expect breaking changes, rough edges, and incomplete features. It is not yet recommended for critical use.
 
 ## Install
 
 ```sh
-git clone https://github.com/forge-z/pi-agent-telegram.git
-cd pi-agent-telegram
+git clone https://github.com/forge-z/pi-bot.git
+cd pi-bot
 cp .env.example .env
 docker compose up -d --build
 ```
@@ -58,18 +66,18 @@ Steve Jobs closed the 2010 iPad event with "there's an app for that" ([CBS](http
 
 `$DATA_DIR/config.yaml` does not connect servers. Its `mcp_servers` map only classifies tools as read or write. A server with no `tools` list of its own uses the executor globs in `config.default.yaml`.
 
-| Service                                | What it adds                                                                                                                                      |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [AgentMail](https://www.agentmail.to)  | an inbox as a tool: receive, reply, send                                                                                                         |
-| [Browser Use](https://browser-use.com) | a real browser for pages that need clicking, not just reading                                                                                    |
-| [Cal.com](https://cal.com)             | scheduling: availability and bookings as tools                                                                                                   |
-| [Exa](https://exa.ai)                  | web search and content extraction. Hosted MCP `https://mcp.exa.ai/mcp` ([docs](https://exa.ai/docs/get-started/exa-mcp)). Key header: `x-api-key` |
-| [Firecrawl](https://www.firecrawl.dev) | crawl a whole site and extract it as clean text                                                                                                  |
-| [Fish Audio](https://fish.audio)       | speech synthesis the assistant can call ([MCP](https://docs.fish.audio/overview/mcp))                                                            |
-| [GitHub](https://github.com)           | repositories, issues and pull requests ([official MCP](https://github.com/github/github-mcp-server))                                              |
-| [Instabox](https://instabox.sh)        | a Linux sandbox as a tool: real shell, browser and persistent disk — run code, build and publish artifacts                                       |
+| Service                                | What it adds                                                                                                                                       |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [AgentMail](https://www.agentmail.to)  | an inbox as a tool: receive, reply, send                                                                                                           |
+| [Browser Use](https://browser-use.com) | a real browser for pages that need clicking, not just reading                                                                                      |
+| [Cal.com](https://cal.com)             | scheduling: availability and bookings as tools                                                                                                     |
+| [Exa](https://exa.ai)                  | web search and content extraction. Hosted MCP `https://mcp.exa.ai/mcp` ([docs](https://exa.ai/docs/get-started/exa-mcp)). Key header: `x-api-key`  |
+| [Firecrawl](https://www.firecrawl.dev) | crawl a whole site and extract it as clean text                                                                                                    |
+| [Fish Audio](https://fish.audio)       | speech synthesis the assistant can call ([MCP](https://docs.fish.audio/overview/mcp))                                                              |
+| [GitHub](https://github.com)           | repositories, issues and pull requests ([official MCP](https://github.com/github/github-mcp-server))                                               |
+| [Instabox](https://instabox.sh)        | a Linux sandbox as a tool: real shell, browser and persistent disk — run code, build and publish artifacts                                         |
 | [Parallel](https://parallel.ai)        | web search, page extraction, and research. Hosted MCP `https://mcp.parallel.ai/mcp` ([docs](https://docs.parallel.ai/integrations/mcp/quickstart)) |
-| [TinyFish](https://www.tinyfish.ai)    | web search and page fetch                                                                                                                        |
+| [TinyFish](https://www.tinyfish.ai)    | web search and page fetch                                                                                                                          |
 
 A personal assistant usually needs them in this order: mail, web, voice, then scraping, browsing, calendar, code and compute. Voice here means the agent producing audio as a tool result: the bot still answers in text, and a Telegram voice bubble is not implemented.
 
