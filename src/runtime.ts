@@ -10,6 +10,7 @@ import {
 } from "./outbound.js";
 import { deterministicFailure, PendingJobs } from "./pending-jobs.js";
 import { deadlineFailure } from "./mcp-calls.js";
+import { loadOperatorSkills } from "./operator-skills.js";
 import {
   createSandboxCodeTaskTool,
   JOB_INDETERMINATE,
@@ -558,6 +559,9 @@ export class Runtime {
     try {
       app = new Runtime(options);
       app.release = release;
+      // Read once. The same string is returned on every turn, including
+      // scheduled runs, so the prefix stays cacheable. Empty omits the section.
+      const operatorSkills = loadOperatorSkills(options.env ?? process.env);
       const registry = (app.registry = createRegistry());
       registry.install(
         defineExtension({
@@ -582,6 +586,11 @@ export class Runtime {
             section(
               "long-task",
               () => sandboxTaskSteer(app!.options.env ?? process.env),
+              { tag: false },
+            ),
+            section(
+              "operator-skills",
+              () => (operatorSkills ? operatorSkills : undefined),
               { tag: false },
             ),
           ],

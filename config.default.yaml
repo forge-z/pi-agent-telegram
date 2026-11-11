@@ -236,3 +236,15 @@ sandbox_code_task:
       writes:
         type: boolean
         description: "true somente para push, pull request ou comentário. O padrão é false (somente leitura, sem cartão). true pede aprovação no Telegram antes de disparar."
+
+# Operator skills (prompt text on the volume). Not the MCP `skills` tool.
+# Each entry is a folder name under $DATA_DIR/skills/<name>/SKILL.md.
+# The file starts with YAML frontmatter (`name` equal to the folder, and
+# `description`) and a markdown body. Bodies are loaded once at startup and
+# appended, in this order, to the stable system prompt after the base
+# instructions and before MCP sections. They apply to every reply, including
+# scheduled runs. An empty list leaves the prompt unchanged. A missing folder,
+# a missing name, invalid frontmatter, or an unreadable file is logged at
+# startup and skipped; the bot still boots.
+skills:
+  always: []
