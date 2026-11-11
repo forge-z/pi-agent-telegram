@@ -58,6 +58,29 @@ The long-running code task is `sandbox_code_task` (Instabox by default). It is o
 
 [Freestyle](https://freestyle.sh) is another hosted Linux VM sandbox ([docs](https://www.freestyle.sh/docs), [quickstart](https://www.freestyle.sh/docs/quickstart)). This feature does not use it. The shipped `sandbox_code_task` block, the `INSTABOX_*` variables, discovery, and `scripts/instabox/` target Instabox. Freestyle's current docs describe an API and a CLI for those VMs. They do not publish an MCP that runs the VMs, so an entry in the MCP list does not switch the code task to Freestyle.
 
+### Operator skills
+
+Optional instructions on the volume apply to every reply, including scheduled runs. Each skill is a folder, for example `$DATA_DIR/skills/weekly-review/SKILL.md`:
+
+```md
+---
+name: weekly-review
+description: What to check in a weekly review
+---
+
+List what is still open from the week and what can wait.
+```
+
+Name the folders in `$DATA_DIR/config.yaml`. The list replaces the default empty list:
+
+```yaml
+skills:
+  always:
+    - weekly-review
+```
+
+Each body is read once at startup and appended, in that order, to the system prompt after the base instructions and before the MCP sections. An empty list, or a skills folder that is not there, leaves the prompt unchanged. A missing name, invalid frontmatter, or an unreadable file is logged and skipped. The bot still starts.
+
 ## There's an API or MCP for that
 
 Steve Jobs closed the 2010 iPad event with "there's an app for that" ([CBS](https://www.cbsnews.com/news/steve-jobs-at-the-heavenly-gates-theres-an-app-for-that/)). Before adding a capability to the bot, connect an API or an MCP server that already does the job.

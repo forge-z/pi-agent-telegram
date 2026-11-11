@@ -48,6 +48,29 @@ A tarefa longa de código é `sandbox_code_task` (Instabox por padrão). Ela fic
 
 `writes=true` (push, pull request ou comentário) espera o cartão de aprovação. Sem isso a tarefa é somente leitura.
 
+### Skills do operador
+
+Instruções opcionais no volume valem para toda resposta, inclusive os runs agendados. Cada skill é uma pasta, por exemplo `$DATA_DIR/skills/weekly-review/SKILL.md`:
+
+```md
+---
+name: weekly-review
+description: O que verificar numa revisão semanal
+---
+
+Liste o que ainda está aberto na semana e o que pode esperar.
+```
+
+Liste as pastas em `$DATA_DIR/config.yaml`. A lista substitui o padrão, que é vazio:
+
+```yaml
+skills:
+  always:
+    - weekly-review
+```
+
+Cada corpo é lido uma vez na subida e acrescentado, nessa ordem, ao prompt de sistema, depois das instruções base e antes das seções de MCP. Uma lista vazia, ou uma pasta de skills que não existe, deixa o prompt igual. Um nome ausente, frontmatter inválido ou arquivo ilegível é registrado no log e ignorado. O bot sobe mesmo assim.
+
 ## Comandos
 
 O app registra este menu ao subir. Não há o que configurar no BotFather. Os comandos são em inglês.

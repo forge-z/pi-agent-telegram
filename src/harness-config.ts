@@ -25,9 +25,16 @@ export interface HarnessConfig {
   asyncJob: { timeoutMin?: number; pollSeconds?: number };
   /** Raw `sandbox_code_task` block; the tool validates it before registering. */
   sandboxTask?: unknown;
+  /** Folder names under `$DATA_DIR/skills`, in prompt order. */
+  skillsAlways: string[];
 }
 
-const EMPTY: HarnessConfig = { mcpServers: {}, asyncJobs: [], asyncJob: {} };
+const EMPTY: HarnessConfig = {
+  mcpServers: {},
+  asyncJobs: [],
+  asyncJob: {},
+  skillsAlways: [],
+};
 const globCache = new Map<string, RegExp | null>();
 let cache: { key: string; config: HarnessConfig } | undefined;
 
@@ -98,6 +105,17 @@ function schemaProblem(value: unknown): string | undefined {
       }
     }
   }
+  if ("skills" in value && value.skills != null) {
+    if (!isRecord(value.skills)) return "skills precisa ser um mapa";
+    if ("always" in value.skills && value.skills.always != null) {
+      const list = value.skills.always;
+      if (
+        !Array.isArray(list) ||
+        list.some((item) => typeof item !== "string" || item.length === 0)
+      )
+        return "skills.always precisa ser uma lista de textos";
+    }
+  }
   if ("async_jobs" in value && value.async_jobs != null) {
     const jobs = value.async_jobs;
     if (Array.isArray(jobs)) {
@@ -155,6 +173,9 @@ function configFrom(raw: Record<string, unknown>): HarnessConfig {
       pollSeconds: positiveNumber(timing.poll_seconds),
     },
     sandboxTask: raw.sandbox_code_task,
+    skillsAlways: stringList(
+      isRecord(raw.skills) ? raw.skills.always : undefined,
+    ),
   };
 }
 

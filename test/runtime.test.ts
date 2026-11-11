@@ -72,7 +72,12 @@ test("the system prompt has no per-turn clock section", async () => {
       .snapshot()
       .extension("personal-assistant")
       ?.sections?.map((item) => item.key);
-    assert.deepEqual(keys, ["scheduling", "policy", "long-task"]);
+    assert.deepEqual(keys, [
+      "scheduling",
+      "policy",
+      "long-task",
+      "operator-skills",
+    ]);
   } finally {
     await app.close();
     await rm(dir, { recursive: true, force: true });
