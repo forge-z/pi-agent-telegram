@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-image="${1:-pi-agent-tg:validation}"
+image="${1:-pi-bot:validation}"
 fixture_dir="$(mktemp -d /tmp/pi-tg-container.XXXXXX)"
 container="pi-tg-smoke-$$"
 volume="pi-tg-smoke-data-$$"

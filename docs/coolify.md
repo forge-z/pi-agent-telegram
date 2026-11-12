@@ -39,7 +39,7 @@ Faça isso uma vez, fora do Coolify, para não descobrir erro de configuração 
    aceita `max` — nela, use a lista explícita.
 4. **Use um bot novo** e confirme que não há webhook ativo nem outro processo consumindo
    o mesmo token (o app falha fechado se detectar webhook ou segundo consumidor).
-5. **Volume novo.** Não reuse um `pi_agent_tg_data` de outro bot: o app recusa subir com
+5. **Volume novo.** Não reuse um `pi_bot_data` de outro bot: o app recusa subir com
    "Volume pertence a outro bot".
 6. Tenha em mãos o token do bot e os user IDs. Os dois entram no `npm run setup`,
    junto da chave do modelo (ou `npm run login`) e, se houver, Executor ou Composio.
@@ -48,7 +48,7 @@ Faça isso uma vez, fora do Coolify, para não descobrir erro de configuração 
 
 - **New Resource → Docker Compose**, apontando para `forge-z/pi-bot` na branch `main`.
 - **Docker Compose Location**: `docker-compose.yml` (raiz do repositório).
-- O serviço se chama `pi-agent-tg`.
+- O serviço se chama `pi-bot`.
 - **Não** configure domínio, porta ou proxy reverso. O processo usa long polling e o
   compose não declara `ports:`. Expor algo não é necessário e só aumenta a superfície.
 
@@ -151,7 +151,7 @@ build nem necessidade de **Source commit availability → Available during build
 
 ## 4. Volume e persistência
 
-- Volume nomeado `pi_agent_tg_data` montado em `/app/data`.
+- Volume nomeado `pi_bot_data` montado em `/app/data`.
 - Banco: `/app/data/app.sqlite` (SQLite embutido do Node 24; a imagem não traz o
   binário `sqlite3`).
 - **Um único processo por volume.** Não aponte para o volume de outro deploy e não
@@ -176,7 +176,7 @@ costuma ser só isso.
 
 ## 6. Verificação pós-deploy
 
-- `docker compose ps` e `docker compose logs --tail=100 pi-agent-tg`.
+- `docker compose ps` e `docker compose logs --tail=100 pi-bot`.
 - No terminal do serviço (Coolify): `node scripts/diagnose-tg-runtime.mjs` ou
   `npm run diagnose`.
 - Defina o modelo padrão (opcional, mas recomendado para quem não vai usar `/model`):
@@ -198,7 +198,17 @@ imagem.
 
 ## 8. Atualização e rollback
 
-- Push na `main` dispara o workflow **Verify pi-agent-tg Telegram agent**, que roda
+### Upgrading from pi-agent-tg
+
+O serviço do Compose é `pi-bot` e o volume nomeado é `pi_bot_data`, ainda montado em `/app/data`. Um volume renomeado é um volume novo e vazio. Para manter os dados, pare o container, copie o volume antigo para o novo, faça o deploy e confira `/status`. Guarde o volume antigo como backup por alguns dias.
+
+```sh
+docker run --rm -v old:/from -v new:/to alpine cp -a /from/. /to/
+```
+
+`old` é o volume existente `pi_agent_tg_data` e `new` é `pi_bot_data`. Use os nomes de `docker volume ls` quando o Compose tiver acrescentado o prefixo do projeto.
+
+- Push na `main` dispara o workflow **Verify pi-bot Telegram agent**, que roda
   `check`, `lint`, `format:check`, `build`, a suíte offline, `docker compose config` e o
   smoke do container.
 - Rebuild local: `npm run compose:up`, ou

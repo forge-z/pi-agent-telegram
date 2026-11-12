@@ -10,8 +10,6 @@
 
 A personal AI assistant that lives in Telegram: one container, one volume, no web panel. It runs on the [pi.dev](https://pi.dev) harness. Tools come from [Executor](https://executor.sh) and, optionally, [Composio](https://composio.dev).
 
-Pi Bot keeps the Compose service `pi-agent-tg` and the volume `pi_agent_tg_data` so existing deployments keep working. Renaming the volume is a separate future change.
-
 **Alpha.** This project is still in alpha: expect breaking changes, rough edges, and incomplete features. It is not yet recommended for critical use.
 
 ## Install
@@ -146,6 +144,16 @@ The app registers this menu on start. There is nothing to set in BotFather.
 Each native topic (a forum topic) has its own history, model, and effort.
 
 ## Upgrade
+
+### Upgrading from pi-agent-tg
+
+The Compose service is `pi-bot` and the named volume is `pi_bot_data`, still mounted at `/app/data`. A renamed volume is a new empty volume. To keep data, stop the container, copy the old volume into the new one, then deploy and check `/status`. Keep the old volume as a backup for a few days.
+
+```sh
+docker run --rm -v old:/from -v new:/to alpine cp -a /from/. /to/
+```
+
+`old` is the existing `pi_agent_tg_data` volume and `new` is `pi_bot_data`. Use the names from `docker volume ls` when Compose has prefixed them with the project name.
 
 Back up the volume before upgrading. The first boot of this release migrates `pending_jobs` by adding columns. SQLite `ALTER TABLE` has no down migration. On startup, leftover `mcp_calls` rows whose id starts with `mcp-stage:` are deleted, and a call left `running` is reclassified (`failed` for a read, `uncertain` for a write). The jobs poller then deletes finished job rows older than 30 days. Open rows stay. There is no rollback of that data: restore the backup if you need the previous volume. The earlier `durable.sqlite` migration to schema 2, from the previous release, still has no rollback either.
 

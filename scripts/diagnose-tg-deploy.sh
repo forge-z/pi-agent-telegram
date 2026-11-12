@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline-safe checks for the pi-agent-tg Telegram deployment. Never prints secret values.
+# Offline-safe checks for the pi-bot Telegram deployment. Never prints secret values.
 set -euo pipefail
 
 ROOT="${1:-.}"
@@ -47,7 +47,7 @@ fi
 section "Containers"
 docker compose ps 2>/dev/null || true
 
-SERVICE=pi-agent-tg
+SERVICE=pi-bot
 section "Últimas linhas de log (sem filtro de segredo — revise antes de colar em chat público)"
 docker compose logs --tail=80 "$SERVICE" 2>/dev/null || echo "sem logs para $SERVICE"
 
@@ -80,5 +80,5 @@ cat <<'EOF'
 - Sem LLM_MODELS o catálogo vem de GET {LLM_BASE_URL}/models e fica sem reasoning.
 - Padrão global: npm run setup -- --list. /model troca o modelo no chat.
 - Rebuild após git pull: SOURCE_COMMIT=$(git rev-parse HEAD) docker compose up -d --build
-- Um processo por volume: use o volume dedicado pi_agent_tg_data.
+- Um processo por volume: use o volume dedicado pi_bot_data.
 EOF

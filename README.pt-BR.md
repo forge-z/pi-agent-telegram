@@ -2,8 +2,6 @@
 
 Um assistente de IA pessoal que vive no Telegram: um container, um volume, nenhum painel web. Roda sobre o harness do [pi.dev](https://pi.dev). As ferramentas vêm do [Executor](https://executor.sh) e, se quiser, do [Composio](https://composio.dev).
 
-O Pi Bot mantém o serviço do Compose `pi-agent-tg` e o volume `pi_agent_tg_data` para os deploys que já existem. Renomear o volume é uma mudança futura, separada.
-
 **Alfa.** Este projeto ainda está em alfa: espere mudanças incompatíveis, imperfeições e recursos incompletos. Ainda não é recomendado para uso crítico.
 
 ## Instalar
@@ -91,6 +89,16 @@ O app registra este menu ao subir. Não há o que configurar no BotFather. Os co
 Cada tópico nativo (tópico de forum) tem o próprio histórico, modelo e esforço.
 
 ## Atualizar
+
+### Upgrading from pi-agent-tg
+
+O serviço do Compose é `pi-bot` e o volume nomeado é `pi_bot_data`, ainda montado em `/app/data`. Um volume renomeado é um volume novo e vazio. Para manter os dados, pare o container, copie o volume antigo para o novo, faça o deploy e confira `/status`. Guarde o volume antigo como backup por alguns dias.
+
+```sh
+docker run --rm -v old:/from -v new:/to alpine cp -a /from/. /to/
+```
+
+`old` é o volume existente `pi_agent_tg_data` e `new` é `pi_bot_data`. Use os nomes de `docker volume ls` quando o Compose tiver acrescentado o prefixo do projeto.
 
 Faça backup do volume antes de atualizar. O primeiro boot desta release migra `pending_jobs` acrescentando colunas. O `ALTER TABLE` do SQLite não tem migração de volta. Na subida, linhas antigas de `mcp_calls` cujo id começa com `mcp-stage:` são apagadas, e uma chamada que ficou `running` é reclassificada (`failed` se era leitura, `uncertain` se era escrita). O poller de jobs apaga em seguida as linhas de jobs já terminados com mais de 30 dias. Linhas abertas permanecem. Não há rollback desses dados: restaure o backup se precisar do volume anterior. A migração anterior do `durable.sqlite` para o schema 2, da release passada, também continua sem rollback.
 

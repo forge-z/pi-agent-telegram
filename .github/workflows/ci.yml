@@ -1,4 +1,4 @@
-name: Verify pi-agent-tg Telegram agent
+name: Verify pi-bot Telegram agent
 on:
   push:
   pull_request:
@@ -22,5 +22,5 @@ jobs:
         run: docker compose config --quiet
       - name: Build container and inspect offline runtime
         run: |
-          docker build -t pi-agent-tg:test .
-          scripts/smoke-container.sh pi-agent-tg:test
+          docker build -t pi-bot:test .
+          scripts/smoke-container.sh pi-bot:test
