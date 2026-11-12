@@ -1,5 +1,5 @@
 services:
-  pi-agent-tg:
+  pi-bot:
     build:
       context: .
     restart: unless-stopped
@@ -13,7 +13,7 @@ services:
     # NODE_ENV and DATA_DIR are fixed in the image (Dockerfile ENV).
 
     volumes:
-      - pi_agent_tg_data:/app/data
+      - pi_bot_data:/app/data
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m
@@ -30,4 +30,4 @@ services:
     stop_grace_period: 45s
 
 volumes:
-  pi_agent_tg_data:
+  pi_bot_data:
