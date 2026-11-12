@@ -110,6 +110,10 @@ import { recentChatLines, scheduledChat } from "./telegram-reply.js";
 import { Commands, CommandError, type CommandAccess } from "./commands.js";
 import { MAX_TEXT, REQUEST_ID } from "./limits.js";
 import { conversationUsageTool } from "./conversation-usage.js";
+import {
+  executorDecidesApproval,
+  loadHarnessConfig,
+} from "./harness-config.js";
 import { LoopGuard, scheduledApprovalRefusal } from "./guards.js";
 
 interface RequestTelegramRoute extends TelegramRoute {
@@ -1277,10 +1281,18 @@ export class Runtime {
                 outputLimits: { maxBytes: 65536, maxLines: 2000 },
                 execute: async (args, api, callContext) => {
                   const conversationId = String(api.conversationId);
-                  const refusal = scheduledApprovalRefusal(
-                    this.scheduledTurn(conversationId),
-                    mcpCallIsReadOnly(tool.name, args),
-                  );
+                  // Executor, and any server that inherits its tool list, decides
+                  // approval. A server with its own list still refuses a non-read
+                  // before send when a scheduled run cannot wait.
+                  const refusal = executorDecidesApproval(
+                    loadHarnessConfig(),
+                    server.server,
+                  )
+                    ? null
+                    : scheduledApprovalRefusal(
+                        this.scheduledTurn(conversationId),
+                        mcpCallIsReadOnly(tool.name, args),
+                      );
                   if (refusal)
                     return {
                       output: [{ type: "text" as const, text: refusal }],

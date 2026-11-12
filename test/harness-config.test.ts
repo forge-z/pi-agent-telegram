@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../src/store.js";
 import { mcpCallIsReadOnly } from "../src/mcp-calls.js";
-import { globMatch, loadHarnessConfig } from "../src/harness-config.js";
+import {
+  executorDecidesApproval,
+  globMatch,
+  loadHarnessConfig,
+} from "../src/harness-config.js";
 import { loadManifests } from "../src/job-manifest.js";
 import { PendingJobs } from "../src/pending-jobs.js";
 import type { Runtime } from "../src/runtime.js";
@@ -159,6 +163,30 @@ test("invalid yaml is logged and the defaults stay", async () => {
     );
   } finally {
     console.error = original;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("executor and a server with no tool list of its own let Executor decide approval", async () => {
+  const defaults = loadHarnessConfig({
+    CONFIG_FILE: join(tmpdir(), "missing-approval.yaml"),
+  });
+  assert.equal(executorDecidesApproval(defaults, "executor"), true);
+  assert.equal(executorDecidesApproval(defaults, "composio"), false);
+  assert.equal(executorDecidesApproval(defaults, "notes"), true);
+
+  const root = await dir();
+  const path = join(root, "inherit.yaml");
+  await writeFile(
+    path,
+    ["mcp_servers:", "  notes:", "    trust: trusted", ""].join("\n"),
+  );
+  try {
+    const config = loadHarnessConfig({ CONFIG_FILE: path });
+    assert.equal(executorDecidesApproval(config, "notes"), true);
+    assert.equal(executorDecidesApproval(config, "composio"), false);
+    assert.equal(config.mcpServers.notes?.ownTools, false);
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

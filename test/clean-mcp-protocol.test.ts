@@ -11,6 +11,7 @@ import { z } from "zod";
 import { McpGateway } from "../src/mcp.js";
 import { McpCalls } from "../src/mcp-calls.js";
 import { Store } from "../src/store.js";
+import { SCHEDULED_APPROVAL_REFUSAL } from "../src/guards.js";
 
 async function until(check: () => boolean) {
   for (let n = 0; n < 400; n++) {
@@ -201,9 +202,17 @@ test("a scheduled occurrence skips an approval pause instead of waiting for a cl
       true,
     );
     assert.equal(result.isError, true);
-    assert.match(JSON.stringify(result.content), /Passo pulado/);
+    assert.match(JSON.stringify(result.content), /write:/);
+    assert.match(
+      JSON.stringify(result.content),
+      new RegExp(SCHEDULED_APPROVAL_REFUSAL),
+    );
     // No card, no pending waiter: nothing to click, nothing to resume.
     assert.equal(f.ledger.interactions("1").length, 0);
+    assert.deepEqual(
+      f.calls.map((call) => call.tool),
+      ["execute"],
+    );
     assert.equal(
       f.store.get<{ state: string }>("SELECT state FROM mcp_calls")?.state,
       "uncertain",
