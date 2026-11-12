@@ -23,9 +23,9 @@
     "compose:up": "bash scripts/compose-up.sh"
   },
   "dependencies": {
-    "@earendil-works/chord": "1.5.0",
-    "@earendil-works/pi-ai": "1.5.0",
-    "@earendil-works/pi-durable": "1.5.0",
+    "@earendil-works/chord": "1.5.2",
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-durable": "1.5.2",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "cron-parser": "5.10.1",
     "marked": "18.1.0",

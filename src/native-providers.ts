@@ -4,7 +4,7 @@ import type { MutableModels, Provider } from "@earendil-works/pi-ai/models";
 import type { Model } from "@earendil-works/pi-ai";
 
 /**
- * Official pi-ai providers (package 1.5.0 `builtinProviders()`), keyed by the
+ * Official pi-ai providers (package 1.5.2 `builtinProviders()`), keyed by the
  * library's own id. The generic `llm` client is not one of them.
  */
 let cached: Provider[] | undefined;

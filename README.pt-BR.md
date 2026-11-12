@@ -108,6 +108,7 @@ Voltar a imagem sem restaurar o backup deixa o ledger numa forma que a release a
 
 ## Notas
 
+- O harness é o Pi 1.5.2 (`pi-ai`, `pi-durable` e `chord`). As conversas ficam no `durable.sqlite`. O processo roda sem terminal, então um turno segue sem pedir Continue, Fork ou Cancel. A busca de MCP adiado encontra uma ferramenta cujo schema só nomeia um modelo por um `$ref` local.
 - Histórico, credenciais e o ledger são tão privados quanto o volume e o host.
 - O assistente não tem shell, arquivo, patch nem browser próprios. O que volta do MCP é dado não confiável.
 - Notas de deploy: [docs/coolify.md](docs/coolify.md) e [docs/verification.md](docs/verification.md).

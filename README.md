@@ -161,6 +161,7 @@ Rolling the image back without restoring the backup leaves the ledger on a shape
 
 ## Notes
 
+- The harness is Pi 1.5.2 (`pi-ai`, `pi-durable`, and `chord`). Conversations stay in `durable.sqlite`. The process is headless, so a turn runs without a Continue, Fork, or Cancel prompt. Deferred MCP search matches a tool whose parameters only name a model through a local `$ref`.
 - Chat history, credentials, and the ledger are only as private as the volume and the host.
 - The assistant has no shell, file, patch, or browser of its own. MCP results are untrusted data.
 - Deployment notes: [docs/coolify.md](docs/coolify.md) and [docs/verification.md](docs/verification.md).

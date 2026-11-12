@@ -133,7 +133,7 @@ e `medium` e aceita `max`:
 LLM_MODELS=deepseek-flash|1000000|384000|off+low+high+max
 ```
 
-Esses valores vêm do catálogo do `pi-ai` 1.4.0 que embute `deepseek-flash` com
+Esses valores vêm do catálogo do `pi-ai` 1.5.2 que embute `deepseek-flash` com
 `contextWindow=1000000`, `maxTokens=384000` e esse mapa de níveis (`off/low/high/max`).
 
 ### Nunca use build args para segredos
