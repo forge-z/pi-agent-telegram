@@ -23,10 +23,11 @@ import {
 import {
   globMatch,
   loadHarnessConfig,
+  executorDecidesApproval,
   mcpServerPolicy,
   type HarnessConfig,
 } from "./harness-config.js";
-import { APPROVAL_EXPIRE_MS } from "./guards.js";
+import { APPROVAL_EXPIRE_MS, SCHEDULED_APPROVAL_REFUSAL } from "./guards.js";
 
 export interface McpCall {
   id: string;
@@ -292,6 +293,35 @@ function buildExecutorResumeArgs(
 // model not to summarize the step it skipped.
 const APPROVAL_SKIPPED =
   "Passo pulado: execução agendada não pode aguardar aprovação humana. Nenhuma retomada automática foi enviada. Não resuma este passo como concluído.";
+
+function namedTool(value: Record<string, unknown>) {
+  const invocation = object(value.invocation) ? value.invocation : undefined;
+  const fromInvocation =
+    invocation && typeof invocation.tool === "string"
+      ? invocation.tool.trim()
+      : "";
+  if (fromInvocation) return fromInvocation;
+  return typeof value.tool === "string" ? value.tool.trim() : "";
+}
+
+/** The action Executor held, or the tool this call actually ran. */
+function approvalToolPath(
+  tool: string,
+  args: Record<string, unknown>,
+  paused: Record<string, unknown> | undefined,
+  bodies: Record<string, unknown>[],
+) {
+  const pausedName = paused ? namedTool(paused) : "";
+  if (pausedName) return pausedName;
+  for (const body of bodies) {
+    const name = namedTool(body);
+    if (name) return name;
+  }
+  const inner = effectiveToolCalls("", tool, args)
+    .map((item) => item.target.trim())
+    .filter((target) => target && target !== tool);
+  return inner[0] || tool;
+}
 const REJECTION = new Set(["InputInvalid", "InvalidToolInput", "UnknownTool"]);
 
 function walkPayload(
@@ -1002,17 +1032,28 @@ export class McpCalls {
       let unsupportedPause =
         browserMode ||
         (!result.isError && !paused && this.hasPauseMarker(result));
-      // A scheduled run cannot wait for a human click: skip the step, tell the model
-      // and let the run continue. This is never an automatic approval or resume.
+      // A scheduled run cannot wait for a human click. Executor's own
+      // approval-required pause is refused with the tool path: no card, no resume.
+      // Any other scheduled pause keeps the existing skip instruction.
+      const candidates = this.pauseCandidates(result);
+      const executorApproval =
+        executorDecidesApproval(loadHarnessConfig(), call.server) &&
+        (paused?.status === "approval-required" ||
+          candidates.some(
+            (body) => executorPauseKind(body) === "approval-required",
+          ));
       const skippedApproval = scheduled && (!!paused || unsupportedPause);
       if (skippedApproval) {
+        const text = executorApproval
+          ? `${approvalToolPath(tool, args, paused, candidates)}: ${SCHEDULED_APPROVAL_REFUSAL}`
+          : APPROVAL_SKIPPED;
         paused = undefined;
         unsupportedPause = false;
         result.isError = true;
-        result.content.push({
-          type: "text",
-          text: APPROVAL_SKIPPED,
-        });
+        if (executorApproval) {
+          result.content = [{ type: "text", text }];
+          delete result.structuredContent;
+        } else result.content.push({ type: "text", text });
       } else if (unsupportedPause) {
         result.isError = true;
         result.content.push({

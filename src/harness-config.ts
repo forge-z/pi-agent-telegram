@@ -194,10 +194,28 @@ export function userConfigPath(env: Env = process.env) {
   return join(env.DATA_DIR?.trim() || "data", "config.yaml");
 }
 
+/** The tool list this server uses. No list of its own means executor's list. */
+function toolListSource(config: HarnessConfig, server?: string) {
+  const named = server ? config.mcpServers[server] : undefined;
+  return named?.ownTools ? named : config.mcpServers.executor;
+}
+
+/**
+ * Executor decides approval for itself and for any server that inherits its
+ * tool list. A server with its own `tools` list keeps the local write gate.
+ */
+export function executorDecidesApproval(
+  config: HarnessConfig,
+  server?: string,
+) {
+  const source = toolListSource(config, server);
+  return !!source && source === config.mcpServers.executor;
+}
+
 /** Lists for one MCP server. A server with no `tools` of its own uses executor's. */
 export function mcpServerPolicy(config: HarnessConfig, server?: string) {
   const named = server ? config.mcpServers[server] : undefined;
-  const source = named?.ownTools ? named : config.mcpServers.executor;
+  const source = toolListSource(config, server);
   return {
     read: source?.read ?? [],
     write: source?.write ?? [],

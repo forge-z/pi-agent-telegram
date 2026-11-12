@@ -33,6 +33,8 @@ O menu edita uma seção de cada vez. **Save and back** grava essa seção. **Sa
 4. **Audio model**
 5. **MCP platform** — Executor, Composio, os dois, ou nenhum.
 
+O Executor decide quais chamadas precisam de aprovação; o bot só encaminha essa pausa. Não há uma segunda aprovação a partir das listas de leitura/escrita. No chat, a pausa é o cartão que já existe. Num run agendado a chamada é enviada, e se o Executor devolver approval-required a ferramenta falha com `needs approval; not available in scheduled runs` mais o caminho da ferramenta. Não há cartão e não há resume. Um servidor sem lista `tools` própria usa as listas do Executor e a mesma regra. O Composio tem lista própria: uma escrita continua recusada antes do envio num run agendado. `writes=true` em `sandbox_code_task` continua esperando o cartão.
+
 Não existe comando `/login`. O OAuth precisa de callback em localhost ou da URL de redirect colada.
 
 Variáveis de ambiente são overrides opcionais. Quando uma está definida, ela vence o valor gravado no volume. `TZ` é o relógio do container (o horário dos logs). Cada agendamento guarda o próprio fuso IANA. O setup não grava `TZ`. Sem ela, o relógio fica em UTC.

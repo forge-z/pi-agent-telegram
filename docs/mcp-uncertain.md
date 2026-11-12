@@ -2,6 +2,8 @@
 
 Quando uma escrita MCP perde o retorno (timeout, queda depois do envio, falha ao gravar o cartão), a linha em `mcp_calls` fica `uncertain`. Isso fica no SQLite e sobrevive a reinício. A chamada não é reenviada. A incerteza bloqueia novas ações **naquele servidor**; outro servidor da mesma conversa continua. Uma leitura continua disponível e **não** apaga a incerteza.
 
+A lista leitura/escrita não decide a aprovação do Executor: quem decide é o Executor, e o bot só encaminha a pausa. A lista continua decidindo resultado incerto, timeout e se uma escrita pode ser repetida.
+
 `/resume` marca todas as incertezas da conversa como `skipped` e registra no log. A resposta avisa, em inglês, que a chamada pode já ter sido executada (por exemplo, um e-mail pode ter saído) antes de o agente continuar. O mesmo comando também retoma uma tarefa estacionada por quedas, e faz as duas coisas numa resposta só quando as duas estão pendentes. `/status` lista cada incerteza e oferece o cartão de verificação. O cartão mostra servidor, ferramenta, alvo e parâmetros em texto. Se o conteúdo teve de ser ocultado, os botões de confirmação não aparecem e o texto aponta `/resume` como saída.
 
 ## O que conta como leitura

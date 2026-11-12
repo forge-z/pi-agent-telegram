@@ -8,18 +8,28 @@
 # - Invalid YAML or schema violations are logged at startup and ignored; the runner continues with defaults.
 #
 # Tool classification (read/write precedence):
-# 1. Matching 'write' glob -> write (pauses for approval card).
-# 2. Matching 'read' glob -> read (safe/read-only, executes automatically).
+# 1. Matching 'write' glob -> write.
+# 2. Matching 'read' glob -> read.
 # 3. annotations.readOnlyHint === true from tools/list -> read ONLY if server has trust: trusted;
 #    untrusted servers ignore readOnlyHint and treat the tool as a write.
 # 4. Otherwise -> write.
+#
+# Read/write decides uncertain results, timeouts, and whether a write is retried.
+# It is not an approval gate for `executor`, or for a server with no `tools`
+# list of its own (that server inherits executor's lists). Executor decides
+# approval; the bot only relays the pause. The call is sent. Interactive: the
+# existing card. Scheduled: an approval-required pause fails the call with
+# "needs approval; not available in scheduled runs" plus the tool path. No card
+# and no resume. A server with its own `tools` list (composio) still refuses a
+# write in a scheduled run before the call is sent.
+# `sandbox_code_task` writes=true still waits for its own card.
 #
 # Meta/protocol tools:
 # 'search', 'describe', and 'skills' stay hardcoded reads in code; the model cannot call 'resume'.
 
 mcp_servers:
   # Map of MCP server names to their trust level and tool lists.
-  # Servers without their own 'tools' list inherit from 'executor'.
+  # Servers without their own 'tools' list inherit executor's lists and its approval.
   executor:
     # trust: 'trusted' | 'untrusted' (default). Only trusted servers honor annotations.readOnlyHint as reads.
     trust: untrusted
@@ -62,6 +72,7 @@ mcp_servers:
       write: []
   # Composio slugs are TOOLKIT_ACTION. An infix verb (*_GET_*, *_LIST_*, *_SEARCH_*, and the same set) is a read.
   composio:
+    # Own tool list, so a scheduled write is still refused before it is sent.
     trust: untrusted
     tools:
       read:

@@ -103,7 +103,9 @@ A poller tick that throws is recorded on `health().last_tick_error` and logged a
 The supported one is **v2, the cloud build** (`https://mcp.executor.sh/mcp`):
 integrations are Executor apps, and their approval policy is part of the app — a tool that must
 return a value to the caller (like `agent.automation.runAsync`) is declared without approval,
-because an approval pause drops that value on resume.
+because an approval pause drops that value on resume. The bot relays that pause and does not
+add a second approval of its own. An interactive pause is the existing card. A scheduled run
+cannot wait, so an approval-required pause fails that call and resume is not sent.
 
 ## Migrating from v1
 
