@@ -944,7 +944,13 @@ test("configuration only registers API credentials and validates endpoint/model 
     ).includes("high"),
   );
   assert.deepEqual(parseLlmModels("one|32768|4096|true"), [
-    { id: "one", contextWindow: 32768, maxTokens: 4096, reasoning: true },
+    {
+      id: "one",
+      contextWindow: 32768,
+      maxTokens: 4096,
+      reasoning: true,
+      reasoningDeclared: true,
+    },
   ]);
   assert.deepEqual(
     parseLlmModels("a,a")!.map((model) => model.id),
@@ -1221,41 +1227,74 @@ test("status after restart reconciles only the explicitly verified action withou
       reason: "answered",
     });
     await f.app.mcpCalls.execute(id, 1, "executor", "execute", {});
-    const lost = f.app.mcpCalls.list(id)[0];
-    // A second independent uncertain effect must survive verification of the first.
+    const answered = f.app.mcpCalls.list(id)[0];
+    // The server answered. That is a known failure, not a lost mutation.
+    assert.equal(answered.state, "failed");
+    await f.bot.flush();
+    assert.equal(
+      f.views.filter((view) => /Não sei se a chamada/.test(view.text)).length,
+      0,
+    );
+    // A dropped write keeps no result. A second server stays blocked on its own.
+    f.app.store.run(
+      "UPDATE mcp_calls SET state='uncertain', result=NULL WHERE id=?",
+      answered.id,
+    );
     f.app.store.run(
       "INSERT INTO mcp_calls VALUES ('other-lost',?,'other-server','write','{}','uncertain',NULL,'binding',0)",
       id,
     );
     await f.restart();
-    assert.equal(f.app.mcpCalls.list(id)[0].state, "uncertain");
-    assert.equal(f.app.mcpCalls.list(id)[1].state, "uncertain");
+    assert.equal(
+      f.app.mcpCalls.list(id).find((call) => call.id === answered.id)?.state,
+      "uncertain",
+    );
+    assert.equal(
+      f.app.mcpCalls.list(id).find((call) => call.id === "other-lost")?.state,
+      "uncertain",
+    );
     f.setResult({ status: "completed" });
     await f.app.mcpCalls.execute(id, 2, "executor", "search", {});
-    assert.equal(f.app.mcpCalls.list(id)[0].state, "uncertain");
+    assert.equal(
+      f.app.mcpCalls.list(id).find((call) => call.id === answered.id)?.state,
+      "uncertain",
+    );
     await f.send("/status");
     const card = f.views.findLast(
       (view) =>
-        /executor/.test(view.text) &&
+        /Não sei se a chamada ao executor \(execute\)/.test(view.text) &&
         view.markup?.inline_keyboard
           .flat()
-          .some((button) => button.text.includes("Record")),
+          .some((button) => button.text.includes("Registrar")),
     )!;
-    assert.match(card.text, /uncertain/);
+    assert.doesNotMatch(card.text, /<pre>/);
     assert.ok(
-      f.views.some((view) => /executor \/ execute: uncertain/.test(view.text)),
+      f.views.some((view) =>
+        /Não sei se a chamada ao executor \(execute\)/.test(view.text),
+      ),
     );
     assert.ok(
       f.views.some((view) =>
-        /other-server \/ write: uncertain/.test(view.text),
+        /Não sei se a chamada ao other-server \(write\)/.test(view.text),
       ),
     );
-    await f.click(f.button("Record", card), card);
-    const review = f.views.at(-1)!;
-    await f.click(f.button("I checked: action completed", review), review);
-    assert.equal(f.app.mcpCalls.list(id)[0].state, "reconciled");
+    const notices = f.views.filter((view) =>
+      /Não sei se a chamada/.test(view.text),
+    );
+    await f.send("/status");
     assert.equal(
-      f.app.mcpCalls.list(id).find((call) => call.id === lost.id)?.state,
+      f.views.filter((view) => /Não sei se a chamada/.test(view.text)).length,
+      notices.length,
+    );
+    await f.click(f.button("Registrar", card), card);
+    const review = f.views.at(-1)!;
+    assert.match(
+      review.text,
+      /Confira no serviço se deu certo antes de confirmar/,
+    );
+    await f.click(f.button("Deu certo", review), review);
+    assert.equal(
+      f.app.mcpCalls.list(id).find((call) => call.id === answered.id)?.state,
       "reconciled",
     );
     assert.equal(
@@ -2768,7 +2807,7 @@ test("flush delivers assistant replies before uncertain MCP side effects run", a
     );
     f.app.store.run(
       `INSERT INTO mcp_calls(id,conversationId,server,tool,args,state,result,binding,updatedAt)
-       VALUES ('lost-prio','REPLACED','executor','execute','{}','uncertain','{"isError":true}','executor',0)`.replace(
+       VALUES ('lost-prio','REPLACED','executor','execute','{}','uncertain',NULL,'executor',0)`.replace(
         "REPLACED",
         id,
       ),
@@ -2780,7 +2819,7 @@ test("flush delivers assistant replies before uncertain MCP side effects run", a
       "a resposta já enfileirada deve ser entregue",
     );
     assert.ok(
-      texts.some((t) => t.includes("uncertain MCP result")),
+      texts.some((t) => t.includes("Não sei se a chamada")),
       "o aviso incerto deve ser entregue no mesmo flush",
     );
   } finally {
@@ -2788,7 +2827,7 @@ test("flush delivers assistant replies before uncertain MCP side effects run", a
   }
 });
 
-test("flush delivers a queued assistant reply when a persisted uncertain MCP notice is pending", async () => {
+test("a returned tool error marked uncertain does not notify, and the reply still goes out", async () => {
   const f = await fixture();
   try {
     await f.send("/status");
@@ -2811,9 +2850,9 @@ test("flush delivers a queued assistant reply when a persisted uncertain MCP not
     const before = f.views.length;
     await f.bot.flush();
     const texts = f.views.slice(before).map((v) => v.text);
-    assert.ok(
-      texts.some((t) => t.includes("uncertain MCP result")),
-      "deve enfileirar aviso de MCP incerto",
+    assert.equal(
+      texts.some((t) => t.includes("Não sei se a chamada")),
+      false,
     );
     assert.ok(
       texts.some((t) => t.includes("Resposta do assistente")),

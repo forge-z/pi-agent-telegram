@@ -200,10 +200,35 @@ export interface ToolGateway {
 interface McpCallOptions {
   signal?: AbortSignal;
   binding?: string;
+  /** A read may be retried after a dropped connection. A mutation may not. */
+  readOnly?: boolean;
   onElicitation?: (
     params: ElicitRequest["params"],
     signal?: AbortSignal,
   ) => Promise<ElicitResult>;
+}
+/** One or two extra tries. The pause stays short so a dead server is not a wait. */
+const TRANSIENT_RETRIES = 2;
+function retryPause(attempt: number) {
+  return new Promise((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
+}
+function errorText(error: unknown) {
+  return error instanceof Error ? error.message : String(error ?? "");
+}
+/** A fast transport drop after a read. Timeouts already spent the budget. */
+function retryableReadDrop(error: unknown) {
+  if (
+    error instanceof PolicyError ||
+    error instanceof McpUrlElicitationRequiredError
+  )
+    return false;
+  if (
+    /does not match the tool output schema|invalid URL interaction|refused authentication|HTTP 401|HTTP 403/i.test(
+      errorText(error),
+    )
+  )
+    return false;
+  return true;
 }
 export interface McpCatalog {
   server: string;
@@ -857,13 +882,14 @@ export class McpGateway implements ToolGateway {
     args: Record<string, unknown>,
     options: McpCallOptions = {},
   ) {
-    for (let attempt = 0; ; attempt++) {
+    for (let attempt = 0; attempt <= TRANSIENT_RETRIES; attempt++) {
       if (options.signal?.aborted)
         throw new McpNotSentError("MCP call cancelled before it was sent.");
       let client: Client;
       try {
         client = await this.ensureLiveClient(server, options.signal);
       } catch (error) {
+        // The probe already retried a dead session once. Do not multiply that.
         const safe =
           error instanceof McpError || error instanceof PolicyError
             ? error
@@ -894,9 +920,11 @@ export class McpGateway implements ToolGateway {
       // This abort is the hard limit; the call still counts progress separately.
       const deadline = new AbortController();
       const deadlineTimer = setTimeout(() => deadline.abort(), timeout);
+      let sent = false;
       try {
+        sent = true;
         // A session can still end after the probe or a trusted hop. Once
-        // callTool starts, any failure remains uncertain and must not be replayed.
+        // callTool starts, a mutation is not replayed: the outcome is unknown.
         const result = await this.withLock(
           server,
           "shared",
@@ -935,7 +963,46 @@ export class McpGateway implements ToolGateway {
           );
         return parsed;
       } catch (error) {
-        if (deadline.signal.aborted) throw new McpError(MCP_TIMEOUT_ERROR);
+        const timedOut = deadline.signal.aborted;
+        const sessionLost = this.expired.has(client);
+        if (sessionLost) {
+          await this.withLock(server, "exclusive", async () => {
+            await this.discard(server, client);
+          });
+        }
+        // Reads are safe to send again after a fast drop. A timeout already
+        // waited, and a mutation that left the client is never repeated.
+        if (
+          sent &&
+          options.readOnly === true &&
+          !timedOut &&
+          sessionLost &&
+          attempt < TRANSIENT_RETRIES &&
+          !options.signal?.aborted
+        ) {
+          console.warn(
+            `Pi-Agent: MCP read ${server}/${tool} dropped after it was sent; retrying.`,
+          );
+          await retryPause(attempt);
+          continue;
+        }
+        if (
+          sent &&
+          options.readOnly === true &&
+          !timedOut &&
+          !sessionLost &&
+          retryableReadDrop(error) &&
+          attempt < TRANSIENT_RETRIES &&
+          !options.signal?.aborted
+        ) {
+          console.warn(
+            `Pi-Agent: MCP read ${server}/${tool} hit a transport error; retrying.`,
+          );
+          await this.releaseSession(server);
+          await retryPause(attempt);
+          continue;
+        }
+        if (timedOut) throw new McpError(MCP_TIMEOUT_ERROR);
         // URL completion never authorizes replay, including locally classified reads.
         if (
           error &&
@@ -944,15 +1011,10 @@ export class McpGateway implements ToolGateway {
           error.code === -32042
         )
           throw safeError(error);
-        if (this.expired.has(client)) {
-          await this.withLock(server, "exclusive", async () => {
-            await this.discard(server, client);
-          });
-          // A lost session after dispatch is not replayed. The result stays uncertain.
+        if (sessionLost)
           throw new McpSessionError(
             "The MCP session expired or was closed (HTTP 404). The call was not resent; check the result in the service. The next operation will open a new session.",
           );
-        }
         throw error instanceof McpError ? error : safeError(error);
       } finally {
         clearTimeout(deadlineTimer);
@@ -960,6 +1022,7 @@ export class McpGateway implements ToolGateway {
         if (set.size === 0) this.active.delete(server);
       }
     }
+    throw new McpNotSentError("MCP call cancelled before it was sent.");
   }
   private async client(server: string) {
     const config = this.config.find((c) => c.name === server);
@@ -1133,16 +1196,19 @@ export class McpGateway implements ToolGateway {
           };
         } catch (error) {
           const timedOut = mcpDiscoveryTimedOut(error);
+          const message = timedOut
+            ? MCP_TIMEOUT_ERROR
+            : error instanceof McpError
+              ? error.message
+              : "Could not discover MCP tools";
+          // Discovery never reaches the chat. /status keeps the last good snapshot.
+          console.warn(`Pi-Agent: MCP discovery ${config.name}: ${message}`);
           return {
             server: config.name,
             mode,
             tools: [],
             ...(timedOut ? { timedOut: true } : {}),
-            error: timedOut
-              ? MCP_TIMEOUT_ERROR
-              : error instanceof McpError
-                ? error.message
-                : "Could not discover MCP tools",
+            error: message,
           };
         }
       }),
@@ -1158,7 +1224,13 @@ export class McpGateway implements ToolGateway {
           if (this.expired.has(client)) {
             await this.discard(server, client);
             // Restart the whole catalog: pagination cursors belong to a session.
-            if (attempt === 0) continue;
+            // One retry. A second expiry is a dead server, not a loop.
+            if (attempt === 0) {
+              console.warn(
+                `Pi-Agent: MCP session ${server} expired during discovery; retrying once.`,
+              );
+              continue;
+            }
             throw new McpSessionError(
               "The MCP session expired again during discovery. Check that the server is available.",
             );

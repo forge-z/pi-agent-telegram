@@ -6,6 +6,7 @@ type Method =
   | "getUpdates"
   | "sendMessage"
   | "sendChatAction"
+  | "setMessageReaction"
   | "getMyCommands"
   | "setMyCommands"
   | "answerCallbackQuery"

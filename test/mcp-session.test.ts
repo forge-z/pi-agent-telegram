@@ -866,7 +866,12 @@ for (const recovery of ["automatic", "manual"] as const) {
           calls.execute("conversation", 1, "mock", tool, {}),
         );
         assert.equal(mock.initializes, 2);
-        assert.equal(calls.list("conversation")[0].state, "uncertain");
+        // lookup's schema-invalid payload came back, so the row is a plain failure.
+        // execute can lose the return on the expired session and stays uncertain.
+        assert.equal(
+          calls.list("conversation")[0].state,
+          tool === "lookup" ? "failed" : "uncertain",
+        );
         assert.equal(
           mock.requests.filter((request) => request.method === "tools/call")
             .length,

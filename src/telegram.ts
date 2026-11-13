@@ -3,7 +3,6 @@ import {
   queueMcpUncertainNotices,
   sweepMcpApprovals,
   decideMcp,
-  queueMcpChecks,
   verifyMcp,
 } from "./telegram-approvals.js";
 import { telegramIdentity } from "./telegram-identity.js";
@@ -26,7 +25,7 @@ import {
   TelegramTyping,
   type TelegramTypingOptions,
 } from "./telegram-typing.js";
-import { logFailure } from "./log.js";
+import { logDebug, logFailure } from "./log.js";
 import { MAX_TEXT } from "./limits.js";
 import {
   ConversationBusyError,
@@ -53,6 +52,7 @@ import {
 import { openModelMenu, handleModelMenu } from "./telegram-models.js";
 import { taskTelegramAuthorized } from "./task-telegram.js";
 import { type TelegramOwner } from "./telegram-chats.js";
+import { handleAskCallback, retireOpenQuestions } from "./ask-user.js";
 interface ControlRoute extends TelegramOwner {
   botId: number;
   credentialBinding: string;
@@ -235,6 +235,11 @@ export interface TelegramTransport {
     markup: TelegramReplyMarkup,
   ): Promise<unknown>;
   typing?(chat: string, options?: TelegramTypingOptions): Promise<unknown>;
+  /**
+   * Eyes on a message just taken for a turn. Optional so test fakes stay small.
+   * Best-effort: the caller does not await it and never clears the reaction.
+   */
+  react?(chat: string, messageId: number): Promise<unknown>;
   send(
     chat: string,
     text: string,
@@ -483,6 +488,13 @@ export class Telegram {
   }
   private async receiveCallback(update: TelegramUpdate) {
     const query = update.callback_query!;
+    // ask_user uses an ask: token. pi: buttons stay on the approval and menu path.
+    if (typeof query.data === "string" && query.data.startsWith("ask:"))
+      return handleAskCallback(this.app, update, this.transport, {
+        users: this.users,
+        chats: this.chats,
+        botId: this.botId,
+      });
     const identity = this.updateIdentity(update);
     const updateKey = `telegram:callback-update:${update.update_id}`;
     const fingerprint = hash(JSON.stringify(update));
@@ -604,7 +616,7 @@ export class Telegram {
       );
       if (data.kind === "mcp-check") {
         await verifyMcp(this.app, data, message.message_id);
-        await answer("Verification updated.");
+        await answer("Verificação registrada.");
       } else if (data.kind === "mcp") {
         const work = decideMcp(this.app, data, message.message_id);
         this.approvalWork.add(work);
@@ -1088,6 +1100,20 @@ export class Telegram {
     );
     return result;
   }
+  /**
+   * Eyes the moment a message is taken for a turn. Not awaited: a refusal
+   * (old message, a chat that cannot react) is debug noise and must not stall
+   * or fail the turn. The reaction is left in place afterwards.
+   */
+  private noteReceived(chat: string, message?: TelegramUpdate["message"]) {
+    const react = this.transport.react;
+    const messageId = message?.message_id;
+    if (!react || messageId === undefined || !Number.isSafeInteger(messageId))
+      return;
+    void Promise.resolve()
+      .then(() => react(chat, messageId))
+      .catch((error: unknown) => logDebug("setMessageReaction", error));
+  }
   private async acceptClean(
     owner: TelegramOwner,
     text: string,
@@ -1181,11 +1207,9 @@ export class Telegram {
         const ledger =
           calls.map((c) => `${c.server} / ${c.tool}: ${c.state}`).join("\n") ||
           "No pending or uncertain calls.";
-        // The warning only means something when there is an uncertain call to verify.
-        const uncertain =
-          calls.length === 0
-            ? ""
-            : "If a result is uncertain, check the external service; the call will not be repeated. /stop ends local waits; external effects need verification.";
+        // A lost write already has one card. /status does not add another line or button.
+        if (discoveryUnanswered)
+          console.warn(`Pi-Agent: ${MCP_DISCOVERY_UNANSWERED}`);
         const functions = resolveFunctions(
           process.env,
           this.app.settings.setup(),
@@ -1203,11 +1227,9 @@ export class Telegram {
             "",
             "MCP ledger:",
             ledger,
-            ...(uncertain ? ["", uncertain] : []),
             "",
             "MCPs:",
             mcps,
-            ...(discoveryUnanswered ? [MCP_DISCOVERY_UNANSWERED] : []),
             "",
             this.app.pendingJobs.healthLine(),
             "",
@@ -1215,7 +1237,6 @@ export class Telegram {
             "Automatic compaction: this conversation's active model and effort.",
           ].join("\n"),
         );
-        queueMcpChecks(this.app, owner, id, updateId);
       } else if (text === "/resume") {
         // Dismiss uncertain MCP first, then continue a crash-parked task.
         // One reply covers whichever of those was actually pending.
@@ -1230,6 +1251,8 @@ export class Telegram {
       )
         reply("Unknown command. Use /help.");
       else {
+        // A turn, not an instant command reply.
+        this.noteReceived(owner.chat, incoming);
         if (command === "stop") this.app.mcpCalls?.cancelConversation(id);
         const notice = this.app.settings.pendingModelNotice(id);
         if (notice) {
@@ -1286,6 +1309,9 @@ export class Telegram {
           prefix && prefix.length + body.length <= MAX_TEXT
             ? `${prefix}${body}`
             : body;
+        // A typed reply closes an open question so a later tap cannot start another turn.
+        if (!commandTurn)
+          await retireOpenQuestions(this.app, id, this.transport);
         // Typed text keeps no prefix; a specialist's output carries its origin.
         await this.app.admit(
           id,

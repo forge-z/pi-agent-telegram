@@ -1,6 +1,7 @@
 import type { Runtime } from "./runtime.js";
 import {
   executorUsesExecutionIdResume,
+  mcpUncertainNeedsNotice,
   type McpCall,
   type McpInteraction,
 } from "./mcp-calls.js";
@@ -735,9 +736,8 @@ function reviewCalls(input: unknown) {
     ? (calls as { path: string; params: [string, unknown][] }[])
     : undefined;
 }
-/** Readable body for an uncertain call card. It must show exactly what was
- * called, so a shape it does not recognize is rendered field by field, never
- * abbreviated and never as a JSON blob. Hiding keeps the `reviewText` rule. */
+/** Full rendering used only to decide whether confirmation is safe (`complete`).
+ * The chat notice does not send this text. Hiding keeps the `reviewText` rule. */
 export function formatUncertainCallReview(
   value: { server: string; tool: string; state: string; input: unknown },
   redact?: (text: string) => string,
@@ -801,6 +801,180 @@ export function formatUncertainCallReview(
   return {
     text: oversized ? tooLarge : safe,
     complete: !scrub.hidden && safe === readable && !oversized,
+  };
+}
+const hintNames = ["goal", "objective", "url"];
+const detailsLimit = 800;
+function plainLabel(value: string, fallback: string) {
+  const text = reviewScrubber()
+    .text(value)
+    .replace(/\u0060+/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return fallback;
+  return text.length > 80 ? `${text.slice(0, 79)}…` : text;
+}
+function clipText(text: string, max: number) {
+  if (text.length <= max) return text;
+  let end = max - 1;
+  const cut = text.charCodeAt(end - 1);
+  if (cut >= 0xd800 && cut <= 0xdbff) end--;
+  return `${text.slice(0, Math.max(0, end))}…`;
+}
+function structuredHint(
+  value: unknown,
+  name: string,
+  depth: number,
+): string | undefined {
+  if (depth > 6 || !value || typeof value !== "object") return;
+  const entries = Array.isArray(value) ? [] : Object.entries(value);
+  for (const [key, item] of entries)
+    if (key.toLowerCase() === name && typeof item === "string" && item.trim())
+      return item.trim();
+  for (const item of Array.isArray(value)
+    ? value
+    : entries.map(([, item]) => item)) {
+    const found = structuredHint(item, name, depth + 1);
+    if (found) return found;
+  }
+}
+/** Reads a `goal`, `objective`, or `url` assignment inside a code string. */
+function hintInCode(text: string) {
+  const slice = text.length > 8000 ? text.slice(0, 8000) : text;
+  for (const name of hintNames) {
+    const at = slice.search(
+      new RegExp(String.raw`(?:^|[^\w$])${name}\s*[:=]`, "i"),
+    );
+    if (at < 0) continue;
+    const tick = "\\u0060";
+    const matched = new RegExp(
+      `[:=]\\s*(?:"([^"\\n]{1,180})"|'([^'\\n]{1,180})'|${tick}([^${tick}\\n]{1,180})${tick})`,
+    ).exec(slice.slice(at));
+    const found = matched?.[1] ?? matched?.[2] ?? matched?.[3];
+    if (found?.trim()) return found.trim();
+  }
+}
+function codeHint(value: unknown, depth: number): string | undefined {
+  if (depth > 6 || value == null) return;
+  if (typeof value === "string") return hintInCode(value);
+  if (typeof value !== "object") return;
+  for (const item of Array.isArray(value) ? value : Object.values(value)) {
+    const found = codeHint(item, depth + 1);
+    if (found) return found;
+  }
+}
+function uncertainHint(value: unknown) {
+  for (const name of hintNames) {
+    const found = structuredHint(value, name, 0);
+    if (found) return found;
+  }
+  return codeHint(value, 0);
+}
+function clipHint(raw: string | undefined) {
+  if (!raw) return;
+  const scrub = reviewScrubber();
+  const text = scrub
+    .text(raw)
+    .replace(/\u0060+/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text || scrub.hidden || /\[REDACTED\]|omitted/.test(text)) return;
+  return clipText(text, 100);
+}
+/** One or two plain lines. Parameters and code stay off this message. */
+export function formatUncertainNotice(
+  value: { server: string; tool: string; input: unknown },
+  redact?: (text: string) => string,
+) {
+  const server = plainLabel(value.server, "MCP");
+  const tool = plainLabel(value.tool, "chamada");
+  let text = `Não sei se a chamada ao ${server} (${tool}) terminou. Confira no serviço e marque abaixo.`;
+  const hint = clipHint(uncertainHint(value.input));
+  if (hint) text += `\nSobre: ${hint}`;
+  return redact ? redact(text) : text;
+}
+/** Truncated, redacted parameters for the Detalhes button. Empty input is omitted. */
+export function formatUncertainDetails(
+  value: { server: string; tool: string; input: unknown },
+  redact?: (text: string) => string,
+): string | undefined {
+  const input = value.input;
+  if (
+    input == null ||
+    input === "" ||
+    (object(input) && !Object.keys(input).length) ||
+    (Array.isArray(input) && !input.length)
+  )
+    return;
+  const scrub = reviewScrubber();
+  let body =
+    typeof input === "string"
+      ? scrub.text(input)
+      : (JSON.stringify(input, (key, item: unknown) => {
+          if (key && sensitive.test(key)) return "[REDACTED]";
+          return typeof item === "string" ? scrub.text(item) : item;
+        }) ?? "");
+  body = body
+    .replace(/\u0060+/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!body || body === "{}" || body === "[]") return;
+  if (redact) body = redact(body);
+  return clipText(
+    `${plainLabel(value.server, "MCP")} / ${plainLabel(value.tool, "chamada")} ${body}`,
+    detailsLimit,
+  );
+}
+function parseCallArgs(args: string): unknown {
+  try {
+    return JSON.parse(args) as unknown;
+  } catch {
+    return args.trim() ? args : undefined;
+  }
+}
+function uncertainCallMenu(
+  app: Runtime,
+  call: McpCall,
+  owner: TelegramButton["owner"],
+  originThreadId: number | null,
+) {
+  const described = {
+    server: call.server,
+    tool: call.tool,
+    input: parseCallArgs(call.args),
+  };
+  const details = formatUncertainDetails(described, app.options.redact);
+  const base = {
+    kind: "mcp-check" as const,
+    owner,
+    originThreadId,
+    conversationId: call.conversationId,
+    callId: call.id,
+    callHash: hash(JSON.stringify(call)),
+    authorizationVersion: app.store.authorizationVersion(
+      owner,
+      call.conversationId,
+    ),
+  };
+  const keyboard: TelegramReplyMarkup["inline_keyboard"] = [
+    [
+      {
+        text: "Registrar verificação",
+        callback_data: button(app, { ...base, verification: "review" }),
+      },
+    ],
+  ];
+  if (details)
+    keyboard.push([
+      {
+        text: "Detalhes",
+        callback_data: button(app, { ...base, verification: "details" }),
+      },
+    ]);
+  return {
+    text: formatUncertainNotice(described, app.options.redact),
+    details,
+    keyboard,
   };
 }
 function approvalReview(app: Runtime, item: McpInteraction, call: McpCall) {
@@ -1055,6 +1229,7 @@ export function queueMcpUncertainNotices(app: Runtime) {
   for (const call of app.store.all<McpCall>(
     "SELECT * FROM mcp_calls WHERE state='uncertain'",
   )) {
+    if (!mcpUncertainNeedsNotice(call)) continue;
     if (
       app.mcpCalls
         .interactions(call.conversationId)
@@ -1073,31 +1248,14 @@ export function queueMcpUncertainNotices(app: Runtime) {
     const resolved = telegramOwnerForConversation(app, call.conversationId);
     if (!resolved) continue;
     const { owner, originThreadId } = resolved;
-    const token = button(app, {
-      kind: "mcp-check",
-      owner,
-      originThreadId,
-      conversationId: call.conversationId,
-      callId: call.id,
-      callHash: hash(JSON.stringify(call)),
-      verification: "review",
-      authorizationVersion: app.store.authorizationVersion(
-        owner,
-        call.conversationId,
-      ),
+    const menu = uncertainCallMenu(app, call, owner, originThreadId);
+    if (!menu.details)
+      console.error(
+        `Uncertain MCP call has no useful details: ${call.server}/${call.tool} (${call.id})`,
+      );
+    queueControl(app, deliveryId, owner, call.conversationId, menu.text, {
+      inline_keyboard: menu.keyboard,
     });
-    queueControl(
-      app,
-      deliveryId,
-      owner,
-      call.conversationId,
-      `${call.server} / ${call.tool}: uncertain MCP result. Check this occurrence in the external service. Tap Record external verification below.`,
-      {
-        inline_keyboard: [
-          [{ text: "Record external verification…", callback_data: token }],
-        ],
-      },
-    );
   }
 }
 export async function decideMcp(
@@ -1179,45 +1337,6 @@ export async function decideMcp(
   }
 }
 
-export function queueMcpChecks(
-  app: Runtime,
-  owner: import("./telegram-chats.js").TelegramOwner,
-  id: string,
-  updateId: number,
-) {
-  for (const call of app.mcpCalls
-    ?.list(id)
-    .filter((c) => c.state === "uncertain") ?? []) {
-    if (
-      app.mcpCalls
-        .interactions(id)
-        .some((i) => i.callId === call.id && i.state === "pending")
-    )
-      continue;
-    const token = button(app, {
-      kind: "mcp-check",
-      owner,
-      originThreadId: owner.messageThreadId ?? null,
-      conversationId: id,
-      callId: call.id,
-      callHash: hash(JSON.stringify(call)),
-      verification: "review",
-      authorizationVersion: app.store.authorizationVersion(owner, id),
-    });
-    queueControl(
-      app,
-      `telegram:mcp-check-menu:${updateId}:${call.id}`,
-      owner,
-      id,
-      `${call.server} / ${call.tool}: uncertain result. Check the external service before allowing new calls on this server.`,
-      {
-        inline_keyboard: [
-          [{ text: "Record external verification…", callback_data: token }],
-        ],
-      },
-    );
-  }
-}
 export async function verifyMcp(
   app: Runtime,
   data: TelegramButton,
@@ -1237,13 +1356,37 @@ export async function verifyMcp(
       "Record changed or not authorized. Use /status again.",
     );
   const prefix = `telegram:mcp-check:${call.id}:${data.callHash}`;
+  if (data.verification === "details") {
+    const details = formatUncertainDetails(
+      {
+        server: call.server,
+        tool: call.tool,
+        input: parseCallArgs(call.args),
+      },
+      app.options.redact,
+    );
+    if (!details) {
+      console.error(
+        `Uncertain MCP call has no useful details: ${call.server}/${call.tool} (${call.id})`,
+      );
+      return;
+    }
+    queueControl(
+      app,
+      `telegram:mcp-details:${call.id}:${data.callHash}`,
+      data.owner,
+      data.conversationId,
+      details,
+    );
+    return;
+  }
   if (data.verification === "review") {
     const view = formatUncertainCallReview(
       {
         server: call.server,
         tool: call.tool,
         state: call.state,
-        input: JSON.parse(call.args),
+        input: parseCallArgs(call.args),
       },
       app.options.redact,
     );
@@ -1263,26 +1406,14 @@ export async function verifyMcp(
       prefix,
       data.owner,
       data.conversationId,
-      `${literalReview(view.text)}\n\n${
-        view.complete
-          ? "Check the result in the external service. Confirm only what you verified. The record allows future calls; it does not run or repeat this action. If you are still unsure, keep it blocked."
-          : "Verification options are unavailable because part of the content was hidden or shortened. The block stays until it is dismissed; use /resume to dismiss this conversation's uncertain result without repeating the action."
-      }`,
+      view.complete
+        ? "Confira no serviço se deu certo antes de confirmar."
+        : "Não dá para confirmar daqui. Use /resume para liberar sem repetir a chamada.",
       {
         inline_keyboard: view.complete
           ? [
-              [
-                {
-                  text: "I checked: action completed",
-                  callback_data: make("done"),
-                },
-              ],
-              [
-                {
-                  text: "I checked: action did not run",
-                  callback_data: make("not-executed"),
-                },
-              ],
+              [{ text: "Deu certo", callback_data: make("done") }],
+              [{ text: "Não rodou", callback_data: make("not-executed") }],
             ]
           : [],
       },
@@ -1316,6 +1447,6 @@ export async function verifyMcp(
     `telegram:mcp-verified:${call.id}`,
     data.owner,
     data.conversationId,
-    "Declared verification recorded. No call was resent.",
+    "Verificação registrada. Nada foi reenviado.",
   );
 }

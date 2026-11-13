@@ -16,7 +16,7 @@ export interface TelegramButton {
   conversationId: string;
   callId?: string;
   callHash?: string;
-  verification?: "review" | "done" | "not-executed";
+  verification?: "review" | "details" | "done" | "not-executed";
   interactionId?: string;
   interactionHash?: string;
   reviewVersion?: number;

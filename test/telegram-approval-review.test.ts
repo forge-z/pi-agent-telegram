@@ -9,7 +9,10 @@ import {
   formatMcpApprovalDisplay,
   formatMcpOutcomeMessage,
   formatUncertainCallReview,
+  formatUncertainDetails,
+  formatUncertainNotice,
   looksLikeMailSend,
+  queueMcpUncertainNotices,
   reviewableEmail,
   reviewText,
   verifyMcp,
@@ -313,10 +316,10 @@ test("verifyMcp with incomplete review (e.g. omitted URL query) provides no veri
     // Rule: Never offer verification buttons when review is incomplete
     assert.deepEqual(markup.inline_keyboard, []);
     // Must explain that verification options are unavailable due to hidden/abbreviated content
-    assert.match(
-      text,
-      /Verification options are unavailable because part of the content was hidden/i,
-    );
+    assert.match(text, /Não dá para confirmar daqui/);
+    assert.doesNotMatch(text, /<pre>/);
+    assert.doesNotMatch(text, /token=secret/);
+    assert.doesNotMatch(text, /example\.test/);
     // Must explicitly provide the /resume command exit
     assert.match(text, /\/resume/);
     assert.doesNotMatch(text, /\/reload/);
@@ -383,7 +386,16 @@ test("verifyMcp with incomplete review (e.g. omitted URL query) provides no veri
       ? JSON.parse(markupCompleteRaw.value)
       : { inline_keyboard: [] };
     assert.equal(markupComplete.inline_keyboard.length, 2);
-    assert.match(textComplete, /Confirm only what you verified/);
+    assert.match(
+      textComplete,
+      /Confira no serviço se deu certo antes de confirmar/,
+    );
+    assert.deepEqual(
+      markupComplete.inline_keyboard.map((row: { text: string }[]) =>
+        row.map((button) => button.text),
+      ),
+      [["Deu certo"], ["Não rodou"]],
+    );
   } finally {
     await app.close();
     await rm(dir, { recursive: true, force: true });
@@ -526,7 +538,7 @@ test("uncertain call card hides sensitive content and oversized text", () => {
   assert.doesNotMatch(view.text, /sk-abcdefghijklmn/);
 });
 
-test("uncertain verification card sends the readable summary and keeps its buttons", async () => {
+test("uncertain verification card stays short and keeps its buttons", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-readable-"));
   const models = createModels();
   models.setProvider(fauxProvider().provider);
@@ -599,16 +611,12 @@ test("uncertain verification card sends the readable summary and keeps its butto
     );
     assert.equal(deliveries.length, 1);
     const text = deliveries[0].text;
-    for (const line of [
-      "Server: executor",
-      "Tool: call",
-      "State: uncertain",
-      "Target: tools.x.y",
-      "accountId: &quot;acc_1&quot;",
-    ])
-      assert.ok(text.includes(line), `${line}\n---\n${text}`);
-    assert.doesNotMatch(text, /"server"/);
-    assert.doesNotMatch(text, /"calls"/);
+    assert.match(text, /Confira no serviço se deu certo antes de confirmar/);
+    assert.doesNotMatch(text, /accountId/);
+    assert.doesNotMatch(text, /tools\.x\.y/);
+    assert.doesNotMatch(text, /<pre>/);
+    assert.doesNotMatch(text, /```/);
+    assert.doesNotMatch(text, /MCP call with an uncertain result/);
     const markupRaw = app.store.get<{ value: string }>(
       "SELECT value FROM meta WHERE key=?",
       `telegram:markup:${deliveries[0].id}`,
@@ -617,7 +625,199 @@ test("uncertain verification card sends the readable summary and keeps its butto
       ? JSON.parse(markupRaw.value)
       : { inline_keyboard: [] };
     assert.equal(markup.inline_keyboard.length, 2);
-    assert.match(text, /Confirm only what you verified/);
+    assert.deepEqual(
+      markup.inline_keyboard.map((row: { text: string }[]) =>
+        row.map((button) => button.text),
+      ),
+      [["Deu certo"], ["Não rodou"]],
+    );
+  } finally {
+    await app.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("uncertain notice is two plain pt-BR lines and leaves the parameters out", () => {
+  const tail = "FIM_QUE_NAO_CABE_NO_DETALHE";
+  const program = [
+    'const goal = "consultar o status do pedido do cliente";',
+    'const apiKey = "sk-abcdefghijklmnop";',
+    "```",
+    "x".repeat(2000),
+    tail,
+  ].join("\n");
+  const input = {
+    goal: "enviar o resumo",
+    code: program,
+    url: "https://example.test/should-not-win",
+  };
+  const notice = formatUncertainNotice({
+    server: "executor",
+    tool: "execute",
+    input,
+  });
+  assert.equal(
+    notice,
+    "Não sei se a chamada ao executor (execute) terminou. Confira no serviço e marque abaixo.\nSobre: enviar o resumo",
+  );
+  assert.equal(notice.split("\n").length, 2);
+  assert.doesNotMatch(
+    notice,
+    /```|Parameters:|MCP call with an uncertain result/,
+  );
+  assert.doesNotMatch(notice, /sk-|FIM_QUE_NAO_CABE|should-not-win|xxxxx/);
+
+  const fromCode = formatUncertainNotice({
+    server: "executor",
+    tool: "execute",
+    input: { code: program },
+  });
+  const hint = fromCode.split("\n")[1]?.replace(/^Sobre: /, "");
+  assert.equal(fromCode.split("\n").length, 2);
+  assert.ok(hint?.startsWith("consultar o status do pedido"));
+  assert.ok(hint && hint.length <= 100);
+  assert.doesNotMatch(fromCode, /sk-|```|FIM_QUE_NAO_CABE|xxxxx/);
+
+  const longUrl = `https://example.test/${"a".repeat(180)}`;
+  const urlNotice = formatUncertainNotice({
+    server: "web",
+    tool: "fetch",
+    input: { url: longUrl },
+  });
+  const urlHint = urlNotice.split("\n")[1]?.replace(/^Sobre: /, "") ?? "";
+  assert.ok(urlHint.startsWith("https://example.test/"));
+  assert.ok(urlHint.length <= 100);
+  assert.ok(urlHint.length < longUrl.length);
+
+  const hidden = formatUncertainNotice({
+    server: "web",
+    tool: "fetch",
+    input: { url: "https://user:pw@example.test/api?token=secret" },
+  });
+  assert.equal(hidden.split("\n").length, 1);
+  assert.doesNotMatch(hidden, /secret|token|pw@|Sobre:/);
+
+  const secretGoal = formatUncertainNotice({
+    server: "executor",
+    tool: "execute",
+    input: { goal: "sk-abcdefghijklmnop" },
+  });
+  assert.doesNotMatch(secretGoal, /sk-/);
+  assert.equal(secretGoal.split("\n").length, 1);
+
+  assert.equal(
+    formatUncertainDetails({
+      server: "executor",
+      tool: "execute",
+      input: {},
+    }),
+    undefined,
+  );
+  const details = formatUncertainDetails(
+    {
+      server: "executor",
+      tool: "execute",
+      input: { code: program, apiKey: "plain-value", note: "PLAIN_SECRET" },
+    },
+    (text) => text.replaceAll("PLAIN_SECRET", "[REDACTED]"),
+  );
+  assert.ok(details);
+  assert.ok(details.length <= 800);
+  assert.doesNotMatch(
+    details,
+    /sk-abcdefghijklmnop|plain-value|PLAIN_SECRET|```|FIM_QUE_NAO_CABE/,
+  );
+  assert.match(details, /\[REDACTED\]/);
+  assert.doesNotMatch(details, /^`/m);
+});
+
+test("uncertain notice queues a short message and puts parameters behind Detalhes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-uncertain-notice-"));
+  const models = createModels();
+  models.setProvider(fauxProvider().provider);
+  const gateway = new McpGateway([]);
+  gateway.catalog = async () => [];
+  const owner = { chat: "100", user: "42" };
+  const app = await Runtime.open({
+    dir,
+    models,
+    gateway,
+    initialize: (store) =>
+      configureTelegram(
+        store,
+        { token: "123:test", users: ["42"], chats: ["100"] },
+        { id: 123, username: "test_bot" },
+      ),
+  });
+  try {
+    const conversationId = await app.telegramChats.ensure(owner);
+    const tail = "FIM_QUE_NAO_CABE_NO_DETALHE";
+    const code = [
+      'const goal = "consultar o status do pedido";',
+      'const token = "sk-abcdefghijklmnop";',
+      "```",
+      "y".repeat(2000),
+      tail,
+    ].join("\n");
+    const args = JSON.stringify({ code });
+    app.store.run(
+      "INSERT INTO mcp_calls(id,conversationId,server,tool,args,state,result,binding,updatedAt) VALUES (?,?,?,?,?,?,?,?,?)",
+      "call-notice-1",
+      conversationId,
+      "executor",
+      "execute",
+      args,
+      "uncertain",
+      null,
+      "executor:default",
+      Date.now(),
+    );
+    queueMcpUncertainNotices(app);
+    const deliveries = app.store.all<{ id: string; text: string }>(
+      "SELECT id,text FROM deliveries WHERE id>=? AND id<? ORDER BY rowid",
+      "telegram:mcp-check-menu:auto:call-notice-1:",
+      "telegram:mcp-check-menu:auto:call-notice-1;",
+    );
+    assert.equal(deliveries.length, 1);
+    const text = deliveries[0].text;
+    assert.match(
+      text,
+      /Não sei se a chamada ao executor \(execute\) terminou\. Confira no serviço e marque abaixo\./,
+    );
+    assert.match(text, /Sobre: consultar o status do pedido/);
+    assert.doesNotMatch(
+      text,
+      /yyyy|sk-abcdefghijklmnop|<pre>|```|FIM_QUE_NAO_CABE/,
+    );
+    assert.doesNotMatch(text, /const token/);
+    const markupRaw = app.store.get<{ value: string }>(
+      "SELECT value FROM meta WHERE key=?",
+      `telegram:markup:${deliveries[0].id}`,
+    );
+    const markup = JSON.parse(markupRaw!.value) as {
+      inline_keyboard: { text: string; callback_data: string }[][];
+    };
+    const labels = markup.inline_keyboard.flat().map((item) => item.text);
+    assert.deepEqual(labels, ["Registrar verificação", "Detalhes"]);
+    const detailsButton = markup.inline_keyboard
+      .flat()
+      .find((item) => item.text === "Detalhes")!;
+    const saved = app.store.get<{ value: string }>(
+      "SELECT value FROM meta WHERE key=?",
+      `telegram:button:${detailsButton.callback_data}`,
+    );
+    await verifyMcp(app, JSON.parse(saved!.value), 700);
+    const detailRows = app.store.all<{ text: string }>(
+      "SELECT text FROM deliveries WHERE id>=? AND id<? ORDER BY rowid",
+      "telegram:mcp-details:call-notice-1:",
+      "telegram:mcp-details:call-notice-1;",
+    );
+    assert.equal(detailRows.length, 1);
+    assert.doesNotMatch(
+      detailRows[0].text,
+      /sk-abcdefghijklmnop|<pre>|```|FIM_QUE_NAO_CABE/,
+    );
+    assert.ok(detailRows[0].text.length <= 1200);
   } finally {
     await app.close();
     await rm(dir, { recursive: true, force: true });
