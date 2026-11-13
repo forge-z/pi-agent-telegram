@@ -226,6 +226,43 @@ function readTimeoutText(label: string, read: boolean) {
 /** A read never needs a decision and never changes state. Reads stay open while
  * another call on this server is uncertain, because checking that result means reading.
  * A later read does not clear the uncertainty. */
+const LOST_RESULT =
+  /estourou o prazo|Resultado MCP incerto|não terminou dentro do prazo|MCP response timed out|MCP connection or operation failed|session expired|was not resent|não será repetida automaticamente|Não foi possível salvar|check the result in the service/i;
+
+/** True only when a write ended without a known result. A returned tool error,
+ * a read, and a scheduled approval skip do not ask the person. */
+export function mcpUncertainNeedsNotice(call: {
+  state: string;
+  tool: string;
+  args: string;
+  result: string | null;
+}) {
+  if (call.state !== "uncertain") return false;
+  let args: Record<string, unknown> | undefined;
+  try {
+    const parsed = JSON.parse(call.args) as unknown;
+    if (object(parsed)) args = parsed;
+  } catch {
+    args = undefined;
+  }
+  if (mcpCallIsReadOnly(call.tool, args)) return false;
+  if (!call.result) return true;
+  try {
+    const body = JSON.parse(call.result) as {
+      isError?: boolean;
+      content?: { type?: string; text?: string }[];
+    };
+    const text = (Array.isArray(body.content) ? body.content : [])
+      .map((item) => (item?.type === "text" ? (item.text ?? "") : ""))
+      .join("\n");
+    if (LOST_RESULT.test(text)) return true;
+    if (body.isError) return false;
+  } catch {
+    return true;
+  }
+  return true;
+}
+
 export function mcpCallIsReadOnly(
   tool: string,
   args?: Record<string, unknown>,
@@ -884,8 +921,10 @@ export class McpCalls {
     }
   }
 
-  /** Reads fail closed. A proven validation/unknown-tool rejection fails closed.
-   * Any other write error stays uncertain on that server only. */
+  /** Reads fail closed. A tool result we actually received is a known outcome,
+   * success or error, so it does not block the server. A scheduled approval
+   * skip stays uncertain: the pause does not prove earlier steps had no effect.
+   * A write that left without a result is marked uncertain by the catch path. */
   private recordedState(
     server: string,
     tool: string,
@@ -900,7 +939,7 @@ export class McpCalls {
     if (skipped) return read ? "skipped" : "uncertain";
     if (read) return result.isError || unsupported ? "failed" : "done";
     if (refusedBeforeDispatch(result)) return "failed";
-    if (result.isError || unsupported) return "uncertain";
+    if (result.isError || unsupported) return "failed";
     return "done";
   }
 
@@ -970,6 +1009,7 @@ export class McpCalls {
       const attempt = this.gateway.callDirect(call.server, tool, args, {
         signal: combined,
         binding: call.binding,
+        readOnly: this.isRead(call.server, tool, args),
         onElicitation: (params, elicitationSignal) =>
           this.elicit(
             call,
@@ -1111,7 +1151,10 @@ export class McpCalls {
       const notSent =
         error instanceof PolicyError || error instanceof McpNotSentError;
       const validation = refusedBeforeDispatch(error);
-      const uncertain = !readOnly && !notSent && !validation;
+      // A schema mismatch means a response arrived. Only a write that left
+      // without one stays uncertain.
+      const schemaMismatch = /does not match the tool output schema/.test(raw);
+      const uncertain = !readOnly && !notSent && !validation && !schemaMismatch;
       // A read that we stopped is a plain timeout. Only a write stays uncertain.
       const timeoutText = timedOut
         ? /estourou o prazo/.test(raw)

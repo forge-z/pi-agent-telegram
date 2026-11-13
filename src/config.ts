@@ -336,6 +336,11 @@ interface LlmModel {
   contextWindow: number;
   maxTokens: number;
   reasoning: boolean;
+  /**
+   * The row included the reasoning field (`false`, `true`, or a level list).
+   * A probe must not replace that choice.
+   */
+  reasoningDeclared?: boolean;
   /** Present when `LLM_MODELS` pins an explicit level list instead of `true`/`false`. */
   thinkingLevelMap?: ThinkingLevelMap;
 }
@@ -383,6 +388,8 @@ function parseThinkingLevels(
 /**
  * `id` or `id|contextWindow|maxTokens|reasoning`. Discovery cannot see whether a
  * model reasons, so reasoning/thinking stays off unless it is declared here.
+ * Ollama is the exception: an undeclared model is probed once, and a thinking
+ * model gains the levels Ollama advertises. An explicit reasoning field wins.
  */
 export function parseLlmModels(
   value: string | undefined,
@@ -419,13 +426,20 @@ export function parseLlmModels(
         "LLM_MODELS inválido: exige contextWindow >= 32768 e 0 < maxTokens < contextWindow.",
       );
     if (parts[3] === "false")
-      return { id, contextWindow, maxTokens, reasoning: false };
+      return {
+        id,
+        contextWindow,
+        maxTokens,
+        reasoning: false,
+        reasoningDeclared: true,
+      };
     const thinkingLevelMap = parseThinkingLevels(id, parts[3]);
     return {
       id,
       contextWindow,
       maxTokens,
       reasoning: true,
+      reasoningDeclared: true,
       ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
     };
   });
@@ -483,6 +497,172 @@ export async function discoverLlmModels(
     reasoning: false,
   }));
 }
+
+/**
+ * No catalog id marks Ollama. The base URL does: Ollama Cloud (`ollama.com`),
+ * a local daemon (port 11434), or the native `/api` root. Anything else stays
+ * on today's compat behavior.
+ */
+export function isOllamaEndpoint(baseUrl: string) {
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    return false;
+  }
+  const host = url.hostname.toLowerCase();
+  if (host === "ollama.com" || host.endsWith(".ollama.com")) return true;
+  if (url.port === "11434") return true;
+  return url.pathname.split("/").some((part) => part.toLowerCase() === "api");
+}
+
+/** Native show endpoint beside an OpenAI-compatible `/v1` root. */
+function ollamaShowUrl(baseUrl: string) {
+  const url = new URL(baseUrl);
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (parts.at(-1)?.toLowerCase() === "v1") parts.pop();
+  if (parts.at(-1)?.toLowerCase() === "api") parts.pop();
+  url.pathname = `/${[...parts, "api", "show"].join("/")}`;
+  url.search = "";
+  url.hash = "";
+  return url.href;
+}
+
+const OLLAMA_PROBE_MS = 2_000;
+const OLLAMA_NAMED_LEVELS = [
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+/** `null` is a confirmed model with no thinking. Failures are not stored. */
+const ollamaCapabilityCache = new Map<string, ThinkingLevelMap | null>();
+
+/**
+ * Levels pi can show, with `off` wired to the value Ollama actually honors.
+ * Boolean thinking models have no names; OpenAI-compat maps low/medium/high
+ * to on and `none` to off. Named `thinking.values` are used as-is.
+ */
+function ollamaThinkingMap(levels: readonly string[]): ThinkingLevelMap {
+  const allowed = new Set(levels);
+  return {
+    off: "none",
+    minimal: allowed.has("minimal") ? "minimal" : null,
+    low: allowed.has("low") ? "low" : null,
+    medium: allowed.has("medium") ? "medium" : null,
+    high: allowed.has("high") ? "high" : null,
+    xhigh: allowed.has("xhigh") ? "xhigh" : null,
+    max: allowed.has("max") ? "max" : null,
+  };
+}
+
+/** `undefined` means the body was not a show document. `null` means no thinking. */
+function levelsFromShow(payload: unknown): ThinkingLevelMap | null | undefined {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload))
+    return undefined;
+  const record = payload as { capabilities?: unknown; thinking?: unknown };
+  const capabilities = Array.isArray(record.capabilities)
+    ? record.capabilities.filter(
+        (item): item is string => typeof item === "string",
+      )
+    : [];
+  const thinking =
+    record.thinking &&
+    typeof record.thinking === "object" &&
+    !Array.isArray(record.thinking)
+      ? (record.thinking as { values?: unknown }).values
+      : undefined;
+  const values = Array.isArray(thinking) ? thinking : undefined;
+  const named = (values ?? []).filter(
+    (value): value is (typeof OLLAMA_NAMED_LEVELS)[number] =>
+      typeof value === "string" &&
+      (OLLAMA_NAMED_LEVELS as readonly string[]).includes(value),
+  );
+  // `values: [false]` is how Ollama says the model cannot think.
+  if (
+    values !== undefined &&
+    values.length > 0 &&
+    values.every((value) => value === false)
+  )
+    return null;
+  const thinks =
+    capabilities.some((item) => item.toLowerCase() === "thinking") ||
+    named.length > 0 ||
+    (values ?? []).some((value) => value === true);
+  if (!thinks) return null;
+  return ollamaThinkingMap(
+    named.length > 0 ? named : ["low", "medium", "high"],
+  );
+}
+
+/**
+ * pi-ai omits reasoning_effort when effort is off unless `thinkingLevelMap.off`
+ * is a string, then sends that string. Ollama disables thinking only for `none`.
+ * Explicit level sets stay; only the off wire value changes.
+ */
+function honorOllamaOff(model: LlmModel): LlmModel {
+  if (!model.reasoning) return model;
+  const current = model.thinkingLevelMap;
+  if (!current) return { ...model, thinkingLevelMap: { off: "none" } };
+  if (current.off !== "off") return model;
+  return { ...model, thinkingLevelMap: { ...current, off: "none" } };
+}
+
+async function probeOllamaThinking(
+  baseUrl: string,
+  apiKey: string,
+  modelId: string,
+  fetchImpl: typeof fetch,
+): Promise<ThinkingLevelMap | undefined> {
+  const key = JSON.stringify([ollamaShowUrl(baseUrl), modelId]);
+  if (ollamaCapabilityCache.has(key))
+    return ollamaCapabilityCache.get(key) ?? undefined;
+  try {
+    const response = await fetchImpl(ollamaShowUrl(baseUrl), {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: modelId }),
+      signal: AbortSignal.timeout(OLLAMA_PROBE_MS),
+    });
+    if (!response.ok) return undefined;
+    const parsed = levelsFromShow(await response.json());
+    if (parsed === undefined) return undefined;
+    ollamaCapabilityCache.set(key, parsed);
+    return parsed ?? undefined;
+  } catch {
+    // Timeout, network, or a body that is not JSON. Keep the declared catalog.
+    return undefined;
+  }
+}
+
+async function applyOllamaThinking(
+  baseUrl: string,
+  apiKey: string,
+  catalog: LlmModel[],
+  fetchImpl: typeof fetch,
+) {
+  if (!isOllamaEndpoint(baseUrl)) return catalog;
+  return Promise.all(
+    catalog.map(async (model) => {
+      if (model.reasoningDeclared) return honorOllamaOff(model);
+      const found = await probeOllamaThinking(
+        baseUrl,
+        apiKey,
+        model.id,
+        fetchImpl,
+      );
+      if (!found) return model;
+      return { ...model, reasoning: true, thinkingLevelMap: found };
+    }),
+  );
+}
+
 /** Friendly names for endpoints we can identify. Anything else falls back to its host. */
 const KNOWN_ENDPOINTS: Record<string, string> = {
   "api.deepseek.com": "DeepSeek",
@@ -602,6 +782,12 @@ async function registerLlmApiKeyProvider(
     throw new Error(
       "Nenhum modelo disponível. Verifique LLM_BASE_URL ou defina LLM_MODELS.",
     );
+  catalog = await applyOllamaThinking(
+    baseUrl,
+    key,
+    catalog,
+    deps.fetch ?? fetch,
+  );
   models.setProvider(
     createProvider({
       id: LLM_PROVIDER_ID,

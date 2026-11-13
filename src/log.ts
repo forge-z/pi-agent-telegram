@@ -8,3 +8,7 @@ function errorShape(error: unknown) {
 export function logFailure(operation: string, error: unknown) {
   console.error(`${operation}: ${errorShape(error)}`);
 }
+
+export function logDebug(operation: string, error: unknown) {
+  console.debug(`${operation}: ${errorShape(error)}`);
+}

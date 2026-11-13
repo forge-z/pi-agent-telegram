@@ -142,6 +142,16 @@ export class TelegramPolling {
             },
             signal,
           ),
+        react: (chat, messageId) =>
+          api.call(
+            "setMessageReaction",
+            {
+              chat_id: chat,
+              message_id: messageId,
+              reaction: [{ type: "emoji", emoji: "👀" }],
+            },
+            signal,
+          ),
         send: async (chat, text, options) => {
           try {
             return await api.call(

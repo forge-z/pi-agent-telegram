@@ -303,7 +303,7 @@ test("a timed-out rediscovery keeps the previous snapshot for the next /status",
     await f.send("/status");
     const text = f.views.at(-1)!.text;
     assert.match(text, /search, call/);
-    assert.ok(text.includes(MCP_DISCOVERY_UNANSWERED));
+    assert.doesNotMatch(text, /Discovery did not answer/);
     assert.equal(f.calls(), settled);
   } finally {
     await f.close();
@@ -324,7 +324,7 @@ test("a rediscovery that throws keeps the previous snapshot and hides the cause"
     await f.send("/status");
     const text = f.views.at(-1)!.text;
     assert.match(text, /search, call/);
-    assert.ok(text.includes(MCP_DISCOVERY_UNANSWERED));
+    assert.doesNotMatch(text, /Discovery did not answer/);
     assert.doesNotMatch(text, /secret\.example/);
     assert.equal(f.calls(), settled);
   } finally {
@@ -365,10 +365,20 @@ test("a slow rediscovery is reported on the next /status and a later success con
     assert.match(f.views.at(-1)!.text, /search, call/);
     await new Promise((resolve) => setTimeout(resolve, 80));
     const before = f.views.length;
-    await f.send("/status");
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+    try {
+      await f.send("/status");
+    } finally {
+      console.warn = originalWarn;
+    }
     assert.equal(f.views.length, before + 1);
     assert.match(f.views.at(-1)!.text, /search, call/);
-    assert.match(f.views.at(-1)!.text, /Discovery did not answer/);
+    assert.doesNotMatch(f.views.at(-1)!.text, /Discovery did not answer/);
+    assert.ok(warnings.some((line) => line.includes(MCP_DISCOVERY_UNANSWERED)));
     release([serverCatalog("executor", ["describe", "execute"])]);
     await new Promise((resolve) => setTimeout(resolve, 30));
     assert.deepEqual(

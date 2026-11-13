@@ -41,6 +41,22 @@ const TELEGRAM_PT =
   /[áàâãéêíóôõúçÁÀÂÃÉÊÍÓÔÕÚÇ]|\b(não|inválid\w*|vírgula|catálogo|usuário|provedor|mantém|escolha|mesmo assim|código|aguardando|resposta|oficial|senha|visão|modelos|texto|nenhuma|conectado|ferramenta|rodar agora|último tick|versão|compactação)\b/i;
 
 const ALLOW = new Set(['"usuário"', "'usuário'", "`usuário`"]);
+/** The uncertain-call notice and its confirmation are pt-BR. */
+const ALLOW_PT = [
+  "Não sei se a chamada ao ${server} (${tool}) terminou. Confira no serviço e marque abaixo.",
+  "Registrar verificação",
+  "Confira no serviço se deu certo antes de confirmar.",
+  "Não dá para confirmar daqui. Use /resume para liberar sem repetir a chamada.",
+  "Deu certo",
+  "Não rodou",
+  "Verificação registrada. Nada foi reenviado.",
+  "Verificação registrada.",
+];
+function allowedPortuguese(value: string) {
+  let rest = value;
+  for (const snippet of ALLOW_PT) rest = rest.replaceAll(snippet, "");
+  return !TELEGRAM_PT.test(rest);
+}
 
 /** Phrases that used to be sent to Telegram. They must not come back in src. */
 const BANNED = [
@@ -80,7 +96,7 @@ test("Telegram runtime strings are English", () => {
   const hits: string[] = [];
   for (const file of TELEGRAM_FILES) {
     for (const value of literals(readFileSync(file, "utf8"), true)) {
-      if (ALLOW.has(value)) continue;
+      if (ALLOW.has(value) || allowedPortuguese(value)) continue;
       if (TELEGRAM_PT.test(value)) hits.push(`${file}: ${value.slice(0, 160)}`);
     }
   }

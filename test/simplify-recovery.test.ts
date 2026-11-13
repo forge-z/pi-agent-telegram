@@ -212,7 +212,7 @@ test("InputInvalid or UnknownTool without a successful toolCall is a plain failu
   );
 });
 
-test("validation rejection fails the row; any other write error is uncertain on that server only", async () => {
+test("validation rejection and a returned write error both fail closed; only a lost result stays uncertain", async () => {
   const root = await dir();
   const store = new Store(root);
   const seen: string[] = [];
@@ -262,43 +262,53 @@ test("validation rejection fails the row; any other write error is uncertain on 
       "failed",
     );
 
-    await calls.execute("c", 3, "executor", "execute", {
+    const boom = await calls.execute("c", 3, "executor", "execute", {
       fail: "boom",
       code: "await tools.call({})",
     });
-    const uncertain = store.get<{ state: string }>(
-      "SELECT state FROM mcp_calls WHERE conversationId=? AND server=? AND state='uncertain'",
-      "c",
-      "executor",
+    assert.equal(boom.isError, true);
+    assert.equal(
+      store.get<{ state: string }>(
+        "SELECT state FROM mcp_calls WHERE conversationId=? AND server=? AND tool='execute' ORDER BY updatedAt DESC",
+        "c",
+        "executor",
+      )?.state,
+      "failed",
     );
-    assert.ok(uncertain);
+    assert.equal(
+      store.get<{ total: number }>(
+        "SELECT count(*) AS total FROM mcp_calls WHERE conversationId='c' AND state='uncertain'",
+      )?.total,
+      0,
+    );
+    // A returned error does not block the next write. The model can continue.
+    await calls.execute("c", 4, "executor", "execute", {
+      code: "await tools.call({})",
+    });
 
     const read = await calls.execute(
       "c",
-      4,
+      5,
       "executor",
       "tools.instabox.machines.list",
       {},
     );
     assert.equal(read.isError, undefined);
-    assert.equal(
-      store.get<{ total: number }>(
-        "SELECT count(*) AS total FROM mcp_calls WHERE conversationId='c' AND state='uncertain'",
-      )?.total,
-      1,
-    );
 
-    await calls.execute("c", 5, "other", "execute", {
+    store.run(
+      "INSERT INTO mcp_calls VALUES ('lost','c','executor','execute','{}','uncertain',NULL,'binding',0)",
+    );
+    await calls.execute("c", 6, "other", "execute", {
       code: "await tools.call({})",
     });
     await assert.rejects(
-      calls.execute("c", 6, "executor", "execute", {
+      calls.execute("c", 7, "executor", "execute", {
         code: "await tools.call({})",
       }),
       /neste servidor/,
     );
     assert.equal(calls.clearUncertain("c"), 1);
-    await calls.execute("c", 7, "executor", "execute", {
+    await calls.execute("c", 8, "executor", "execute", {
       code: "await tools.call({})",
     });
   } finally {

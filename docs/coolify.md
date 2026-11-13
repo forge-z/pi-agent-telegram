@@ -116,7 +116,12 @@ Depois de atualizar o repositório e fazer o deploy desta versão:
 
 Sem `LLM_MODELS`, o catálogo vem de `GET {LLM_BASE_URL}/models`. Como essa listagem não
 informa capacidades, os modelos descobertos ficam com limites conservadores e
-`reasoning=false` — ou seja, `/thinking` oferece apenas `off`.
+`reasoning=false` — ou seja, `/thinking` oferece apenas `off`. Ollama é a exceção:
+host `ollama.com`, porta `11434` ou caminho com `/api` dispara um `POST /api/show`
+por modelo (timeout curto, em cache). Se `capabilities` inclui `thinking`, os níveis
+passam a ser `off`/`low`/`medium`/`high` ou os nomes em `thinking.values`. Um campo
+`reasoning` explícito em `LLM_MODELS` continua vencendo, e falha na consulta não muda
+o catálogo. A chamada manda `reasoning_effort` (`none` desliga o raciocínio).
 
 Cada entrada de `LLM_MODELS` é `id` ou `id|contextWindow|maxTokens|reasoning`, com
 `contextWindow >= 32768` e `0 < maxTokens < contextWindow`. O campo `reasoning` aceita:
